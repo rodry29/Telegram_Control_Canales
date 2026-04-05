@@ -194,7 +194,7 @@ async def alert_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"✅ {username} actualizado")
 
 # -------- RECORDATORIOS --------
-async def check_expired(context: ContextTypes.DEFAULT_TYPE):
+async def check_expired():
     now = datetime.now()
 
     cursor.execute("SELECT username, plan, end_date FROM users WHERE status='activo'")
@@ -206,7 +206,10 @@ async def check_expired(context: ContextTypes.DEFAULT_TYPE):
 
         if days_left == 1:
             msg = f"⚠️ Vence mañana\n{username}\nPlan: {plan}\nFecha: {end.date()}"
-            await context.bot.send_message(
+            from telegram import Bot
+
+            bot = Bot(token=TOKEN)
+            await bot.send_message(
                 ADMIN_ID,
                 msg,
                 reply_markup=alert_buttons(username)
