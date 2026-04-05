@@ -265,7 +265,7 @@ app.add_handler(CommandHandler("msg", broadcast))
 app.add_handler(CallbackQueryHandler(panel_buttons))
 app.add_handler(CallbackQueryHandler(alert_actions))
 
-scheduler = AsyncIOScheduler()
+scheduler = BackgroundScheduler()
 scheduler.add_job(check_expired, "interval", hours=6)
 scheduler.start()
 
