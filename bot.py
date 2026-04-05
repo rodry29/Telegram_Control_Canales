@@ -16,7 +16,7 @@ VIP_GROUP_ID = -1003842587095
 ADMIN_ID = 8682208062
 
 # -------- DB --------
-conn = psycopg2.connect(os.getenv("postgresql://postgres:VqYJlPRMPTFYQSBuTDcLxTZOYDnOXquy@postgres.railway.internal:5432/railwayL"))
+conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cursor = conn.cursor()
 
 cursor.execute("""
