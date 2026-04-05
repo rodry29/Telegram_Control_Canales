@@ -18,6 +18,7 @@ ADMIN_ID = 8682208062
 # -------- DB --------
 conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cursor = conn.cursor()
+${{ Postgres.DATABASE_URL }}
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
