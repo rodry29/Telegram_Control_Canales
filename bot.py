@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     start_date TIMESTAMP,
     end_date TIMESTAMP,
     status TEXT,
-    trial_used INTEGER DEFAULT 0
+    trial_used INTEGER DEFAULT 0,
     payment_date TIMESTAMP DEFAULT NULL
 )
 """)
