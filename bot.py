@@ -7,6 +7,15 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 
+scheduler = BackgroundScheduler()
+
+# Verificar si ya está corriendo antes de iniciar
+if not scheduler.running:
+    scheduler.start()
+    print("Scheduler iniciado")
+else:
+    print("Scheduler ya estaba corriendo"
+          
 # -------- CONFIG --------
 TOKEN = "8782944509:AAFqTBOCPwJdhRgt2Qxx4Usj45DNF83Y86s"
 VIP_GROUP_ID = -1003842587095
