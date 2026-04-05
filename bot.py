@@ -95,10 +95,10 @@ async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "broadcast":
         await query.message.reply_text("Usa:\n/msg mensaje")
 
-elif query.data == "ganancias":
-    from datetime import datetime, timedelta
-
-    now = datetime.now()
+    elif query.data == "ganancias":
+        from datetime import datetime, timedelta
+    
+        now = datetime.now()
 
     # Inicio mes actual
     inicio_mes = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
