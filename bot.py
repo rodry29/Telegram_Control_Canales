@@ -41,7 +41,8 @@ PLANS = {
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("➕ Agregar", callback_data="add")],
-        [InlineKeyboardButton("📊 Status de suscriptores", callback_data="list")]
+        [InlineKeyboardButton("📊 Status de suscriptores", callback_data="list")],
+        [InlineKeyboardButton("💰 Ganancias", callback_data="ganancias")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -93,6 +94,77 @@ async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "broadcast":
         await query.message.reply_text("Usa:\n/msg mensaje")
+
+elif query.data == "ganancias":
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+
+    # Inicio mes actual
+    inicio_mes = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Inicio mes anterior
+    mes_anterior = (inicio_mes - timedelta(days=1)).replace(day=1)
+
+    # ---- MES ACTUAL ----
+    cursor.execute("""
+    SELECT plan FROM users
+    WHERE payment_date >= %s
+    """, (inicio_mes,))
+    data_actual = cursor.fetchall()
+
+    # ---- MES ANTERIOR ----
+    cursor.execute("""
+    SELECT plan FROM users
+    WHERE payment_date >= %s AND payment_date < %s
+    """, (mes_anterior, inicio_mes))
+    data_anterior = cursor.fetchall()
+
+    PRICES = {
+        "trial": 0,
+        "semanal": 10,
+        "mensual": 20
+    }
+
+    # ---- CALCULO MES ACTUAL ----
+    total_actual = 0
+    conteo_actual = {"trial": 0, "semanal": 0, "mensual": 0}
+
+    for (plan,) in data_actual:
+        conteo_actual[plan] += 1
+        total_actual += PRICES.get(plan, 0)
+
+    # ---- CALCULO MES ANTERIOR ----
+    total_anterior = 0
+    for (plan,) in data_anterior:
+        total_anterior += PRICES.get(plan, 0)
+
+    # ---- CRECIMIENTO ----
+    if total_anterior > 0:
+        crecimiento = ((total_actual - total_anterior) / total_anterior) * 100
+    else:
+        crecimiento = 100 if total_actual > 0 else 0
+
+    crecimiento = round(crecimiento, 2)
+
+    # ---- MENSAJE ----
+    msg = "💰 GANANCIAS DEL MES\n\n"
+    msg += f"🆓 Trial: {conteo_actual['trial']}\n"
+    msg += f"📅 Semanal: {conteo_actual['semanal']} ($10)\n"
+    msg += f"📆 Mensual: {conteo_actual['mensual']} ($20)\n\n"
+
+    msg += f"💵 TOTAL MES: ${total_actual}\n"
+    msg += f"📊 Mes anterior: ${total_anterior}\n"
+
+    # Emoji según crecimiento
+    if crecimiento > 0:
+        msg += f"📈 Crecimiento: +{crecimiento}%"
+    elif crecimiento < 0:
+        msg += f"📉 Crecimiento: {crecimiento}%"
+    else:
+        msg += f"➖ Sin cambio: {crecimiento}%"
+
+    await query.message.reply_text(msg)
 
 # -------- AGREGAR --------
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
