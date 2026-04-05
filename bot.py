@@ -269,4 +269,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(check_expired, "interval", hours=6)
 scheduler.start()
 
-app.run_polling()
+scheduler.start()
+
+if __name__ == "__main__":
+    app.run_polling()
