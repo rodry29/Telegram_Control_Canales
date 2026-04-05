@@ -78,7 +78,7 @@ async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "📊 STATUS DE SUSCRIPTORES\n\n"
 
         for username, end_date in users[:30]:
-            end = datetime.fromisoformat(end_date)
+            end = end_date
             hoy = datetime.now()
 
             dias_restantes = (end - hoy).days
