@@ -179,7 +179,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Plan inválido")
             return
 
-        cursor.execute("SELECT * FROM users WHERE username=?", (username,))
+        cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
         user = cursor.fetchone()
 
         if plan == "trial" and user and user[5] == 1:
