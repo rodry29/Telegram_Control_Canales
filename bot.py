@@ -1,4 +1,5 @@
-import sqlite3
+import psycopg2
+import os
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,21 +16,20 @@ VIP_GROUP_ID = -1003842587095
 ADMIN_ID = 8682208062
 
 # -------- DB --------
-conn = sqlite3.connect("database.db", check_same_thread=False)
+conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
     plan TEXT,
-    start_date TEXT,
-    end_date TEXT,
+    start_date TIMESTAMP,
+    end_date TIMESTAMP,
     status TEXT,
     trial_used INTEGER DEFAULT 0
 )
 """)
 conn.commit()
-
 # -------- PLANES --------
 PLANS = {
     "trial": 1,
