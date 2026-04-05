@@ -91,8 +91,6 @@ async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(msg)
 
-        await query.message.reply_text(msg)
-
     elif query.data == "broadcast":
         await query.message.reply_text("Usa:\n/msg mensaje")
 
@@ -101,71 +99,71 @@ async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
         now = datetime.now()
 
-    # Inicio mes actual
-    inicio_mes = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Inicio mes actual
+        inicio_mes = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    # Inicio mes anterior
-    mes_anterior = (inicio_mes - timedelta(days=1)).replace(day=1)
+        # Inicio mes anterior
+        mes_anterior = (inicio_mes - timedelta(days=1)).replace(day=1)
 
-    # ---- MES ACTUAL ----
-    cursor.execute("""
-    SELECT plan FROM users
-    WHERE payment_date >= %s
-    """, (inicio_mes,))
-    data_actual = cursor.fetchall()
+        # ---- MES ACTUAL ----
+        cursor.execute("""
+        SELECT plan FROM users
+        WHERE payment_date >= %s
+        """, (inicio_mes,))
+        data_actual = cursor.fetchall()
 
-    # ---- MES ANTERIOR ----
-    cursor.execute("""
-    SELECT plan FROM users
-    WHERE payment_date >= %s AND payment_date < %s
-    """, (mes_anterior, inicio_mes))
-    data_anterior = cursor.fetchall()
+        # ---- MES ANTERIOR ----
+        cursor.execute("""
+        SELECT plan FROM users
+        WHERE payment_date >= %s AND payment_date < %s
+        """, (mes_anterior, inicio_mes))
+        data_anterior = cursor.fetchall()
 
-    PRICES = {
-        "trial": 0,
-        "semanal": 10,
-        "mensual": 20
-    }
+        PRICES = {
+            "trial": 0,
+            "semanal": 10,
+            "mensual": 20
+        }
 
-    # ---- CALCULO MES ACTUAL ----
-    total_actual = 0
-    conteo_actual = {"trial": 0, "semanal": 0, "mensual": 0}
+        # ---- CALCULO MES ACTUAL ----
+        total_actual = 0
+        conteo_actual = {"trial": 0, "semanal": 0, "mensual": 0}
 
-    for (plan,) in data_actual:
-        conteo_actual[plan] += 1
-        total_actual += PRICES.get(plan, 0)
+        for (plan,) in data_actual:
+            conteo_actual[plan] += 1
+            total_actual += PRICES.get(plan, 0)
 
-    # ---- CALCULO MES ANTERIOR ----
-    total_anterior = 0
-    for (plan,) in data_anterior:
-        total_anterior += PRICES.get(plan, 0)
+        # ---- CALCULO MES ANTERIOR ----
+        total_anterior = 0
+        for (plan,) in data_anterior:
+            total_anterior += PRICES.get(plan, 0)
 
-    # ---- CRECIMIENTO ----
-    if total_anterior > 0:
-        crecimiento = ((total_actual - total_anterior) / total_anterior) * 100
-    else:
-        crecimiento = 100 if total_actual > 0 else 0
+        # ---- CRECIMIENTO ----
+        if total_anterior > 0:
+            crecimiento = ((total_actual - total_anterior) / total_anterior) * 100
+        else:
+            crecimiento = 100 if total_actual > 0 else 0
 
-    crecimiento = round(crecimiento, 2)
+        crecimiento = round(crecimiento, 2)
 
-    # ---- MENSAJE ----
-    msg = "💰 GANANCIAS DEL MES\n\n"
-    msg += f"🆓 Trial: {conteo_actual['trial']}\n"
-    msg += f"📅 Semanal: {conteo_actual['semanal']} ($10)\n"
-    msg += f"📆 Mensual: {conteo_actual['mensual']} ($20)\n\n"
+        # ---- MENSAJE ----
+        msg = "💰 GANANCIAS DEL MES\n\n"
+        msg += f"🆓 Trial: {conteo_actual['trial']}\n"
+        msg += f"📅 Semanal: {conteo_actual['semanal']} ($10)\n"
+        msg += f"📆 Mensual: {conteo_actual['mensual']} ($20)\n\n"
+    
+        msg += f"💵 TOTAL MES: ${total_actual}\n"
+        msg += f"📊 Mes anterior: ${total_anterior}\n"
 
-    msg += f"💵 TOTAL MES: ${total_actual}\n"
-    msg += f"📊 Mes anterior: ${total_anterior}\n"
-
-    # Emoji según crecimiento
-    if crecimiento > 0:
-        msg += f"📈 Crecimiento: +{crecimiento}%"
-    elif crecimiento < 0:
-        msg += f"📉 Crecimiento: {crecimiento}%"
-    else:
-        msg += f"➖ Sin cambio: {crecimiento}%"
-
-    await query.message.reply_text(msg)
+        # Emoji según crecimiento
+        if crecimiento > 0:
+            msg += f"📈 Crecimiento: +{crecimiento}%"
+        elif crecimiento < 0:
+            msg += f"📉 Crecimiento: {crecimiento}%"
+        else:
+            msg += f"➖ Sin cambio: {crecimiento}%"
+    
+        await query.message.reply_text(msg)
 
 # -------- AGREGAR --------
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,15 +312,29 @@ async def check_expired():
             except:
                 conn.rollback()
 
+# -------- MANEJADOR UNIFICADO --------
+async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    # Separar datos del callback
+    if "|" in query.data:
+        # Es una alerta (renew7|username, renew30|username, etc.)
+        await alert_actions(update, context)
+    else:
+        # Es un botón del panel (add, list, ganancias, etc.)
+        await panel_buttons(update, context)
+        
 # -------- MAIN --------
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("add", add_user))
 
-
-app.add_handler(CallbackQueryHandler(panel_buttons))
-app.add_handler(CallbackQueryHandler(alert_actions))
+app.add_handler(CallbackQueryHandler(handle_all_callbacks))
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_expired, "interval", hours=6)
