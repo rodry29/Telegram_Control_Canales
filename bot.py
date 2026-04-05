@@ -16,16 +16,8 @@ VIP_GROUP_ID = -1003842587095
 ADMIN_ID = 8682208062
 
 # -------- DB --------
-try:
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-    cursor = conn.cursor()
-    print("Conectado a DB")
-except Exception as e:
-    print(f"❌ Error conectando a DB: {e}")
-    print("⚠️ Asegúrate de tener PostgreSQL configurado en Railway")
-    raise
-
-print("Tabla verificada")
+conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
@@ -38,7 +30,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 conn.commit()
-print("✅ Tabla 'users' verificada/creada")
 # -------- PLANES --------
 PLANS = {
     "trial": 1,
