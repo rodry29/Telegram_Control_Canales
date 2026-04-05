@@ -41,9 +41,7 @@ PLANS = {
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("➕ Agregar", callback_data="add")],
-        [InlineKeyboardButton("🔄 Renovar", callback_data="renew")],
-        [InlineKeyboardButton("📊 Activos", callback_data="list")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
+        [InlineKeyboardButton("📊 Status de suscriptores", callback_data="list")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -68,12 +66,28 @@ async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Formato:\n/renovar @usuario plan")
 
     elif query.data == "list":
+        from datetime import datetime
+
         cursor.execute("SELECT username, end_date FROM users WHERE status='activo'")
         users = cursor.fetchall()
 
-        msg = "🟢 Activos:\n"
-        for u in users[:30]:
-            msg += f"{u[0]} → {u[1][:10]}\n"
+        if not users:
+            await query.message.reply_text("No hay usuarios activos")
+            return
+
+        msg = "📊 STATUS DE SUSCRIPTORES\n\n"
+
+        for username, end_date in users[:30]:
+            end = datetime.fromisoformat(end_date)
+            hoy = datetime.now()
+
+            dias_restantes = (end - hoy).days
+
+            msg += f"👤 {username}\n"
+            msg += f"📅 Expira: {end.date()}\n"
+            msg += f"⏳ Días restantes: {dias_restantes}\n\n"
+
+        await query.message.reply_text(msg)
 
         await query.message.reply_text(msg)
 
@@ -120,29 +134,6 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except:
         await update.message.reply_text("Error en formato")
-
-# -------- RENOVAR --------
-async def renew_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_ID:
-        return
-
-    username = context.args[0]
-    plan = context.args[1]
-
-    if plan == "trial":
-        await update.message.reply_text("No se puede renovar trial")
-        return
-
-    days = PLANS[plan]
-    end = datetime.now() + timedelta(days=days)
-
-    cursor.execute("""
-    UPDATE users SET plan=?, end_date=?, status='activo'
-    WHERE username=?
-    """, (plan, end.isoformat(), username))
-    conn.commit()
-
-    await update.message.reply_text("🔄 Renovado")
 
 # -------- BOTONES ALERTA --------
 def alert_buttons(username):
@@ -235,34 +226,12 @@ async def check_expired():
             """, (username,))
             conn.commit()
 
-# -------- BROADCAST --------
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_ID:
-        return
-
-    msg = " ".join(context.args)
-
-    cursor.execute("SELECT username FROM users WHERE status='activo'")
-    users = cursor.fetchall()
-
-    enviados = 0
-
-    for (u,) in users:
-        try:
-            await context.bot.send_message(u, msg)
-            enviados += 1
-        except:
-            pass
-
-    await update.message.reply_text(f"📢 Enviado a {enviados}")
-
 # -------- MAIN --------
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("add", add_user))
-app.add_handler(CommandHandler("renovar", renew_user))
-app.add_handler(CommandHandler("msg", broadcast))
+
 
 app.add_handler(CallbackQueryHandler(panel_buttons))
 app.add_handler(CallbackQueryHandler(alert_actions))
