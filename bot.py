@@ -204,9 +204,15 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(f"✅ {username} activo hasta {end.date()}")
 
-    except:
-        await update.message.reply_text("Error en formato")
-
+    except Exception as e:
+        await update.message.reply_text(
+        "❌ Formato incorrecto\n\nUsa:\n/add @usuario plan\n\nPlanes:\n- trial\n- semanal\n- mensual"
+        )
+        print("ERROR ADD:", e)
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Falta información\nUsa: /add @usuario plan")
+        return
+        
 # -------- BOTONES ALERTA --------
 def alert_buttons(username):
     keyboard = [
