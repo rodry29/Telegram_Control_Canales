@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS users (
     end_date TIMESTAMP,
     status TEXT,
     trial_used INTEGER DEFAULT 0
+    payment_date TIMESTAMP DEFAULT NULL
 )
 """)
 conn.commit()
@@ -193,7 +194,14 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trial_used = 1 if plan == "trial" else (user[5] if user else 0)
 
         cursor.execute("""
-        INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)
+        INSERT INTO users (username, plan, start_date, end_date, status, trial_used)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (username) DO UPDATE SET
+            plan = EXCLUDED.plan,
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            status = EXCLUDED.status,
+            trial_used = EXCLUDED.trial_used
         """, (username, plan, start.isoformat(), end.isoformat(), "activo", trial_used))
         conn.commit()
 
@@ -249,7 +257,7 @@ async def alert_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-        cursor.execute("UPDATE users SET status='vencido' WHERE username=?", (username,))
+        cursor.execute("UPDATE users SET status='vencido' WHERE username=%s", (username,))
         conn.commit()
 
         await query.message.reply_text(f"🚪 {username} expulsado")
@@ -258,7 +266,7 @@ async def alert_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     end = datetime.now() + timedelta(days=days)
 
     cursor.execute("""
-    UPDATE users SET end_date=?, status='activo' WHERE username=?
+    UPDATE users SET end_date=%s, status='activo' WHERE username=%s
     """, (end.isoformat(), username))
     conn.commit()
 
@@ -288,21 +296,23 @@ async def check_expired():
 
         if now > end:
             msg = f"❌ Vencido\n{username}\nFecha: {end.date()}"
-            await context.bot.send_message(
+            bot = Bot(token=TOKEN)
+            await bot.send_message(
                 ADMIN_ID,
                 msg,
                 reply_markup=alert_buttons(username)
             )
 
             try:
-                await context.bot.ban_chat_member(VIP_GROUP_ID, username)
+                await bot.ban_chat_member(VIP_GROUP_ID, username)
             except:
                 pass
 
-            cursor.execute("""
-            UPDATE users SET status='vencido' WHERE username=?
-            """, (username,))
-            conn.commit()
+            try:
+                cursor.execute("UPDATE users SET status='vencido' WHERE username=%s", (username,))
+                conn.commit()
+            except:
+                conn.rollback()
 
 # -------- MAIN --------
 app = ApplicationBuilder().token(TOKEN).build()
