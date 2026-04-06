@@ -267,90 +267,90 @@ class Database:
         logger.info("✅ Base de datos inicializada")
 
     async def init_tables(self):
-    """Inicializa las tablas con soporte multi-grupo"""
-    with self.get_connection() as conn:
-        with conn.cursor() as cur:
-            # Verificar si la tabla groups existe
-            cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'groups'
-            )
-            """)
-            groups_exists = cur.fetchone()[0]
-            
-            if not groups_exists:
-                # Crear tabla groups
+        """Inicializa las tablas con soporte multi-grupo"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Verificar si la tabla groups existe
                 cur.execute("""
-                CREATE TABLE groups (
-                    group_id BIGINT PRIMARY KEY,
-                    group_name TEXT,
-                    admin_id BIGINT,
-                    super_admin_id BIGINT,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    settings JSONB DEFAULT '{}'::jsonb
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'groups'
                 )
                 """)
-                logger.info("✅ Tabla 'groups' creada")
-            else:
-                # Verificar columnas existentes
+                groups_exists = cur.fetchone()[0]
+                
+                if not groups_exists:
+                    # Crear tabla groups
+                    cur.execute("""
+                    CREATE TABLE groups (
+                        group_id BIGINT PRIMARY KEY,
+                        group_name TEXT,
+                        admin_id BIGINT,
+                        super_admin_id BIGINT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        settings JSONB DEFAULT '{}'::jsonb
+                    )
+                    """)
+                    logger.info("✅ Tabla 'groups' creada")
+                else:
+                    # Verificar columnas existentes
+                    cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'groups'
+                    """)
+                    existing_columns = [row[0] for row in cur.fetchall()]
+                    
+                    # Agregar columnas faltantes
+                    if 'group_name' not in existing_columns:
+                        cur.execute("ALTER TABLE groups ADD COLUMN group_name TEXT")
+                    if 'admin_id' not in existing_columns:
+                        cur.execute("ALTER TABLE groups ADD COLUMN admin_id BIGINT")
+                    if 'super_admin_id' not in existing_columns:
+                        cur.execute("ALTER TABLE groups ADD COLUMN super_admin_id BIGINT")
+                    if 'settings' not in existing_columns:
+                        cur.execute("ALTER TABLE groups ADD COLUMN settings JSONB DEFAULT '{}'::jsonb")
+                    
+                    logger.info("✅ Tabla 'groups' verificada")
+                
+                # Tabla de usuarios
                 cur.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'groups'
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    plan TEXT NOT NULL,
+                    start_date TIMESTAMP NOT NULL,
+                    end_date TIMESTAMP NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    trial_used BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, group_id)
+                )
                 """)
-                existing_columns = [row[0] for row in cur.fetchall()]
                 
-                # Agregar columnas faltantes
-                if 'group_name' not in existing_columns:
-                    cur.execute("ALTER TABLE groups ADD COLUMN group_name TEXT")
-                if 'admin_id' not in existing_columns:
-                    cur.execute("ALTER TABLE groups ADD COLUMN admin_id BIGINT")
-                if 'super_admin_id' not in existing_columns:
-                    cur.execute("ALTER TABLE groups ADD COLUMN super_admin_id BIGINT")
-                if 'settings' not in existing_columns:
-                    cur.execute("ALTER TABLE groups ADD COLUMN settings JSONB DEFAULT '{}'::jsonb")
+                # Tabla de pagos
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    plan TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    payment_date TIMESTAMP DEFAULT NOW()
+                )
+                """)
                 
-                logger.info("✅ Tabla 'groups' verificada")
-            
-            # Tabla de usuarios
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                group_id BIGINT NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                plan TEXT NOT NULL,
-                start_date TIMESTAMP NOT NULL,
-                end_date TIMESTAMP NOT NULL,
-                status TEXT DEFAULT 'active',
-                trial_used BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(user_id, group_id)
-            )
-            """)
-            
-            # Tabla de pagos
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                group_id BIGINT NOT NULL,
-                username TEXT,
-                plan TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                payment_date TIMESTAMP DEFAULT NOW()
-            )
-            """)
-            
-            # Índices
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
-            
-            conn.commit()
+                # Índices
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                
+                conn.commit()
             
             # Registrar grupos configurados (si existen en GROUPS)
             if GROUPS:
