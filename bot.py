@@ -13,6 +13,73 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, Defaults, ChatMemberHandler
 )
+from telegram.ext import MessageHandler, filters
+
+async def detect_new_member_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detecta cuando alguien entra al grupo mediante el mensaje de Telegram"""
+    if not update.message:
+        return
+    
+    # Verificar que es el grupo correcto
+    if update.message.chat_id != VIP_GROUP_ID:
+        return
+    
+    # Verificar si hay nuevos miembros en el mensaje
+    if update.message.new_chat_members:
+        for new_member in update.message.new_chat_members:
+            # Ignorar si es el bot mismo
+            if new_member.id == context.bot.id:
+                continue
+            
+            user_id = new_member.id
+            username = new_member.username or f"user_{user_id}"
+            first_name = new_member.first_name or ""
+            
+            logger.info(f"📥 Nuevo miembro detectado por mensaje: @{username} ({user_id})")
+            
+            # Registrar automáticamente
+            registered, result = await db.register_user_auto(user_id, username, first_name)
+            
+            if registered:
+                if result == "trial_nuevo":
+                    welcome_msg = (
+                        f"🎉 ¡Bienvenido @{username}!\n\n"
+                        f"✨ Has recibido un **TRIAL GRATIS de 1 día**\n"
+                        f"📅 Expira: {(datetime.now() + timedelta(days=1)).strftime('%d/%m/%Y')}\n\n"
+                        f"Para continuar después del trial, contacta al administrador.\n\n"
+                        f"Planes disponibles:\n"
+                        f"• 📅 Semanal (7 días) - $10\n"
+                        f"• 📆 Mensual (30 días) - $20"
+                    )
+                    await context.bot.send_message(user_id, welcome_msg, parse_mode="Markdown")
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"🆕 *Nuevo usuario registrado automáticamente*\n"
+                        f"👤 @{username}\n"
+                        f"🎁 Trial activado por 1 día",
+                        parse_mode="Markdown"
+                    )
+                elif result == "activo":
+                    user_data = await db.get_user_by_id(user_id)
+                    if user_data:
+                        days_left = (user_data['end_date'] - datetime.now()).days
+                        await context.bot.send_message(
+                            user_id,
+                            f"🎉 ¡Bienvenido de vuelta @{username}!\n\n"
+                            f"✅ Tu suscripción está activa\n"
+                            f"📅 Expira en {days_left} días"
+                        )
+            else:
+                if result == "expirado":
+                    # Expulsar inmediatamente
+                    await context.bot.ban_chat_member(VIP_GROUP_ID, user_id)
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"🚫 *ACCESO DENEGADO*\n"
+                        f"👤 @{username}\n"
+                        f"❌ Usuario expirado intentó reingresar - Expulsado",
+                        parse_mode="Markdown"
+                    )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------- CONFIGURACIÓN ----------
@@ -668,6 +735,77 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "export_month":
         await export_report(update, context)
 
+async def register_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/register @username - Registra manualmente un usuario que ya está en el grupo"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Usa: `/register @username`", parse_mode="Markdown")
+        return
+    
+    username = context.args[0].replace("@", "")
+    
+    # Buscar el usuario en el grupo
+    try:
+        # Intentar obtener info del miembro del grupo
+        member = await context.bot.get_chat_member(VIP_GROUP_ID, username)
+        user_id = member.user.id
+        username = member.user.username or username
+        first_name = member.user.first_name or ""
+        
+        # Registrar manualmente
+        registered, result = await db.register_user_auto(user_id, username, first_name)
+        
+        if registered:
+            await update.message.reply_text(f"✅ Usuario @{username} registrado correctamente con TRIAL")
+            
+            # Notificar al usuario
+            await context.bot.send_message(
+                user_id,
+                f"🎉 ¡Tu suscripción TRIAL ha sido activada!\n"
+                f"📅 Expira en 1 día\n\n"
+                f"Para renovar, contacta al administrador."
+            )
+        else:
+            if result == "expirado":
+                await update.message.reply_text(f"❌ Usuario @{username} ya expiró y no puede ser registrado nuevamente")
+            else:
+                await update.message.reply_text(f"⚠️ No se pudo registrar a @{username}")
+                
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: No pude encontrar a @{username} en el grupo.\nAsegúrate de que esté en el grupo y que el bot sea admin.")
+        logger.error(f"Error en register: {e}")
+
+async def check_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check @username - Verifica el estado de un usuario"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Usa: `/check @username`", parse_mode="Markdown")
+        return
+    
+    username = context.args[0].replace("@", "")
+    user = await db.get_user_by_username(username)
+    
+    if not user:
+        await update.message.reply_text(f"❌ No hay registro de @{username}")
+        return
+    
+    status_emoji = "🟢" if user['status'] == 'active' and user['end_date'] > datetime.now() else "🔴"
+    days_left = (user['end_date'] - datetime.now()).days if user['end_date'] > datetime.now() else 0
+    
+    msg = f"📊 *Estado de @{username}*\n\n"
+    msg += f"{status_emoji} Estado: {user['status']}\n"
+    msg += f"📋 Plan: {user['plan']}\n"
+    msg += f"📅 Inicio: {user['start_date'].strftime('%d/%m/%Y')}\n"
+    msg += f"📅 Expira: {user['end_date'].strftime('%d/%m/%Y')}\n"
+    msg += f"⏳ Días restantes: {days_left}\n"
+    msg += f"🎁 Trial usado: {'✅' if user['trial_used'] else '❌'}"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 # ---------- TAREAS PROGRAMADAS ----------
 async def check_expiring_subscriptions():
     """Verifica suscripciones próximas a expirar (7 AM)"""
@@ -779,6 +917,9 @@ async def main():
     bot_app.add_handler(CommandHandler("remove", remove_user))
     bot_app.add_handler(CommandHandler("export", export_report))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
+    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member_message))
+    bot_app.add_handler(CommandHandler("register", register_user_command))
+    bot_app.add_handler(CommandHandler("check", check_user_command))
     
     # Detectar nuevos miembros
     bot_app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
