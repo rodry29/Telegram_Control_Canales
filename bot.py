@@ -15,6 +15,13 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# Logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # ==================== CONFIGURACIÓN ====================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -48,13 +55,6 @@ for group_config in GROUPS_CONFIG.split(","):
                 "group_name": parts[2],
                 "admin_id": int(parts[3])
             })
-
-# Logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 
 # ==================== FUNCIONES DE UTILIDAD ====================
