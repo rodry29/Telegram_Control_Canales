@@ -550,10 +550,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Panel de Control - Suscripciones VIP*\n\n"
         "Gestiona las suscripciones de los usuarios.\n\n"
-        "📌 *Comandos:*\n"
-        "`/add @username plan` - Agregar/Renovar usuario\n"
-        "`/remove @username` - Expulsar usuario\n"
-        "`/export` - Exportar reporte del mes\n\n"
         "Planes: `trial`, `semanal`, `mensual`",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -636,38 +632,125 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {e}")
 
 async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/export - Exporta reporte del mes"""
-    if update.effective_user.id != ADMIN_ID:
+    """/export - Exporta reporte del mes actual a CSV (funciona con comando y botón)"""
+    
+    # Determinar si es callback (botón) o comando directo
+    query = update.callback_query
+    
+    if query:
+        # Es un clic en botón
+        await query.answer()  # Esto es IMPORTANTE para botones
+        message = query.message
+        user_id = query.from_user.id
+    else:
+        # Es un comando /export
+        message = update.message
+        user_id = update.effective_user.id
+    
+    # Verificar autorización
+    if user_id != ADMIN_ID:
+        if query:
+            await query.edit_message_text("❌ No autorizado")
+        else:
+            await message.reply_text("❌ No autorizado")
         return
     
     now = datetime.now()
-    report = await db.get_monthly_report(now.year, now.month)
+    year = now.year
+    month = now.month
     
-    if not report['transactions']:
-        await update.message.reply_text(f"📭 No hay transacciones en {now.strftime('%B %Y')}")
-        return
+    # Mostrar mensaje de "procesando"
+    processing_msg = await message.reply_text("📊 Generando reporte... Por favor espera.")
     
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['Fecha', 'User ID', 'Username', 'Plan', 'Monto'])
-    
-    for t in report['transactions']:
-        writer.writerow([
-            t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'),
-            t['user_id'],
-            t['username'] or '',
-            t['plan'],
-            f"${t['amount']}"
-        ])
-    
-    output.seek(0)
-    
-    await update.message.reply_document(
-        document=output.getvalue().encode('utf-8'),
-        filename=f"reporte_{now.year}_{now.month:02d}.csv",
-        caption=f"📊 Reporte de {now.strftime('%B %Y')}\n💰 Total: ${report['total']}"
-    )
-    output.close()
+    try:
+        # Obtener datos del mes
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                start_date = datetime(year, month, 1)
+                if month == 12:
+                    end_date = datetime(year + 1, 1, 1)
+                else:
+                    end_date = datetime(year, month + 1, 1)
+                
+                # Transacciones
+                cur.execute("""
+                SELECT user_id, username, plan, amount, payment_date
+                FROM payments
+                WHERE payment_date >= %s AND payment_date < %s
+                ORDER BY payment_date DESC
+                """, (start_date, end_date))
+                transactions = cur.fetchall()
+                
+                # Resumen por plan
+                cur.execute("""
+                SELECT plan, COUNT(*) as count, SUM(amount) as total
+                FROM payments
+                WHERE payment_date >= %s AND payment_date < %s
+                GROUP BY plan
+                """, (start_date, end_date))
+                summary = cur.fetchall()
+                
+                total = sum(row['total'] for row in summary) if summary else 0
+                
+                # Usuarios nuevos
+                cur.execute("""
+                SELECT COUNT(*) as new_users
+                FROM users
+                WHERE created_at >= %s AND created_at < %s
+                """, (start_date, end_date))
+                new_users = cur.fetchone()['new_users']
+        
+        if not transactions:
+            await processing_msg.edit_text(f"📭 No hay transacciones en {now.strftime('%B %Y')}")
+            return
+        
+        # Crear CSV
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        writer.writerow(['Fecha', 'User ID', 'Username', 'Plan', 'Monto (USD)'])
+        writer.writerow(['='*50, '='*10, '='*20, '='*10, '='*15])
+        
+        for t in transactions:
+            writer.writerow([
+                t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'),
+                t['user_id'],
+                t['username'] or 'Sin username',
+                t['plan'].upper(),
+                f"${t['amount']}"
+            ])
+        
+        writer.writerow([])
+        writer.writerow(['RESUMEN DEL MES', '', '', '', ''])
+        writer.writerow(['-'*30, '', '', '', ''])
+        
+        for s in summary:
+            plan_name = PLANS.get(s['plan'], {}).get('name', s['plan'])
+            writer.writerow([f'{plan_name}:', f"{s['count']} ventas", f"${s['total']}", '', ''])
+        
+        writer.writerow([])
+        writer.writerow([f'TOTAL DEL MES:', '', '', '', f"${total}"])
+        writer.writerow([f'NUEVOS USUARIOS:', '', '', '', new_users])
+        
+        output.seek(0)
+        
+        # Eliminar mensaje de "procesando"
+        await processing_msg.delete()
+        
+        # Enviar el archivo
+        await message.reply_document(
+            document=output.getvalue().encode('utf-8-sig'),
+            filename=f"reporte_{year}_{month:02d}.csv",
+            caption=f"📊 *Reporte de {now.strftime('%B %Y')}*\n💰 Total: ${total}\n👥 Nuevos usuarios: {new_users}",
+            parse_mode="Markdown"
+        )
+        
+        output.close()
+        logger.info(f"Reporte exportado: {year}-{month:02d} - Total: ${total}")
+        
+    except Exception as e:
+        logger.error(f"Error exportando reporte: {e}")
+        await processing_msg.edit_text(f"❌ Error al generar el reporte: {str(e)}")
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lista usuarios activos"""
@@ -774,20 +857,36 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja callbacks del teclado"""
+    """Maneja los callbacks del teclado inline"""
     query = update.callback_query
-    await query.answer()
+    
+    # Log para depuración
+    logger.info(f"Callback recibido: {query.data} de usuario {query.from_user.id}")
     
     if query.data == "add_user":
-        await query.message.reply_text("📝 Usa: `/add @username plan`", parse_mode="Markdown")
+        await query.answer()
+        await query.message.reply_text(
+            "📝 *Agregar usuario*\n\n"
+            "Usa el comando:\n"
+            "`/add @username plan`\n\n"
+            "Planes: trial, semanal, mensual",
+            parse_mode="Markdown"
+        )
     elif query.data == "list_active":
+        await query.answer()
         await list_active_users(update, context)
     elif query.data == "earnings":
+        await query.answer()
         await show_earnings(update, context)
     elif query.data == "stats":
+        await query.answer()
         await show_stats(update, context)
     elif query.data == "export_month":
+        # ✅ IMPORTANTE: No llamar a query.answer() dos veces
+        # export_report ya llama a query.answer()
         await export_report(update, context)
+    else:
+        await query.answer(f"Opción no implementada: {query.data}")
 
 async def register_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/register @username - Registra manualmente un usuario que ya está en el grupo"""
