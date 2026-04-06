@@ -594,7 +594,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Panel de control según rol y tipo de grupo"""
+    
+    # Log inmediato
+    print(f"🔹 /start recibido de usuario {update.effective_user.id}")
+    logger.info(f"🔹 /start recibido de usuario {update.effective_user.id}")
+    
+    user_id = update.effective_user.id
+    
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/add @username plan - Agrega o renueva usuario (solo con username)"""
     user_id = update.effective_user.id
@@ -1218,51 +1226,41 @@ async def check_expired_subscriptions():
 async def main():
     global bot_app
     
+    print("🔹 Iniciando main()...")
+    
     await db.init_tables()
+    print("🔹 Tablas inicializadas")
+    
     await db.load_groups_from_db()
+    print(f"🔹 Grupos cargados: {len(GROUPS)}")
+    
     logger.info(f"📦 {len(GROUPS)} grupos disponibles")
     
     defaults = Defaults(parse_mode="HTML")
     bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
+    print("🔹 Application construida")
     
     # Handlers
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("add", add_user_command))
     bot_app.add_handler(CommandHandler("groups", list_groups))
     bot_app.add_handler(CommandHandler("addgroup", add_group_command))
-    bot_app.add_handler(CommandHandler("editgroup", edit_group_command))
-    bot_app.add_handler(CommandHandler("groupinfo", group_info))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Detectar nuevos miembros
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
     
-    # Tareas
+    print("🔹 Handlers registrados")
+    
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
     scheduler.start()
+    print("🔹 Scheduler iniciado")
     
     logger.info("🤖 Bot iniciado")
+    print("🔹 Iniciando polling...")
     
-    # ✅ Manejo más robusto del polling
-    try:
-        await bot_app.initialize()
-        await bot_app.start()
-        
-        # Limpiar webhook antes de iniciar polling
-        await bot_app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook limpiado")
-        
-        await bot_app.updater.start_polling(
-            drop_pending_updates=True,  # Ignorar actualizaciones pendientes
-            timeout=30,  # Timeout más corto
-            read_timeout=30
-        )
-        
-        # Mantener el bot corriendo
-        await asyncio.Event().wait()
-        
-    except Exception as e:
-        logger.error(f"Error en el bot: {e}")
-        await asyncio.sleep(5)
-        # Reiniciar
-        asyncio.create_task(main())
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling(drop_pending_updates=True)
+    
+    print("🔹 Bot está corriendo. Esperando actualizaciones...")
+    
+    await asyncio.Event().wait()
