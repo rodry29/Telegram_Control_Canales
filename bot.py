@@ -1,8 +1,3 @@
-"""
-Telegram Bot para Gestión de Suscripciones VIP
-Escalable para 10k+ usuarios en Railway con PostgreSQL
-"""
-
 import os
 import csv
 import asyncio
@@ -16,15 +11,15 @@ from psycopg2.extras import RealDictCursor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, Defaults, ConversationHandler
+    ContextTypes, Defaults
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------- CONFIGURACIÓN ----------
-TOKEN = os.getenv("8782944509:AAFqTBOCPwJdhRgt2Qxx4Usj45DNF83Y86s")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("8682208062", 0))
-VIP_GROUP_ID = int(os.getenv("-1003842587095", 0))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+VIP_GROUP_ID = int(os.getenv("VIP_GROUP_ID", 0))
 
 # Planes y precios (días, precio, nombre)
 PLANS = {
@@ -39,9 +34,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Estados para conversación
-WAITING_FOR_USERNAME, WAITING_FOR_PLAN = range(2)
 
 # ---------- BASE DE DATOS ----------
 class Database:
@@ -150,7 +142,7 @@ class Database:
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """, (user_id, username, first_name, plan, start_date, end_date, trial_used))
                 
-                # Registrar el pago (incluye username para estadísticas)
+                # Registrar el pago
                 cur.execute("""
                 INSERT INTO payments (user_id, username, plan, amount, payment_date)
                 VALUES (%s, %s, %s, %s, %s)
@@ -158,8 +150,7 @@ class Database:
                 
                 conn.commit()
                 
-                days_left = days
-                message = f"✅ {username or user_id} activado con {PLANS[plan]['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}\n⏳ Días: {days_left}"
+                message = f"✅ {username or user_id} activado con {PLANS[plan]['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
                 return True, message
     
     async def get_expiring_users(self, days_before: int) -> List[Dict]:
@@ -258,11 +249,12 @@ class Database:
                 return cur.fetchone()[0]
     
     async def get_all_active_users(self) -> List[Dict]:
-        """Obtiene todos los usuarios activos para reporte"""
+        """Obtiene todos los usuarios activos con días restantes"""
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                SELECT user_id, username, first_name, plan, start_date, end_date
+                SELECT user_id, username, first_name, plan, start_date, end_date,
+                       EXTRACT(DAY FROM (end_date - NOW())) as days_left
                 FROM users
                 WHERE status = 'active' AND end_date > NOW()
                 ORDER BY end_date ASC
@@ -272,6 +264,7 @@ class Database:
 # ---------- INSTANCIA GLOBAL ----------
 db = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
+bot_app = None  # Se asignará en main
 
 # ---------- FUNCIONES DEL BOT ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,113 +291,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-
-# ---------- AGREGAR USUARIO (CONVERSACIÓN) ----------
-async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el proceso de agregar usuario"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    await update.message.reply_text(
-        "📝 *Agregar nuevo usuario*\n\n"
-        "Envía el *username* del usuario (ej: @usuario):\n\n"
-        "Puedes usar el `user_id` numérico si no tiene username.\n\n"
-        "Escribe *cancelar* para salir.",
-        parse_mode="Markdown"
-    )
-    return WAITING_FOR_USERNAME
-
-async def get_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe el username"""
-    if update.message.text.lower() == "cancelar":
-        await update.message.reply_text("❌ Operación cancelada")
-        return ConversationHandler.END
-    
-    username = update.message.text.replace("@", "").strip()
-    context.user_data['new_username'] = username
-    
-    # Intentar obtener user_id (si es numérico)
-    if username.isdigit():
-        context.user_data['new_user_id'] = int(username)
-    else:
-        # Buscar user_id en la DB si ya existe
-        existing = await db.get_user_by_username(username)
-        if existing:
-            context.user_data['new_user_id'] = existing['user_id']
-        else:
-            # No tenemos el user_id, se pedirá después
-            context.user_data['new_user_id'] = None
-    
-    keyboard = [
-        [InlineKeyboardButton("🎁 Trial (1 día - $0)", callback_data="plan_trial")],
-        [InlineKeyboardButton("📅 Semanal (7 días - $10)", callback_data="plan_semanal")],
-        [InlineKeyboardButton("📆 Mensual (30 días - $20)", callback_data="plan_mensual")]
-    ]
-    await update.message.reply_text(
-        f"👤 Usuario: @{username}\n\n"
-        "Ahora selecciona el *plan*:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-    return WAITING_FOR_PLAN
-
-async def get_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe el plan via callback"""
-    query = update.callback_query
-    await query.answer()
-    
-    plan = query.data.replace("plan_", "")
-    username = context.user_data.get('new_username')
-    user_id = context.user_data.get('new_user_id')
-    
-    if plan not in PLANS:
-        await query.message.reply_text("❌ Plan inválido")
-        return ConversationHandler.END
-    
-    plan_config = PLANS[plan]
-    
-    # Si no tenemos user_id, necesitamos que el admin lo proporcione
-    if not user_id:
-        await query.message.reply_text(
-            f"⚠️ No tengo el ID numérico de @{username}\n\n"
-            "Por favor, envía el `user_id` numérico del usuario.\n"
-            "Puedes obtenerlo con @userinfobot o en los logs del bot.",
-            parse_mode="Markdown"
-        )
-        context.user_data['pending_plan'] = plan
-        return WAITING_FOR_PLAN
-    
-    # Procesar la suscripción
-    success, message = await db.add_or_update_user(
-        user_id=user_id,
-        username=username,
-        first_name="",
-        plan=plan,
-        days=plan_config['days'],
-        amount=plan_config['price']
-    )
-    
-    if success:
-        # Agregar al grupo VIP si está activo
-        try:
-            await context.bot.unban_chat_member(VIP_GROUP_ID, user_id)
-            await context.bot.send_message(
-                VIP_GROUP_ID,
-                f"🎉 ¡Bienvenido @{username}! Tu suscripción {plan_config['name']} está activa."
-            )
-        except:
-            pass
-    
-    await query.message.reply_text(message)
-    
-    # Limpiar datos
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancela la conversación"""
-    await update.message.reply_text("❌ Operación cancelada")
-    return ConversationHandler.END
 
 # ---------- COMANDOS DE ADMIN ----------
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,7 +332,8 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ No tengo registro de @{username}\n\n"
                 "Por favor, usa el formato completo:\n"
                 "`/add user_id @username plan`\n\n"
-                "Ejemplo: `/add 123456789 @juan semanal`",
+                "Ejemplo: `/add 123456789 @juan semanal`\n\n"
+                "Para obtener el user_id, pídele al usuario que envíe un mensaje al bot o usa @userinfobot",
                 parse_mode="Markdown"
             )
             return
@@ -461,9 +348,13 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         if success:
-            # Agregar al grupo VIP
+            # Agregar al grupo VIP (unban por si estaba baneado)
             try:
                 await context.bot.unban_chat_member(VIP_GROUP_ID, user_id)
+                await context.bot.send_message(
+                    VIP_GROUP_ID,
+                    f"🎉 ¡Bienvenido @{username}! Tu suscripción {plan_config['name']} está activa."
+                )
             except:
                 pass
         
@@ -522,7 +413,7 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     writer = csv.writer(output)
     
     # Encabezados
-    writer.writerow(['Fecha', 'Usuario', 'Username', 'Plan', 'Monto'])
+    writer.writerow(['Fecha', 'User ID', 'Username', 'Plan', 'Monto'])
     
     for t in report['transactions']:
         writer.writerow([
@@ -536,11 +427,11 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Agregar resumen al final
     writer.writerow([])
     writer.writerow(['RESUMEN', '', '', '', ''])
-    writer.writerow(['Total del mes', f"${report['total']}"])
-    writer.writerow(['Nuevos usuarios', report['new_users']])
+    writer.writerow(['Total del mes', '', '', '', f"${report['total']}"])
+    writer.writerow(['Nuevos usuarios', '', '', '', report['new_users']])
     
     for s in report['summary']:
-        writer.writerow([f"  {s['plan']}", f"{s['count']} ventas", f"${s['total']}"])
+        writer.writerow([f"  {s['plan']}", '', f"{s['count']} ventas", '', f"${s['total']}"])
     
     output.seek(0)
     
@@ -553,7 +444,7 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output.close()
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista de usuarios activos"""
+    """Muestra lista de usuarios activos con días restantes"""
     if update.effective_user.id != ADMIN_ID:
         return
     
@@ -574,16 +465,73 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
     
     for user in users[:30]:  # Límite de 30 por mensaje
-        days_left = (user['end_date'] - datetime.now()).days
-        emoji = "🟢" if days_left > 7 else "🟡" if days_left > 2 else "🔴"
-        msg += f"{emoji} @{user['username'] or user['user_id']}\n"
-        msg += f"   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n"
+        days_left = user['days_left']
+        if days_left is not None:
+            days_left = int(days_left)
+        else:
+            # Calcular manualmente si no vino de la consulta
+            days_left = (user['end_date'] - datetime.now()).days
+        
+        # Emoji según días restantes
+        if days_left > 7:
+            emoji = "🟢"
+        elif days_left > 2:
+            emoji = "🟡"
+        elif days_left > 0:
+            emoji = "🔴"
+        else:
+            emoji = "⚫"
+        
+        username_display = f"@{user['username']}" if user['username'] else str(user['user_id'])
+        
+        msg += f"{emoji} {username_display}\n"
+        msg += f"   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')}\n"
+        msg += f"   ⏳ Días restantes: {days_left}\n"
         msg += f"   📋 Plan: {user['plan']}\n\n"
     
     if len(users) > 30:
         msg += f"\n... y {len(users) - 30} más"
     
-    await message.reply_text(msg, parse_mode="Markdown")
+    # Agregar botón para exportar la lista completa
+    keyboard = [[InlineKeyboardButton("📥 Exportar lista completa", callback_data="export_active_list")]]
+    
+    await message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def export_active_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exporta la lista de usuarios activos a CSV"""
+    query = update.callback_query
+    await query.answer()
+    
+    users = await db.get_all_active_users()
+    
+    if not users:
+        await query.message.reply_text("📭 No hay usuarios activos")
+        return
+    
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    writer.writerow(['User ID', 'Username', 'Plan', 'Fecha Inicio', 'Fecha Expiración', 'Días Restantes'])
+    
+    for user in users:
+        days_left = int(user['days_left']) if user['days_left'] else (user['end_date'] - datetime.now()).days
+        writer.writerow([
+            user['user_id'],
+            user['username'] or '',
+            user['plan'],
+            user['start_date'].strftime('%Y-%m-%d'),
+            user['end_date'].strftime('%Y-%m-%d'),
+            days_left
+        ])
+    
+    output.seek(0)
+    
+    await query.message.reply_document(
+        document=output.getvalue().encode('utf-8'),
+        filename=f"usuarios_activos_{datetime.now().strftime('%Y%m%d')}.csv",
+        caption=f"📊 Lista de usuarios activos\nTotal: {len(users)}"
+    )
+    output.close()
 
 async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra reporte de ganancias del mes actual"""
@@ -678,12 +626,6 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await message.reply_text(msg, parse_mode="Markdown")
 
-async def export_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para exportar reporte del mes actual"""
-    query = update.callback_query
-    await query.answer()
-    await export_report(update, context)
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja los callbacks del teclado inline"""
     query = update.callback_query
@@ -694,7 +636,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📝 *Agregar usuario*\n\n"
             "Usa el comando:\n"
             "`/add @username plan`\n\n"
-            "O usa el botón de 'Exportar mes' para generar un reporte en Excel.",
+            "Planes: trial, semanal, mensual\n\n"
+            "Ejemplo: `/add @juan semanal`",
             parse_mode="Markdown"
         )
     elif query.data == "list_active":
@@ -705,17 +648,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_stats(update, context)
     elif query.data == "export_month":
         await export_report(update, context)
-    elif query.data.startswith("plan_"):
-        # Esto viene de la conversación de agregar usuario
-        await get_plan(update, context)
+    elif query.data == "export_active_list":
+        await export_active_list(update, context)
 
 # ---------- TAREAS PROGRAMADAS ----------
 async def check_expiring_subscriptions():
     """Verifica suscripciones próximas a expirar (3, 2, 1 días antes a las 7 AM)"""
+    global bot_app
+    
     now = datetime.now()
     
     # Solo ejecutar cerca de las 7 AM (margen de 30 minutos)
     if now.hour != 7 or now.minute > 30:
+        return
+    
+    if not bot_app:
+        logger.warning("Bot app no disponible para enviar recordatorios")
         return
     
     for days in [3, 2, 1]:
@@ -723,7 +671,7 @@ async def check_expiring_subscriptions():
         
         for user in users:
             try:
-                await application.bot.send_message(
+                await bot_app.bot.send_message(
                     ADMIN_ID,
                     f"⏰ *RECORDATORIO DE EXPIRACIÓN*\n\n"
                     f"👤 Usuario: @{user['username'] or user['user_id']}\n"
@@ -739,7 +687,13 @@ async def check_expiring_subscriptions():
 
 async def check_expired_subscriptions():
     """Verifica y expulsa usuarios con suscripción vencida"""
+    global bot_app
+    
     expired_users = await db.get_expired_users()
+    
+    if not bot_app:
+        logger.warning("Bot app no disponible para expulsar usuarios")
+        return
     
     for user in expired_users:
         # Marcar como expirado en BD
@@ -747,8 +701,8 @@ async def check_expired_subscriptions():
         
         # Expulsar del grupo VIP
         try:
-            await application.bot.ban_chat_member(VIP_GROUP_ID, user['user_id'])
-            await application.bot.send_message(
+            await bot_app.bot.ban_chat_member(VIP_GROUP_ID, user['user_id'])
+            await bot_app.bot.send_message(
                 ADMIN_ID,
                 f"🚫 *USUARIO EXPULSADO*\n\n"
                 f"👤 @{user['username'] or user['user_id']}\n"
@@ -762,10 +716,16 @@ async def check_expired_subscriptions():
 
 async def send_monthly_report():
     """Envía reporte automático al inicio de cada mes"""
+    global bot_app
+    
     now = datetime.now()
     
     # Ejecutar el primer día del mes a las 8 AM
     if now.day == 1 and now.hour == 8:
+        if not bot_app:
+            logger.warning("Bot app no disponible para enviar reporte")
+            return
+        
         last_month = now.replace(day=1) - timedelta(days=1)
         report = await db.get_monthly_report(last_month.year, last_month.month)
         
@@ -773,7 +733,7 @@ async def send_monthly_report():
             # Crear CSV
             output = StringIO()
             writer = csv.writer(output)
-            writer.writerow(['Fecha', 'Usuario', 'Username', 'Plan', 'Monto'])
+            writer.writerow(['Fecha', 'User ID', 'Username', 'Plan', 'Monto'])
             
             for t in report['transactions']:
                 writer.writerow([
@@ -786,7 +746,7 @@ async def send_monthly_report():
             
             output.seek(0)
             
-            await application.bot.send_document(
+            await bot_app.bot.send_document(
                 ADMIN_ID,
                 document=output.getvalue().encode('utf-8'),
                 filename=f"reporte_{last_month.year}_{last_month.month:02d}.csv",
@@ -798,7 +758,7 @@ async def send_monthly_report():
             )
             output.close()
         else:
-            await application.bot.send_message(
+            await bot_app.bot.send_message(
                 ADMIN_ID,
                 f"📊 *REPORTE MENSUAL*\n"
                 f"📅 {last_month.strftime('%B %Y')}\n"
@@ -807,47 +767,25 @@ async def send_monthly_report():
             )
 
 # ---------- MAIN ----------
-application = None
-
 async def main():
     """Función principal"""
-    global application
+    global bot_app
     
     # Inicializar base de datos
     await db.init_tables()
+    logger.info("📦 Base de datos lista")
     
     # Configurar el bot
     defaults = Defaults(parse_mode="HTML")
-    application = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
+    bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
     
     # Handlers de comandos
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("add", add_user_command))
-    application.add_handler(CommandHandler("renew", renew_user))
-    application.add_handler(CommandHandler("remove", remove_user))
-    application.add_handler(CommandHandler("export", export_report))
-    application.add_handler(CommandHandler("activos", list_active_users))
-    application.add_handler(CommandHandler("ganancias", show_earnings))
-    application.add_handler(CommandHandler("stats", show_stats))
-    
-    # Conversación para agregar usuario
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("adduser", add_user_start)],
-        states={
-            WAITING_FOR_USERNAME: [CommandHandler("cancel", cancel_add), 
-                                   CommandHandler("start", cancel_add),
-                                   CommandHandler("adduser", cancel_add),
-                                   CommandHandler("add", cancel_add),
-                                   CommandHandler("renew", cancel_add),
-                                   CommandHandler("remove", cancel_add)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_add)],
-    )
-    # Nota: Para manejar texto normal, necesitas un MessageHandler
-    # Por simplicidad, usamos comandos directos
-    
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("add", add_user_command))
+    bot_app.add_handler(CommandHandler("renew", renew_user))
+    bot_app.add_handler(CommandHandler("remove", remove_user))
+    bot_app.add_handler(CommandHandler("export", export_report))
+    bot_app.add_handler(CallbackQueryHandler(handle_callback))
     
     # Programar tareas
     scheduler.add_job(check_expiring_subscriptions, 'interval', hours=1)  # Cada hora, pero solo actúa a las 7 AM
@@ -855,9 +793,11 @@ async def main():
     scheduler.add_job(send_monthly_report, 'interval', hours=1)           # Cada hora, pero solo actúa el día 1 a las 8 AM
     scheduler.start()
     
+    logger.info("🤖 Bot iniciado - Los datos se guardan en PostgreSQL persistentemente")
+    logger.info(f"📊 Los usuarios activos se conservan entre reinicios")
+    
     # Iniciar el bot
-    logger.info("🤖 Bot iniciado")
-    await application.run_polling()
+    await bot_app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
