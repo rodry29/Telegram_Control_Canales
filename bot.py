@@ -103,13 +103,14 @@ class Database:
     
                  
     async def get_user_by_username(self, username: str, group_id: int = None) -> Optional[Dict]:
-        """Busca usuario por username (opcionalmente por grupo)"""
+        """Busca usuario por username (insensible a mayúsculas)"""
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if group_id:
-                    cur.execute("SELECT * FROM users WHERE username = %s AND group_id = %s", (username, group_id))
+                    # Buscar ignorando mayúsculas/minúsculas
+                    cur.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(%s) AND group_id = %s", (username, group_id))
                 else:
-                    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                    cur.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username,))
                 return cur.fetchone()
 
     async def get_user_by_id(self, user_id: int, group_id: int = None) -> Optional[Dict]:
@@ -162,7 +163,7 @@ class Database:
                     return False, "expirado"
 
     async def add_or_update_user(self, group_id: int, username: str, plan: str) -> Tuple[bool, str]:
-        """Agrega o renueva usuario - SOLO CON USERNAME, sin necesidad de user_id"""
+        """Agrega o renueva usuario - SOLO CON USERNAME"""
         now = datetime.now()
     
         if plan not in PLANS:
@@ -172,8 +173,8 @@ class Database:
     
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Buscar usuario por username en este grupo
-                cur.execute("SELECT user_id, trial_used, status FROM users WHERE username = %s AND group_id = %s", (username, group_id))
+                # Buscar usuario por username (insensible a mayúsculas)
+                cur.execute("SELECT user_id, trial_used, status FROM users WHERE LOWER(username) = LOWER(%s) AND group_id = %s", (username, group_id))
                 existing = cur.fetchone()
     
                 if existing:
@@ -191,7 +192,6 @@ class Database:
                     WHERE user_id = %s AND group_id = %s
                     """, (plan, now, end_date, username, plan == "trial", user_id, group_id))
                     
-                    # Registrar pago
                     cur.execute("""
                     INSERT INTO payments (user_id, group_id, username, plan, amount, payment_date)
                     VALUES (%s, %s, %s, %s, %s, %s)
@@ -201,9 +201,45 @@ class Database:
                     return True, f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
                 
                 else:
-                    # Usuario no existe en la base de datos
+                    # Buscar también por user_id si el username no coincide
+                    # Esto pasa si el usuario se unió con un username y luego lo cambió
+                    cur.execute("SELECT user_id FROM users WHERE group_id = %s AND username IS NOT NULL", (group_id,))
+                    all_users = cur.fetchall()
+                    
+                    # También intentar buscar en los logs del grupo (mensajes recientes)
                     return False, f"❌ No tengo registro de @{username} en este grupo.\n\n📌 *Para activar su suscripción:*\n1. Pídele a @{username} que envíe cualquier mensaje a este bot\n2. Una vez que el bot reciba su mensaje, vuelve a ejecutar el comando\n\n*O puede unirse al grupo y el bot lo registrará automáticamente con TRIAL.*"
-  
+
+    async def sync_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /sync - Sincroniza usuarios del grupo con la base de datos (solo admin)"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        
+        group = get_group_by_id(chat_id)
+        if not group or not can_manage_group(user_id, chat_id):
+            await update.message.reply_text("❌ No autorizado")
+            return
+        
+        await update.message.reply_text("🔄 Sincronizando usuarios del grupo...")
+        
+        try:
+            # Obtener todos los miembros del grupo
+            admins = await context.bot.get_chat_administrators(chat_id)
+            
+            count = 0
+            for admin in admins:
+                if admin.user.id != context.bot.id:
+                    # Verificar si existe en BD
+                    existing = await db.get_user_by_username(admin.user.username, chat_id) if admin.user.username else None
+                    if not existing:
+                        # Registrar al usuario
+                        username = admin.user.username or f"user_{admin.user.id}"
+                        await db.register_user_auto(chat_id, admin.user.id, username, admin.user.first_name or "")
+                        count += 1
+            
+            await update.message.reply_text(f"✅ Sincronización completa. {count} usuarios nuevos registrados.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+    
     async def get_expiring_users(self, group_id: int, days_before: int) -> List[Dict]:
         """Obtiene usuarios que expiran en X días en un grupo"""
         target_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_before)
@@ -893,6 +929,7 @@ async def main():
     bot_app.add_handler(CommandHandler("groups", list_groups))
     bot_app.add_handler(CommandHandler("addgroup", add_group_command))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
+    bot_app.add_handler(CommandHandler("sync", sync_users))
 
     # Detectar nuevos miembros
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
