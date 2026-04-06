@@ -157,81 +157,81 @@ class Database:
         return conn
 
    async def init_tables(self):
-    """Inicializa las tablas con soporte multi-grupo"""
-    with self.get_connection() as conn:
-        with conn.cursor() as cur:
-            # 1. PRIMERO: Crear tabla groups
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS groups (
-                group_id BIGINT PRIMARY KEY,
-                group_name TEXT,
-                admin_id BIGINT,
-                super_admin_id BIGINT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                settings JSONB DEFAULT '{}'::jsonb
-            )
-            """)
-            logger.info("✅ Tabla 'groups' verificada/creada")
-            
-            # 2. SEGUNDO: Crear tabla users (con group_id)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                group_id BIGINT NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                plan TEXT NOT NULL,
-                start_date TIMESTAMP NOT NULL,
-                end_date TIMESTAMP NOT NULL,
-                    status TEXT DEFAULT 'active',
-                    trial_used BOOLEAN DEFAULT FALSE,
+        """Inicializa las tablas con soporte multi-grupo"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # 1. PRIMERO: Crear tabla groups
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    group_id BIGINT PRIMARY KEY,
+                    group_name TEXT,
+                    admin_id BIGINT,
+                    super_admin_id BIGINT,
                     created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    UNIQUE(user_id, group_id)
+                    settings JSONB DEFAULT '{}'::jsonb
                 )
                 """)
-                logger.info("✅ Tabla 'users' verificada/creada")
+                logger.info("✅ Tabla 'groups' verificada/creada")
                 
-                # 3. TERCERO: Crear tabla payments
+                # 2. SEGUNDO: Crear tabla users (con group_id)
                 cur.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
+                CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
                     group_id BIGINT NOT NULL,
                     username TEXT,
+                    first_name TEXT,
                     plan TEXT NOT NULL,
-                    amount INTEGER NOT NULL,
-                    payment_date TIMESTAMP DEFAULT NOW()
-                )
-                """)
-                logger.info("✅ Tabla 'payments' verificada/creada")
-                
-                # 4. CUARTO: Crear índices (AHORA las columnas ya existen)
-                try:
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
-                    logger.info("✅ Índices creados")
-                except Exception as e:
-                    logger.warning(f"Error creando índices: {e}")
-                
-                conn.commit()
-                
-                # 5. QUINTO: Registrar grupos configurados
-                if GROUPS:
-                    for group in GROUPS:
-                        cur.execute("""
-                        INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (group_id) DO UPDATE SET
-                            group_name = EXCLUDED.group_name,
-                            admin_id = EXCLUDED.admin_id
-                        """, (group["group_id"], group["group_name"], group["admin_id"], SUPER_ADMIN_ID))
+                    start_date TIMESTAMP NOT NULL,
+                    end_date TIMESTAMP NOT NULL,
+                        status TEXT DEFAULT 'active',
+                        trial_used BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(user_id, group_id)
+                    )
+                    """)
+                    logger.info("✅ Tabla 'users' verificada/creada")
+                    
+                    # 3. TERCERO: Crear tabla payments
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS payments (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        group_id BIGINT NOT NULL,
+                        username TEXT,
+                        plan TEXT NOT NULL,
+                        amount INTEGER NOT NULL,
+                        payment_date TIMESTAMP DEFAULT NOW()
+                    )
+                    """)
+                    logger.info("✅ Tabla 'payments' verificada/creada")
+                    
+                    # 4. CUARTO: Crear índices (AHORA las columnas ya existen)
+                    try:
+                        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
+                        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
+                        cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                        logger.info("✅ Índices creados")
+                    except Exception as e:
+                        logger.warning(f"Error creando índices: {e}")
+                    
                     conn.commit()
-                    logger.info(f"✅ {len(GROUPS)} grupos registrados")
-        
-        logger.info("✅ Base de datos inicializada correctamente")
+                    
+                    # 5. QUINTO: Registrar grupos configurados
+                    if GROUPS:
+                        for group in GROUPS:
+                            cur.execute("""
+                            INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (group_id) DO UPDATE SET
+                                group_name = EXCLUDED.group_name,
+                                admin_id = EXCLUDED.admin_id
+                            """, (group["group_id"], group["group_name"], group["admin_id"], SUPER_ADMIN_ID))
+                        conn.commit()
+                        logger.info(f"✅ {len(GROUPS)} grupos registrados")
+            
+            logger.info("✅ Base de datos inicializada correctamente")
     
     async def get_user_by_username(self, username: str) -> Optional[Dict]:
         """Busca usuario por username"""
