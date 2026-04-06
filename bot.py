@@ -1226,19 +1226,21 @@ async def check_expired_subscriptions():
 async def main():
     global bot_app
     
-    print("🔹 Iniciando main()...")
+    print("🚀 PASO 1: Iniciando main()")
     
     await db.init_tables()
-    print("🔹 Tablas inicializadas")
+    print("🚀 PASO 2: Tablas inicializadas")
     
     await db.load_groups_from_db()
-    print(f"🔹 Grupos cargados: {len(GROUPS)}")
+    print("🚀 PASO 3: Grupos cargados")
     
     logger.info(f"📦 {len(GROUPS)} grupos disponibles")
     
     defaults = Defaults(parse_mode="HTML")
+    print("🚀 PASO 4: Creando Application...")
+    
     bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
-    print("🔹 Application construida")
+    print("🚀 PASO 5: Application creada")
     
     # Handlers
     bot_app.add_handler(CommandHandler("start", start))
@@ -1247,20 +1249,22 @@ async def main():
     bot_app.add_handler(CommandHandler("addgroup", add_group_command))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
-    
-    print("🔹 Handlers registrados")
+    print("🚀 PASO 6: Handlers registrados")
     
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
     scheduler.start()
-    print("🔹 Scheduler iniciado")
+    print("🚀 PASO 7: Scheduler iniciado")
     
     logger.info("🤖 Bot iniciado")
-    print("🔹 Iniciando polling...")
+    print("🚀 PASO 8: Iniciando polling...")
     
     await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=True)
+    print("🚀 PASO 9: Bot inicializado")
     
-    print("🔹 Bot está corriendo. Esperando actualizaciones...")
+    await bot_app.start()
+    print("🚀 PASO 10: Bot started")
+    
+    await bot_app.updater.start_polling(drop_pending_updates=True)
+    print("🚀 PASO 11: Polling iniciado - BOT ACTIVO")
     
     await asyncio.Event().wait()
