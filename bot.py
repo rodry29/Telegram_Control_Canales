@@ -1268,3 +1268,7 @@ async def main():
     print("🚀 PASO 11: Polling iniciado - BOT ACTIVO")
     
     await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    print("🚀 PUNTO DE ENTRADA: Ejecutando main()")
+    asyncio.run(main())
