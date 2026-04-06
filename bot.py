@@ -1,4 +1,13 @@
 import os
+
+print("=== DIAGNÓSTICO DE VARIABLES ===")
+print("Variables de entorno disponibles:")
+for key in os.environ.keys():
+    print(f"  {key}")
+print("================================")
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+print(f"TELEGRAM_TOKEN: {'✅ Encontrado' if TOKEN else '❌ NO ENCONTRADO'}")
 import csv
 import asyncio
 import logging
@@ -23,14 +32,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURACIÓN ====================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 SUPER_ADMIN_ID = 5054216496
+# Intentar con diferentes nombres de variable
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
 
 if not TOKEN:
-    logger.error("❌ TELEGRAM_TOKEN no está configurado")
+    print("❌ ERROR: No se encontró token en ninguna variable")
+    print("Variables disponibles:", list(os.environ.keys()))
     exit(1)
-    
+  
 # Planes y precios
 PLANS = {
     "trial": {"days": 1, "price": 0, "name": "🎁 Trial (1 día)"},
