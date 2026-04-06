@@ -1339,9 +1339,76 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
     if not group or (user_id != SUPER_ADMIN_ID and group["admin_id"] != user_id):
         await query.edit_message_text("❌ No tienes permiso para gestionar este grupo")
         return
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los callbacks del teclado inline"""
+    query = update.callback_query
+    
+    # Log para ver qué callback está llegando
+    logger.info(f"📱 Callback recibido: {query.data} de usuario {query.from_user.id}")
+    
+    # Siempre responder al callback primero
+    await query.answer()
+    
+    # Verificar según el callback
+    if query.data == "add_user":
+        await query.edit_message_text(
+            "📝 *Agregar usuario*\n\n"
+            "Usa el comando:\n"
+            "`/add @username plan`\n\n"
+            "Planes: trial, semanal, mensual",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == "list_active":
+        await list_active_users(update, context)
+    
+    elif query.data == "earnings":
+        await show_earnings(update, context)
+    
+    elif query.data == "stats":
+        await show_stats(update, context)
+    
+    elif query.data == "export_month":
+        await export_report(update, context)
+    
+    elif query.data.startswith("select_group_"):
+        group_id = int(query.data.replace("select_group_", ""))
+        await select_group(update, context, group_id)
+    
+    elif query.data == "all_groups":
+        await list_groups(update, context)
+    
+    elif query.data == "add_group":
+        await query.edit_message_text(
+            "📝 *Agregar nuevo grupo*\n\n"
+            "Usa el comando:\n"
+            "`/addgroup group_id \"nombre\" admin_id`\n\n"
+            "Ejemplo: `/addgroup -1001234567890 \"Mi Grupo\" 123456789`",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == "global_stats":
+        await global_stats(update, context)
+    
+    elif query.data == "consolidated_report":
+        await consolidated_report(update, context)
+    
+    else:
+        logger.warning(f"⚠️ Callback no reconocido: {query.data}")
+        await query.edit_message_text(f"❌ Opción no implementada: {query.data}")
     
     context.user_data['current_group'] = group_id
     
+   # En la función start() para Super Admin:
+    keyboard = [
+        [InlineKeyboardButton("📊 Todos los grupos", callback_data="all_groups")],
+        [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
+        [InlineKeyboardButton("📈 Estadísticas globales", callback_data="global_stats")],
+        [InlineKeyboardButton("📥 Reporte consolidado", callback_data="consolidated_report")]
+    ]
+    
+    # Para admin de grupo:
     keyboard = [
         [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
         [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
@@ -1446,36 +1513,29 @@ async def main():
     global bot_app
     
     await db.init_tables()
-    logger.info("📦 Base de datos lista - Modo ESTRICTO activado")
+    logger.info("📦 Base de datos lista")
     
     defaults = Defaults(parse_mode="HTML")
     bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
     
-    # Handlers
+    # Handlers de comandos
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("add", add_user_command))
-    bot_app.add_handler(CommandHandler("remove", remove_user))
-    bot_app.add_handler(CommandHandler("export", export_report))
+    bot_app.add_handler(CommandHandler("groups", list_groups))
+    bot_app.add_handler(CommandHandler("addgroup", add_group_command))
+    bot_app.add_handler(CommandHandler("global", global_stats))
+    
+    # ✅ IMPORTANTE: El handler de callbacks debe estar registrado
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
-    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member_message))
-    bot_app.add_handler(CommandHandler("register", register_user_command))
-    bot_app.add_handler(CommandHandler("check", check_user_command))
-    # En main(), agrega este handler:
-    bot_app.add_handler(CommandHandler("export", export_report))
     
     # Detectar nuevos miembros
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member_message))
     
     # Tareas programadas
-    scheduler.add_job(check_expiring_subscriptions, 'interval', hours=1)
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
-    scheduler.add_job(send_monthly_report, 'interval', hours=1)
     scheduler.start()
     
-    logger.info("🤖 Bot iniciado en MODO ESTRICTO")
-    logger.info("✅ Usuarios expirados NO pueden reingresar")
-    logger.info("✅ Nuevos miembros reciben TRIAL automático (1 día)")
-    logger.info("✅ Expulsión automática al vencer la suscripción")
+    logger.info("🤖 Bot iniciado")
     
     await bot_app.initialize()
     await bot_app.start()
