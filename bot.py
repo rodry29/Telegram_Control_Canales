@@ -340,12 +340,13 @@ class Database:
     async def load_groups_from_db(self):
         """Carga los grupos desde la base de datos al iniciar (persistente)"""
         global GROUPS
-
+    
         logger.info("🔍 Cargando grupos desde la base de datos...")
         
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT group_id, group_name, admin_id FROM groups")
+                # ✅ Incluir group_type en la selección
+                cur.execute("SELECT group_id, group_name, admin_id, group_type FROM groups")
                 db_groups = cur.fetchall()
                 
                 if db_groups:
@@ -354,8 +355,10 @@ class Database:
                         GROUPS.append({
                             "group_id": g["group_id"],
                             "group_name": g["group_name"],
-                            "admin_id": g["admin_id"]
+                            "admin_id": g["admin_id"],
+                            "type": g.get("group_type", "VIP")  # ✅ Agregar el tipo
                         })
+                        logger.info(f"🔍 Grupo cargado: {g['group_name']} - Tipo: {g.get('group_type', 'VIP')}")
                     logger.info(f"📦 {len(GROUPS)} grupos cargados desde la base de datos")
                     return True
                 else:
