@@ -208,28 +208,28 @@ class Database:
                 logger.info("✅ Tabla 'payments' verificada/creada")
                     
                     # 4. CUARTO: Crear índices (AHORA las columnas ya existen)
-                    try:
-                        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
-                        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
-                        cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
-                        logger.info("✅ Índices creados")
-                    except Exception as e:
-                        logger.warning(f"Error creando índices: {e}")
-                    
+                try:
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                logger.info("✅ Índices creados")
+                except Exception as e:
+                    logger.warning(f"Error creando índices: {e}")
+                
+                conn.commit()
+                
+                # 5. QUINTO: Registrar grupos configurados
+                if GROUPS:
+                    for group in GROUPS:
+                        cur.execute("""
+                        INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (group_id) DO UPDATE SET
+                            group_name = EXCLUDED.group_name,
+                            admin_id = EXCLUDED.admin_id
+                        """, (group["group_id"], group["group_name"], group["admin_id"], SUPER_ADMIN_ID))
                     conn.commit()
-                    
-                    # 5. QUINTO: Registrar grupos configurados
-                    if GROUPS:
-                        for group in GROUPS:
-                            cur.execute("""
-                            INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
-                            VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (group_id) DO UPDATE SET
-                                group_name = EXCLUDED.group_name,
-                                admin_id = EXCLUDED.admin_id
-                            """, (group["group_id"], group["group_name"], group["admin_id"], SUPER_ADMIN_ID))
-                        conn.commit()
-                        logger.info(f"✅ {len(GROUPS)} grupos registrados")
+                logger.info(f"✅ {len(GROUPS)} grupos registrados")
             
             logger.info("✅ Base de datos inicializada correctamente")
     
