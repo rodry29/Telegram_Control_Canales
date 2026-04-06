@@ -83,67 +83,7 @@ class Database:
         conn = psycopg2.connect(self.db_url)
         conn.autocommit = True
         return conn
-
-    async def init_tables(self):
-        """Inicializa las tablas con soporte multi-grupo"""
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                # Tabla groups
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS groups (
-                    group_id BIGINT PRIMARY KEY,
-                    group_name TEXT,
-                    admin_id BIGINT,
-                    super_admin_id BIGINT,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    settings JSONB DEFAULT '{}'::jsonb
-                )
-                """)
-                logger.info("✅ Tabla 'groups' lista")
-
-                # Tabla users
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    group_id BIGINT NOT NULL,
-                    username TEXT,
-                    first_name TEXT,
-                    plan TEXT NOT NULL,
-                    start_date TIMESTAMP NOT NULL,
-                    end_date TIMESTAMP NOT NULL,
-                    status TEXT DEFAULT 'active',
-                    trial_used BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    UNIQUE(user_id, group_id)
-                )
-                """)
-                logger.info("✅ Tabla 'users' lista")
-
-                # Tabla payments
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    group_id BIGINT NOT NULL,
-                    username TEXT,
-                    plan TEXT NOT NULL,
-                    amount INTEGER NOT NULL,
-                    payment_date TIMESTAMP DEFAULT NOW()
-                )
-                """)
-                logger.info("✅ Tabla 'payments' lista")
-
-                # Índices
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
-                logger.info("✅ Índices creados")
-
-                conn.commit()
-
-            logger.info("✅ Base de datos inicializada correctamente")
+        
 
     async def main():
         global bot_app
@@ -346,7 +286,7 @@ class Database:
                 return {"summary": summary, "total": total, "new_users": new_users}
 
     async def save_group(self, group_id: int, group_name: str, admin_id: int):
-        """Guarda un grupo en la base de datos (persistente)"""
+        """Guarda un grupo en la base de datos"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -362,6 +302,8 @@ class Database:
     async def load_groups_from_db(self):
         """Carga los grupos desde la base de datos al iniciar (persistente)"""
         global GROUPS
+
+        logger.info("🔍 Cargando grupos desde la base de datos...")
         
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -382,6 +324,66 @@ class Database:
                     logger.info("📦 No hay grupos en la base de datos")
                     return False
 
+    async def init_tables(self):
+        """Inicializa las tablas con soporte multi-grupo"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Tabla groups
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    group_id BIGINT PRIMARY KEY,
+                    group_name TEXT,
+                    admin_id BIGINT,
+                    super_admin_id BIGINT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    settings JSONB DEFAULT '{}'::jsonb
+                )
+                """)
+                logger.info("✅ Tabla 'groups' lista")
+
+                # Tabla users
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    plan TEXT NOT NULL,
+                    start_date TIMESTAMP NOT NULL,
+                    end_date TIMESTAMP NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    trial_used BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, group_id)
+                )
+                """)
+                logger.info("✅ Tabla 'users' lista")
+
+                # Tabla payments
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    plan TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    payment_date TIMESTAMP DEFAULT NOW()
+                )
+                """)
+                logger.info("✅ Tabla 'payments' lista")
+
+                # Índices
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                logger.info("✅ Índices creados")
+
+                conn.commit()
+
+            logger.info("✅ Base de datos inicializada correctamente")
 
 # ==================== INSTANCIA GLOBAL ====================
 db = Database(DATABASE_URL)
@@ -874,9 +876,13 @@ async def check_expired_subscriptions():
 # ==================== MAIN ====================
 async def main():
     global bot_app
-
+    
     await db.init_tables()
-    logger.info("📦 Base de datos lista")
+    
+    # ✅ IMPORTANTE: Cargar grupos desde la base de datos
+    await db.load_groups_from_db()
+    
+    logger.info(f"📦 {len(GROUPS)} grupos disponibles")
 
     defaults = Defaults(parse_mode="HTML")
     bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
