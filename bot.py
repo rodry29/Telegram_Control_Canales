@@ -193,19 +193,19 @@ class Database:
                     """)
                 logger.info("✅ Tabla 'users' verificada/creada")
                     
-                    # 3. TERCERO: Crear tabla payments
-                    cur.execute("""
-                    CREATE TABLE IF NOT EXISTS payments (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        group_id BIGINT NOT NULL,
-                        username TEXT,
-                        plan TEXT NOT NULL,
-                        amount INTEGER NOT NULL,
-                        payment_date TIMESTAMP DEFAULT NOW()
-                    )
-                    """)
-                    logger.info("✅ Tabla 'payments' verificada/creada")
+                # 3. TERCERO: Crear tabla payments
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    plan TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    payment_date TIMESTAMP DEFAULT NOW()
+                )
+                """)
+                logger.info("✅ Tabla 'payments' verificada/creada")
                     
                     # 4. CUARTO: Crear índices (AHORA las columnas ya existen)
                     try:
