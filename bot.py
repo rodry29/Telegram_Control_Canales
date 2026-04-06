@@ -156,7 +156,7 @@ class Database:
         conn.autocommit = True
         return conn
 
-   async def init_tables(self):
+    async def init_tables(self):
         """Inicializa las tablas con soporte multi-grupo"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
