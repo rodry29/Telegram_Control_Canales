@@ -309,19 +309,33 @@ class Database:
                 
                 return {"summary": summary, "total": total, "new_users": new_users}
 
-    async def save_group(self, group_id: int, group_name: str, admin_id: int):
+    async def save_group(self, group_id: int, group_name: str, admin_id: int, group_type: str = "VIP"):
         """Guarda un grupo en la base de datos"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
+                # Asegurar que la columna group_type existe
                 cur.execute("""
-                INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
-                VALUES (%s, %s, %s, %s)
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                  WHERE table_name = 'groups' AND column_name = 'group_type') THEN
+                        ALTER TABLE groups ADD COLUMN group_type TEXT DEFAULT 'VIP';
+                    END IF;
+                END $$;
+                """)
+                conn.commit()
+                
+                # Guardar grupo
+                cur.execute("""
+                INSERT INTO groups (group_id, group_name, admin_id, super_admin_id, group_type)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (group_id) DO UPDATE SET
                     group_name = EXCLUDED.group_name,
-                    admin_id = EXCLUDED.admin_id
-                """, (group_id, group_name, admin_id, SUPER_ADMIN_ID))
+                    admin_id = EXCLUDED.admin_id,
+                    group_type = EXCLUDED.group_type
+                """, (group_id, group_name, admin_id, SUPER_ADMIN_ID, group_type))
                 conn.commit()
-                logger.info(f"✅ Grupo {group_name} guardado en BD")
+                logger.info(f"✅ Grupo {group_name} (tipo: {group_type}) guardado en BD")
 
     async def load_groups_from_db(self):
         """Carga los grupos desde la base de datos al iniciar (persistente)"""
