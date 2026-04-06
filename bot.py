@@ -1,3 +1,46 @@
+SUPER_ADMIN_ID = 5054216496
+
+GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
+
+GROUPS = []
+for group_config in GROUPS_CONFIG.split(","):
+    if group_config.strip():
+        parts = group_config.strip().split(":")
+        if len(parts) == 3:
+            GROUPS.append({
+                "group_id": int(parts[0]),
+                "group_name": parts[1],
+                "admin_id": int(parts[2])
+            })
+
+def get_group_by_id(group_id: int) -> dict:
+    """Obtiene la configuración de un grupo por su ID"""
+    for group in GROUPS:
+        if group["group_id"] == group_id:
+            return group
+    return None
+
+def get_groups_by_admin(admin_id: int) -> list:
+    """Obtiene todos los grupos donde un usuario es admin"""
+    if admin_id == SUPER_ADMIN_ID:
+        # Super admin ve todos los grupos
+        return GROUPS
+    else:
+        # Admin normal solo ve su grupo
+        return [g for g in GROUPS if g["admin_id"] == admin_id]
+
+def can_manage_group(user_id: int, group_id: int) -> bool:
+    """Verifica si un usuario puede gestionar un grupo"""
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    group = get_group_by_id(group_id)
+    return group and group["admin_id"] == user_id
+
+def get_group_name(group_id: int) -> str:
+    """Obtiene el nombre del grupo"""
+    group = get_group_by_id(group_id)
+    return group["group_name"] if group else f"Grupo {group_id}"
+
 import os
 import csv
 import asyncio
@@ -111,6 +154,74 @@ class Database:
         conn = psycopg2.connect(self.db_url)
         conn.autocommit = True
         return conn
+
+    async def init_tables(self):
+        """Inicializa las tablas con soporte multi-grupo y roles"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Tabla de grupos
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    group_id BIGINT PRIMARY KEY,
+                    group_name TEXT,
+                    admin_id BIGINT,
+                    super_admin_id BIGINT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    settings JSONB DEFAULT '{}'::jsonb
+                )
+                """)
+                
+                # Tabla de usuarios (con group_id)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    plan TEXT NOT NULL,
+                    start_date TIMESTAMP NOT NULL,
+                    end_date TIMESTAMP NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    trial_used BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, group_id)
+                )
+                """)
+                
+                # Tabla de pagos (con group_id)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    username TEXT,
+                    plan TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    payment_date TIMESTAMP DEFAULT NOW()
+                )
+                """)
+                
+                # Índices
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                
+                conn.commit()
+                
+                # Registrar grupos configurados
+                for group in GROUPS:
+                    cur.execute("""
+                    INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (group_id) DO UPDATE SET
+                        group_name = EXCLUDED.group_name,
+                        admin_id = EXCLUDED.admin_id
+                    """, (group["group_id"], group["group_name"], group["admin_id"], SUPER_ADMIN_ID))
+                    conn.commit()
+        
+        logger.info(f"✅ Base de datos inicializada con {len(GROUPS)} grupos")
     
     async def init_tables(self):
         """Inicializa las tablas"""
@@ -534,6 +645,88 @@ scheduler = AsyncIOScheduler()
 bot_app = None
 
 # ---------- COMANDOS ----------
+async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /groups - Lista todos los grupos (solo Super Admin)"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo el Super Admin puede ver esta información")
+        return
+    
+    if not GROUPS:
+        await update.message.reply_text("📭 No hay grupos configurados")
+        return
+    
+    msg = "📊 *GRUPOS CONFIGURADOS*\n\n"
+    
+    for group in GROUPS:
+        # Obtener estadísticas del grupo
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users WHERE group_id = %s AND status = 'active' AND end_date > NOW()", (group["group_id"],))
+                active = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM users WHERE group_id = %s", (group["group_id"],))
+                total = cur.fetchone()[0]
+                
+                cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE group_id = %s AND payment_date >= date_trunc('month', NOW())", (group["group_id"],))
+                monthly = cur.fetchone()[0]
+        
+        msg += f"📌 *{group['group_name']}*\n"
+        msg += f"   🆔 ID: `{group['group_id']}`\n"
+        msg += f"   👑 Admin: `{group['admin_id']}`\n"
+        msg += f"   👥 Activos: {active}/{total}\n"
+        msg += f"   💰 Mes: ${monthly}\n\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addgroup group_id group_name admin_id - Agrega un nuevo grupo (solo Super Admin)"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo el Super Admin puede agregar grupos")
+        return
+    
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ *Formato:* `/addgroup group_id \"nombre_grupo\" admin_id`\n\n"
+            "Ejemplo: `/addgroup -1001234567890 \"VIP Club\" 123456789`\n\n"
+            "Para obtener el group_id, agrega el bot al grupo y usa /getId",
+            parse_mode="Markdown"
+        )
+        return
+    
+    group_id = int(context.args[0])
+    group_name = context.args[1].strip('"')
+    admin_id = int(context.args[2])
+    
+    # Verificar que el grupo no exista ya
+    if get_group_by_id(group_id):
+        await update.message.reply_text(f"❌ El grupo {group_id} ya está configurado")
+        return
+    
+    # Agregar a la lista
+    GROUPS.append({
+        "group_id": group_id,
+        "group_name": group_name,
+        "admin_id": admin_id
+    })
+    
+    # Registrar en base de datos
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
+            VALUES (%s, %s, %s, %s)
+            """, (group_id, group_name, admin_id, SUPER_ADMIN_ID))
+            conn.commit()
+    
+    await update.message.reply_text(
+        f"✅ *Grupo agregado exitosamente*\n\n"
+        f"📌 Nombre: {group_name}\n"
+        f"🆔 ID: `{group_id}`\n"
+        f"👑 Admin: `{admin_id}`\n\n"
+        f"⚠️ Asegúrate de que el bot sea administrador del grupo",
+        parse_mode="Markdown"
+    )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Panel de control - Solo admin"""
     if update.effective_user.id != ADMIN_ID:
@@ -555,6 +748,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Panel de control - detecta automáticamente el grupo y rol"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Verificar si es Super Admin (puede usar en cualquier chat)
+    if user_id == SUPER_ADMIN_ID:
+        keyboard = [
+            [InlineKeyboardButton("📊 Todos los grupos", callback_data="all_groups")],
+            [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
+            [InlineKeyboardButton("📈 Estadísticas globales", callback_data="global_stats")],
+            [InlineKeyboardButton("📥 Reporte consolidado", callback_data="consolidated_report")]
+        ]
+        await update.message.reply_text(
+            "👑 *Panel de Super Administrador*\n\n"
+            "Tienes control sobre todos los grupos configurados.\n\n"
+            "Usa los botones para ver estadísticas globales.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Verificar si es admin de algún grupo
+    user_groups = get_groups_by_admin(user_id)
+    
+    if not user_groups:
+        await update.message.reply_text("❌ No tienes grupos asignados")
+        return
+    
+    # Si es admin de un solo grupo, mostrar panel de ese grupo
+    if len(user_groups) == 1:
+        group = user_groups[0]
+        context.user_data['current_group'] = group['group_id']
+        
+        keyboard = [
+            [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+            [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+            [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+            [InlineKeyboardButton("📈 Estadísticas", callback_data="stats")],
+            [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]
+        ]
+        await update.message.reply_text(
+            f"🤖 *Panel de Control - {group['group_name']}*\n\n"
+            f"Gestiona las suscripciones de tu grupo.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        # Es admin de múltiples grupos, mostrar selector
+        keyboard = []
+        for group in user_groups:
+            keyboard.append([InlineKeyboardButton(f"📌 {group['group_name']}", callback_data=f"select_group_{group['group_id']}")])
+        
+        await update.message.reply_text(
+            "📋 *Selecciona el grupo que quieres gestionar*\n\n"
+            f"Eres administrador de {len(user_groups)} grupos.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/add @username plan - Agrega o renueva usuario"""
     if update.effective_user.id != ADMIN_ID:
@@ -1075,6 +1328,117 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_stats(update, context)
     elif query.data == "export_month":
         await export_report(update, context)  # ✅ Esto debe llamar a export_report
+
+async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Selecciona un grupo para gestionar"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    group = get_group_by_id(group_id)
+    if not group or (user_id != SUPER_ADMIN_ID and group["admin_id"] != user_id):
+        await query.edit_message_text("❌ No tienes permiso para gestionar este grupo")
+        return
+    
+    context.user_data['current_group'] = group_id
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+        [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+        [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+        [InlineKeyboardButton("📈 Estadísticas", callback_data="stats")],
+        [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]
+    ]
+    
+    await query.edit_message_text(
+        f"🤖 *Panel de Control - {group['group_name']}*\n\n"
+        f"Gestiona las suscripciones de este grupo.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/add @username plan - Agrega usuario al grupo actual"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Obtener grupo actual del contexto o del chat
+    current_group = context.user_data.get('current_group')
+    if not current_group:
+        # Intentar obtener del chat actual
+        group = get_group_by_id(chat_id)
+        if group and can_manage_group(user_id, chat_id):
+            current_group = chat_id
+        else:
+            await update.message.reply_text("❌ No se ha seleccionado un grupo. Usa /start primero.")
+            return
+    
+    if not can_manage_group(user_id, current_group):
+        await update.message.reply_text("❌ No tienes permiso para gestionar este grupo")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usa: `/add @username plan`", parse_mode="Markdown")
+        return
+    
+    username = context.args[0].replace("@", "")
+    plan = context.args[1].lower()
+    
+    if plan not in PLANS:
+        await update.message.reply_text("❌ Plan inválido")
+        return
+    
+    existing = await db.get_user_by_username(username, current_group)
+    success, msg = await db.add_or_update_user(current_group, username, plan, existing['user_id'] if existing else None)
+    await update.message.reply_text(msg)
+    
+    if success and existing:
+        await context.bot.unban_chat_member(current_group, existing['user_id'])
+
+async def global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra estadísticas de todos los grupos (solo Super Admin)"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo el Super Admin puede ver estadísticas globales")
+        return
+    
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    total_users = 0
+    total_active = 0
+    total_monthly = 0
+    
+    msg = "🌍 *ESTADÍSTICAS GLOBALES*\n\n"
+    
+    for group in GROUPS:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users WHERE group_id = %s", (group["group_id"],))
+                total = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM users WHERE group_id = %s AND status = 'active' AND end_date > NOW()", (group["group_id"],))
+                active = cur.fetchone()[0]
+                
+                cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE group_id = %s AND payment_date >= date_trunc('month', NOW())", (group["group_id"],))
+                monthly = cur.fetchone()[0]
+                
+                total_users += total
+                total_active += active
+                total_monthly += monthly
+        
+        msg += f"📌 *{group['group_name']}*\n"
+        msg += f"   👥 Usuarios: {active}/{total}\n"
+        msg += f"   💰 Ganancias mes: ${monthly}\n\n"
+    
+    msg += f"━━━━━━━━━━━━━━━━━━\n"
+    msg += f"📊 *TOTALES*\n"
+    msg += f"👥 Usuarios: {total_active}/{total_users}\n"
+    msg += f"💰 Ganancias totales mes: ${total_monthly}\n"
+    
+    await message.reply_text(msg, parse_mode="Markdown")
         
 # ---------- MAIN ----------
 async def main():
