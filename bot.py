@@ -16,10 +16,10 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------- CONFIGURACIÓN ----------
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = "8782944509:AAFqTBOCPwJdhRgt2Qxx4Usj45DNF83Y86s"
+VIP_GROUP_ID = -1003842587095
+ADMIN_ID = 8682208062
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-VIP_GROUP_ID = int(os.getenv("VIP_GROUP_ID", 0))
 
 # Diagnóstico de variables
 print("=== INICIO DEL BOT ===")
