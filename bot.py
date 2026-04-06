@@ -404,80 +404,152 @@ class Database:
                 """)
                 return cur.fetchall()
 
-# ---------- INSTANCIA GLOBAL ----------
-db = Database(DATABASE_URL)
-scheduler = AsyncIOScheduler()
-bot_app = None
-
-# ---------- MANEJADOR DE NUEVOS MIEMBROS ----------
-async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detecta cuando un usuario entra al grupo - MODO ESTRICTO"""
-    chat_member = update.chat_member
-    
-    if not chat_member or chat_member.chat.id != VIP_GROUP_ID:
-        return
-    
-    # Verificar que es un nuevo miembro
-    if chat_member.new_chat_member.status == "member" and chat_member.old_chat_member.status in ["left", "kicked"]:
-        user = chat_member.new_chat_member.user
-        user_id = user.id
-        username = user.username or f"user_{user_id}"
-        first_name = user.first_name or ""
+    async def reactivate_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/reactivate @username plan - Reactiva usuario expulsado/expirado"""
+        if update.effective_user.id != ADMIN_ID:
+            return
         
-        logger.info(f"📥 Nuevo miembro detectado: @{username} ({user_id})")
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ *Formato:* `/reactivate @username plan`\n\n"
+                "Ejemplo: `/reactivate @juan semanal`\n\n"
+                "⚠️ Esto reactivará al usuario aunque haya sido expulsado.",
+                parse_mode="Markdown"
+            )
+            return
         
-        registered, result = await db.register_user_auto(user_id, username, first_name)
+        username = context.args[0].replace("@", "")
+        plan = context.args[1].lower()
         
-        if registered:
-            if result == "trial_nuevo":
-                welcome_msg = (
-                    f"🎉 ¡Bienvenido @{username}!\n\n"
-                    f"✨ Has recibido un **TRIAL GRATIS de 1 día**\n"
-                    f"📅 Expira: {(datetime.now() + timedelta(days=1)).strftime('%d/%m/%Y')}\n\n"
-                    f"Para continuar después del trial, contacta al administrador.\n\n"
-                    f"Planes disponibles:\n"
-                    f"• 📅 Semanal (7 días) - $10\n"
-                    f"• 📆 Mensual (30 días) - $20"
-                )
-                await context.bot.send_message(user_id, welcome_msg, parse_mode="Markdown")
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"🆕 *Nuevo usuario registrado*\n"
-                    f"👤 @{username}\n"
-                    f"🎁 Trial activado por 1 día\n"
-                    f"📅 Expira: {(datetime.now() + timedelta(days=1)).strftime('%d/%m/%Y')}",
-                    parse_mode="Markdown"
-                )
+        if plan not in PLANS:
+            await update.message.reply_text("❌ Plan inválido. Usa: semanal o mensual")
+            return
+        
+        # Buscar el usuario
+        user = await db.get_user_by_username(username)
+        
+        if not user:
+            await update.message.reply_text(f"❌ No hay registro de @{username}")
+            return
+        
+        now = datetime.now()
+        plan_config = PLANS[plan]
+        end_date = now + timedelta(days=plan_config['days'])
+        
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Reactivar usuario
+                cur.execute("""
+                UPDATE users 
+                SET plan = %s, start_date = %s, end_date = %s, status = 'active',
+                    updated_at = NOW()
+                WHERE user_id = %s
+                """, (plan, now, end_date, user['user_id']))
+                
+                # Registrar pago
+                cur.execute("""
+                INSERT INTO payments (user_id, username, plan, amount, payment_date)
+                VALUES (%s, %s, %s, %s, %s)
+                """, (user['user_id'], username, plan, plan_config['price'], now))
+                
+                conn.commit()
+        
+        # Desbanear del grupo
+        try:
+            await context.bot.unban_chat_member(VIP_GROUP_ID, user['user_id'])
+            await update.message.reply_text(
+                f"✅ @{username} reactivado con {plan_config['name']}\n"
+                f"📅 Expira: {end_date.strftime('%d/%m/%Y')}\n"
+                f"✅ Usuario desbaneado del grupo"
+            )
             
-            elif result == "activo":
-                # Usuario ya activo, mensaje de bienvenida de vuelta
-                user_data = await db.get_user_by_id(user_id)
-                if user_data:
-                    days_left = (user_data['end_date'] - datetime.now()).days
-                    await context.bot.send_message(
-                        user_id,
-                        f"🎉 ¡Bienvenido de vuelta @{username}!\n\n"
-                        f"✅ Tu suscripción está activa\n"
-                        f"📅 Expira en {days_left} días\n"
-                        f"📋 Plan: {user_data['plan']}"
-                    )
+            # Notificar al usuario
+            await context.bot.send_message(
+                user['user_id'],
+                f"🎉 ¡Tu suscripción ha sido reactivada!\n\n"
+                f"📋 Plan: {plan_config['name']}\n"
+                f"📅 Expira: {end_date.strftime('%d/%m/%Y')}\n\n"
+                f"¡Bienvenido de nuevo!"
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"✅ Usuario reactivado en BD pero hubo error al desbanear: {e}"
+            )
+    
+    # ---------- INSTANCIA GLOBAL ----------
+    db = Database(DATABASE_URL)
+    scheduler = AsyncIOScheduler()
+    bot_app = None
+    
+    # ---------- MANEJADOR DE NUEVOS MIEMBROS ----------
+    async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Detecta cuando un usuario entra al grupo - MODO ESTRICTO"""
+        chat_member = update.chat_member
         
-        else:
-            # Usuario expirado o no válido - Expulsar inmediatamente
-            if result == "expirado":
-                try:
-                    await context.bot.ban_chat_member(VIP_GROUP_ID, user_id)
+        if not chat_member or chat_member.chat.id != VIP_GROUP_ID:
+            return
+        
+        # Verificar que es un nuevo miembro
+        if chat_member.new_chat_member.status == "member" and chat_member.old_chat_member.status in ["left", "kicked"]:
+            user = chat_member.new_chat_member.user
+            user_id = user.id
+            username = user.username or f"user_{user_id}"
+            first_name = user.first_name or ""
+            
+            logger.info(f"📥 Nuevo miembro detectado: @{username} ({user_id})")
+            
+            registered, result = await db.register_user_auto(user_id, username, first_name)
+            
+            if registered:
+                if result == "trial_nuevo":
+                    welcome_msg = (
+                        f"🎉 ¡Bienvenido @{username}!\n\n"
+                        f"✨ Has recibido un **TRIAL GRATIS de 1 día**\n"
+                        f"📅 Expira: {(datetime.now() + timedelta(days=1)).strftime('%d/%m/%Y')}\n\n"
+                        f"Para continuar después del trial, contacta al administrador.\n\n"
+                        f"Planes disponibles:\n"
+                        f"• 📅 Semanal (7 días) - $10\n"
+                        f"• 📆 Mensual (30 días) - $20"
+                    )
+                    await context.bot.send_message(user_id, welcome_msg, parse_mode="Markdown")
                     await context.bot.send_message(
                         ADMIN_ID,
-                        f"🚫 *ACCESO DENEGADO*\n"
+                        f"🆕 *Nuevo usuario registrado*\n"
                         f"👤 @{username}\n"
-                        f"❌ Intento de reingreso de usuario expirado\n"
-                        f"🛡️ Expulsado automáticamente",
+                        f"🎁 Trial activado por 1 día\n"
+                        f"📅 Expira: {(datetime.now() + timedelta(days=1)).strftime('%d/%m/%Y')}",
                         parse_mode="Markdown"
                     )
-                    logger.info(f"🚫 Usuario expirado {username} expulsado automáticamente")
-                except Exception as e:
-                    logger.error(f"Error expulsando usuario {username}: {e}")
+                
+                elif result == "activo":
+                    # Usuario ya activo, mensaje de bienvenida de vuelta
+                    user_data = await db.get_user_by_id(user_id)
+                    if user_data:
+                        days_left = (user_data['end_date'] - datetime.now()).days
+                        await context.bot.send_message(
+                            user_id,
+                            f"🎉 ¡Bienvenido de vuelta @{username}!\n\n"
+                            f"✅ Tu suscripción está activa\n"
+                            f"📅 Expira en {days_left} días\n"
+                            f"📋 Plan: {user_data['plan']}"
+                        )
+            
+            else:
+                # Usuario expirado o no válido - Expulsar inmediatamente
+                if result == "expirado":
+                    try:
+                        await context.bot.ban_chat_member(VIP_GROUP_ID, user_id)
+                        await context.bot.send_message(
+                            ADMIN_ID,
+                            f"🚫 *ACCESO DENEGADO*\n"
+                            f"👤 @{username}\n"
+                            f"❌ Intento de reingreso de usuario expirado\n"
+                            f"🛡️ Expulsado automáticamente",
+                            parse_mode="Markdown"
+                        )
+                        logger.info(f"🚫 Usuario expirado {username} expulsado automáticamente")
+                    except Exception as e:
+                        logger.error(f"Error expulsando usuario {username}: {e}")
 
 # ---------- COMANDOS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
