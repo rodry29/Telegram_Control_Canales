@@ -724,8 +724,7 @@ async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Grupo agregado correctamente*\n\n"
             f"📌 Nombre: {group_name}\n"
             f"🆔 ID: `{group_id}`\n"
-            f"👑 Admin: `{admin_id}`\n\n"
-            f"✅ El grupo quedará guardado permanentemente, incluso después de deploys.",
+            f"👑 Admin: `{admin_id}`\n\n",
             parse_mode="Markdown"
         )
 
