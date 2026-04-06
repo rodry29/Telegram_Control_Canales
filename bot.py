@@ -1399,6 +1399,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ Opción no implementada: {query.data}")
     
     context.user_data['current_group'] = group_id
+
+    #pruebas
+    async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los callbacks del teclado inline"""
+    query = update.callback_query
+    
+    # ✅ Esto imprimirá en los logs de Railway
+    print(f"🔔 CALLBACK RECIBIDO: {query.data}")
+    logger.info(f"🔔 CALLBACK RECIBIDO: {query.data}")
+    
+    await query.answer()
     
    # En la función start() para Super Admin:
     keyboard = [
