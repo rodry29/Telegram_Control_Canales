@@ -208,37 +208,6 @@ class Database:
                     
                     # También intentar buscar en los logs del grupo (mensajes recientes)
                     return False, f"❌ No tengo registro de @{username} en este grupo.\n\n📌 *Para activar su suscripción:*\n1. Pídele a @{username} que envíe cualquier mensaje a este bot\n2. Una vez que el bot reciba su mensaje, vuelve a ejecutar el comando\n\n*O puede unirse al grupo y el bot lo registrará automáticamente con TRIAL.*"
-
-    async def sync_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /sync - Sincroniza usuarios del grupo con la base de datos (solo admin)"""
-        user_id = update.effective_user.id
-        chat_id = update.effective_chat.id
-        
-        group = get_group_by_id(chat_id)
-        if not group or not can_manage_group(user_id, chat_id):
-            await update.message.reply_text("❌ No autorizado")
-            return
-        
-        await update.message.reply_text("🔄 Sincronizando usuarios del grupo...")
-        
-        try:
-            # Obtener todos los miembros del grupo
-            admins = await context.bot.get_chat_administrators(chat_id)
-            
-            count = 0
-            for admin in admins:
-                if admin.user.id != context.bot.id:
-                    # Verificar si existe en BD
-                    existing = await db.get_user_by_username(admin.user.username, chat_id) if admin.user.username else None
-                    if not existing:
-                        # Registrar al usuario
-                        username = admin.user.username or f"user_{admin.user.id}"
-                        await db.register_user_auto(chat_id, admin.user.id, username, admin.user.first_name or "")
-                        count += 1
-            
-            await update.message.reply_text(f"✅ Sincronización completa. {count} usuarios nuevos registrados.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {e}")
     
     async def get_expiring_users(self, group_id: int, days_before: int) -> List[Dict]:
         """Obtiene usuarios que expiran en X días en un grupo"""
@@ -894,7 +863,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-
+async def sync_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /sync - Sincroniza usuarios del grupo con la base de datos (solo admin)"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    group = get_group_by_id(chat_id)
+    if not group or not can_manage_group(user_id, chat_id):
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    await update.message.reply_text("🔄 Sincronizando usuarios del grupo...")
+    
+    try:
+        # Obtener todos los miembros del grupo
+        admins = await context.bot.get_chat_administrators(chat_id)
+        
+        count = 0
+        for admin in admins:
+            if admin.user.id != context.bot.id:
+                # Verificar si existe en BD
+                existing = await db.get_user_by_username(admin.user.username, chat_id) if admin.user.username else None
+                if not existing and admin.user.username:
+                    # Registrar al usuario
+                    username = admin.user.username
+                    await db.register_user_auto(chat_id, admin.user.id, username, admin.user.first_name or "")
+                    count += 1
+        
+        await update.message.reply_text(f"✅ Sincronización completa. {count} usuarios nuevos registrados.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     """Expulsa usuarios con suscripción vencida"""
