@@ -507,27 +507,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Super Admin
     if user_id == SUPER_ADMIN_ID:
-        vip_groups = get_groups_by_admin(user_id, "VIP")
-        free_groups = get_groups_by_admin(user_id, "FREE")
+        # Contar grupos
+        vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
+        free_groups = [g for g in GROUPS if g.get("type", "VIP") == "FREE"]
         
-        keyboard = []
-        if vip_groups:
-            keyboard.append([InlineKeyboardButton("👑 Grupos VIP", callback_data="vip_groups")])
-        if free_groups:
-            keyboard.append([InlineKeyboardButton("📋 Grupos FREE", callback_data="free_groups")])
-        keyboard.append([InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")])
-        keyboard.append([InlineKeyboardButton("📈 Estadísticas globales", callback_data="global_stats")])
+        keyboard = [
+            [InlineKeyboardButton(f"👑 Grupos VIP ({len(vip_groups)})", callback_data="vip_groups")],
+            [InlineKeyboardButton(f"📋 Grupos FREE ({len(free_groups)})", callback_data="free_groups")],
+            [InlineKeyboardButton("✏️ Editar grupo", callback_data="edit_group_menu")],  # ← NUEVO BOTÓN
+            [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
+            [InlineKeyboardButton("📈 Estadísticas globales", callback_data="global_stats")],
+        ]
         
         await update.message.reply_text(
-            "👑 *Panel de Super Administrador*\n\n"
+            f"👑 *Panel de Super Administrador*\n\n"
             f"📊 VIP: {len(vip_groups)} grupos\n"
-            f"📋 FREE: {len(free_groups)} grupos",
+            f"📋 FREE: {len(free_groups)} grupos\n\n"
+            f"Selecciona una opción:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return
-
-    # Admin de grupos
+    
+        # Admin de grupos
     user_groups = get_groups_by_admin(user_id)
     if not user_groups:
         await update.message.reply_text("❌ No tienes grupos asignados")
