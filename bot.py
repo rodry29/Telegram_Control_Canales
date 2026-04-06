@@ -724,7 +724,8 @@ async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Grupo agregado correctamente*\n\n"
             f"📌 Nombre: {group_name}\n"
             f"🆔 ID: `{group_id}`\n"
-            f"👑 Admin: `{admin_id}`\n\n",
+            f"👑 Admin: `{admin_id}`\n\n"
+            f"Ya puedes contactar al admin del grupo para verificar su rol`\n\n",
             parse_mode="Markdown"
         )
 
