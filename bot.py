@@ -143,20 +143,25 @@ class Database:
 
                 conn.commit()
 
-                # Registrar grupos configurados
-                for group in GROUPS:
-                    cur.execute("""
-                    INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (group_id) DO UPDATE SET
-                        group_name = EXCLUDED.group_name,
-                        admin_id = EXCLUDED.admin_id
-                    """, (group["group_id"], group["group_name"], group["admin_id"], SUPER_ADMIN_ID))
-                conn.commit()
-                logger.info(f"✅ {len(GROUPS)} grupos registrados")
+            logger.info("✅ Base de datos inicializada correctamente")
 
-        logger.info("✅ Base de datos inicializada correctamente")
-
+    async def main():
+        global bot_app
+        
+        await db.init_tables()
+        
+        # ✅ CARGAR GRUPOS DESDE BASE DE DATOS (persistente)
+        grupos_cargados = await db.load_groups_from_db()
+        
+        if not grupos_cargados and GROUPS_CONFIG:
+            # Solo si no hay grupos en BD, usar los de la variable de entorno
+            logger.info("📦 Usando grupos de GROUPS_CONFIG como respaldo")
+            for group in GROUPS:
+                await db.save_group(group["group_id"], group["group_name"], group["admin_id"])
+        
+        logger.info(f"📦 {len(GROUPS)} grupos disponibles")
+    
+                 
     async def get_user_by_username(self, username: str, group_id: int = None) -> Optional[Dict]:
         """Busca usuario por username (opcionalmente por grupo)"""
         with self.get_connection() as conn:
@@ -339,6 +344,43 @@ class Database:
                 new_users = cur.fetchone()['new_users']
                 
                 return {"summary": summary, "total": total, "new_users": new_users}
+
+    async def save_group(self, group_id: int, group_name: str, admin_id: int):
+        """Guarda un grupo en la base de datos (persistente)"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (group_id) DO UPDATE SET
+                    group_name = EXCLUDED.group_name,
+                    admin_id = EXCLUDED.admin_id
+                """, (group_id, group_name, admin_id, SUPER_ADMIN_ID))
+                conn.commit()
+                logger.info(f"✅ Grupo {group_name} guardado en BD")
+
+    async def load_groups_from_db(self):
+        """Carga los grupos desde la base de datos al iniciar (persistente)"""
+        global GROUPS
+        
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT group_id, group_name, admin_id FROM groups")
+                db_groups = cur.fetchall()
+                
+                if db_groups:
+                    GROUPS.clear()
+                    for g in db_groups:
+                        GROUPS.append({
+                            "group_id": g["group_id"],
+                            "group_name": g["group_name"],
+                            "admin_id": g["admin_id"]
+                        })
+                    logger.info(f"📦 {len(GROUPS)} grupos cargados desde la base de datos")
+                    return True
+                else:
+                    logger.info("📦 No hay grupos en la base de datos")
+                    return False
 
 
 # ==================== INSTANCIA GLOBAL ====================
@@ -645,13 +687,17 @@ async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Agrega un nuevo grupo (solo Super Admin)"""
+    """Agrega un nuevo grupo (solo Super Admin) - GUARDA EN BD"""
     if update.effective_user.id != SUPER_ADMIN_ID:
         await update.message.reply_text("❌ Solo el Super Admin puede agregar grupos")
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text("❌ Formato: `/addgroup group_id \"nombre\" admin_id`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ *Formato:* `/addgroup group_id \"nombre\" admin_id`\n\n"
+            "Ejemplo: `/addgroup -1001234567890 \"VIP Club\" 123456789`",
+            parse_mode="Markdown"
+        )
         return
 
     try:
@@ -659,21 +705,30 @@ async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_name = " ".join(context.args[1:-1]).strip('"')
         admin_id = int(context.args[-1])
 
+        # Verificar si ya existe
         if get_group_by_id(group_id):
             await update.message.reply_text(f"❌ El grupo {group_id} ya existe")
             return
 
-        GROUPS.append({"group_id": group_id, "group_name": group_name, "admin_id": admin_id})
+        # Guardar en la lista global
+        GROUPS.append({
+            "group_id": group_id,
+            "group_name": group_name,
+            "admin_id": admin_id
+        })
 
-        with db.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                INSERT INTO groups (group_id, group_name, admin_id, super_admin_id)
-                VALUES (%s, %s, %s, %s)
-                """, (group_id, group_name, admin_id, SUPER_ADMIN_ID))
-                conn.commit()
+        # ✅ GUARDAR EN BASE DE DATOS (persistente)
+        await db.save_group(group_id, group_name, admin_id)
 
-        await update.message.reply_text(f"✅ Grupo '{group_name}' agregado correctamente", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ *Grupo agregado correctamente*\n\n"
+            f"📌 Nombre: {group_name}\n"
+            f"🆔 ID: `{group_id}`\n"
+            f"👑 Admin: `{admin_id}`\n\n"
+            f"✅ El grupo quedará guardado permanentemente, incluso después de deploys.",
+            parse_mode="Markdown"
+        )
+
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
