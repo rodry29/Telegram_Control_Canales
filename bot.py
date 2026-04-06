@@ -994,7 +994,7 @@ async def main():
     bot_app.add_handler(CommandHandler("check", check_user_command))
     
     # Detectar nuevos miembros
-    bot_app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member_message))
     
     # Tareas programadas
     scheduler.add_job(check_expiring_subscriptions, 'interval', hours=1)
