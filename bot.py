@@ -216,24 +216,27 @@ class Database:
                 else:
                     return False, "expirado"
 
-    async def add_or_update_user(self, group_id: int, username: str, plan: str, user_id: int = None) -> Tuple[bool, str]:
-        """Agrega o renueva usuario"""
+    async def add_or_update_user(self, group_id: int, username: str, plan: str) -> Tuple[bool, str]:
+        """Agrega o renueva usuario - SOLO CON USERNAME, sin necesidad de user_id"""
         now = datetime.now()
-
+    
         if plan not in PLANS:
             return False, "❌ Plan inválido"
-
+    
         config = PLANS[plan]
-
+    
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                existing = await self.get_user_by_username(username, group_id)
-
+                # Buscar usuario por username en este grupo
+                cur.execute("SELECT user_id, trial_used, status FROM users WHERE username = %s AND group_id = %s", (username, group_id))
+                existing = cur.fetchone()
+    
                 if existing:
                     user_id = existing['user_id']
+                    
                     if plan == "trial" and existing['trial_used']:
                         return False, "❌ Este usuario ya usó su prueba gratuita"
-
+    
                     end_date = now + timedelta(days=config['days'])
                     cur.execute("""
                     UPDATE users 
@@ -242,25 +245,20 @@ class Database:
                         trial_used = trial_used OR %s
                     WHERE user_id = %s AND group_id = %s
                     """, (plan, now, end_date, username, plan == "trial", user_id, group_id))
-                else:
-                    if not user_id:
-                        return False, f"❌ No tengo el ID de @{username}. Pídele que envíe un mensaje al bot."
-
-                    end_date = now + timedelta(days=config['days'])
-                    trial_used = (plan == "trial")
+                    
+                    # Registrar pago
                     cur.execute("""
-                    INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, trial_used, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active')
-                    """, (user_id, group_id, username, "", plan, now, end_date, trial_used))
-
-                cur.execute("""
-                INSERT INTO payments (user_id, group_id, username, plan, amount, payment_date)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """, (user_id, group_id, username, plan, config['price'], now))
-
-                conn.commit()
-                return True, f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
-
+                    INSERT INTO payments (user_id, group_id, username, plan, amount, payment_date)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (user_id, group_id, username, plan, config['price'], now))
+                    
+                    conn.commit()
+                    return True, f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
+                
+                else:
+                    # Usuario no existe en la base de datos
+                    return False, f"❌ No tengo registro de @{username} en este grupo.\n\n📌 *Para activar su suscripción:*\n1. Pídele a @{username} que envíe cualquier mensaje a este bot\n2. Una vez que el bot reciba su mensaje, vuelve a ejecutar el comando\n\n*O puede unirse al grupo y el bot lo registrará automáticamente con TRIAL.*"
+  
     async def get_expiring_users(self, group_id: int, days_before: int) -> List[Dict]:
         """Obtiene usuarios que expiran en X días en un grupo"""
         target_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_before)
@@ -439,7 +437,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/add @username plan - Agrega o renueva usuario"""
+    """/add @username plan - Agrega o renueva usuario (solo con username)"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -458,23 +456,43 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Usa: `/add @username plan`\nPlanes: trial, semanal, mensual", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ *Formato correcto:*\n"
+            "`/add @username plan`\n\n"
+            "Ejemplo: `/add @juan semanal`\n\n"
+            "Planes: trial, semanal, mensual",
+            parse_mode="Markdown"
+        )
         return
 
     username = context.args[0].replace("@", "")
     plan = context.args[1].lower()
 
     if plan not in PLANS:
-        await update.message.reply_text("❌ Plan inválido")
+        await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal o mensual")
         return
 
-    existing = await db.get_user_by_username(username, current_group)
-    success, msg = await db.add_or_update_user(current_group, username, plan, existing['user_id'] if existing else None)
-    await update.message.reply_text(msg)
+    # Mostrar mensaje de procesando
+    processing_msg = await update.message.reply_text(f"⏳ Procesando suscripción para @{username}...")
 
-    if success and existing:
-        await context.bot.unban_chat_member(current_group, existing['user_id'])
+    success, msg = await db.add_or_update_user(current_group, username, plan)
+    await processing_msg.edit_text(msg)
 
+    if success:
+        # Obtener el user_id para desbanear
+        user_data = await db.get_user_by_username(username, current_group)
+        if user_data:
+            try:
+                await context.bot.unban_chat_member(current_group, user_data['user_id'])
+                await context.bot.send_message(
+                    user_data['user_id'],
+                    f"🎉 ¡Tu suscripción ha sido activada!\n"
+                    f"📋 Plan: {PLANS[plan]['name']}\n"
+                    f"📅 Expira: {(datetime.now() + timedelta(days=PLANS[plan]['days'])).strftime('%d/%m/%Y')}"
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo notificar al usuario: {e}")
+                
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lista usuarios activos del grupo actual"""
