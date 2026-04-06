@@ -25,20 +25,18 @@ logger = logging.getLogger(__name__)
 # ==================== CONFIGURACIÓN ====================
 DATABASE_URL = os.getenv("DATABASE_URL")
 SUPER_ADMIN_ID = 5054216496
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not TOKEN:
     print("❌ ERROR: No se encontró token")
     exit(1)
 
-# Planes y precios
 PLANS = {
     "trial": {"days": 1, "price": 0, "name": "🎁 Trial (1 día)"},
     "semanal": {"days": 7, "price": 10, "name": "📅 Semanal (7 días)"},
     "mensual": {"days": 30, "price": 20, "name": "📆 Mensual (30 días)"}
 }
 
-# Configuración de grupos
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
 GROUPS = []
 
@@ -241,6 +239,15 @@ class Database:
                 new_users = cur.fetchone()['new_users']
                 return {"summary": summary, "total": total, "new_users": new_users}
 
+    async def get_total_monthly_earnings(self):
+        """Ganancias totales de todos los grupos del mes actual"""
+        now = datetime.now()
+        start_date = datetime(now.year, now.month, 1)
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE payment_date >= %s", (start_date,))
+                return cur.fetchone()[0]
+
     async def get_expired_users(self, group_id: int):
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -267,6 +274,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton(f"👑 Grupos VIP ({vip_count})", callback_data="vip_groups")],
             [InlineKeyboardButton(f"📋 Grupos FREE ({free_count})", callback_data="free_groups")],
+            [InlineKeyboardButton("💰 Ganancias", callback_data="total_earnings")],
             [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
         ]
         await update.message.reply_text(f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -284,6 +292,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             keyboard = [[InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")], [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]]
             await update.message.reply_text(f"📋 *Panel FREE - {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra las ganancias totales del mes de todos los grupos (solo Super Admin)"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    total = await db.get_total_monthly_earnings()
+    now = datetime.now()
+    
+    msg = f"💰 *GANANCIAS TOTALES DEL MES*\n\n"
+    msg += f"📅 {now.strftime('%B %Y')}\n"
+    msg += f"💵 Total recaudado: **${total}**\n\n"
+    msg += f"📊 Incluye todos los grupos configurados."
+    
+    await message.reply_text(msg, parse_mode="Markdown")
 
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -332,7 +359,7 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{emoji} @{user['username'] or user['user_id']}\n   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n   📋 {user['plan']}\n\n"
     await message.reply_text(msg, parse_mode="Markdown")
 
-async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async function show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
         await query.answer()
@@ -536,6 +563,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_groups_by_type(update, context, "VIP")
     elif data == "free_groups":
         await show_groups_by_type(update, context, "FREE")
+    elif data == "total_earnings":
+        await total_earnings(update, context)
     elif data == "all_groups":
         await list_groups(update, context)
     elif data == "add_group":
@@ -583,7 +612,7 @@ async def check_expired_subscriptions():
             await db.expire_user(user['user_id'], group["group_id"])
             try:
                 await bot_app.bot.ban_chat_member(group["group_id"], user['user_id'])
-                await bot_app.bot.send_message(group["admin_id"], f"🚫 @{user['username']} expulsado - suscripción vencida")
+                await bot_app.bot.send_message(group["admin_id"], f"🚫 @{user['username']} expulsado")
             except:
                 pass
 
