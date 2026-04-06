@@ -169,100 +169,100 @@ class Database:
                 return cur.fetchone()
     
     async def register_user_auto(self, user_id: int, username: str, first_name: str) -> Tuple[bool, str]:
-    """Registra usuario automáticamente al entrar al grupo"""
-    now = datetime.now()
-    
-    with self.get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT user_id, trial_used, status, end_date FROM users WHERE user_id = %s", (user_id,))
-            existing = cur.fetchone()
-            
-            if not existing:
-                # Nuevo usuario - dar trial
-                end_date = now + timedelta(days=PLANS["trial"]["days"])
-                cur.execute("""
-                INSERT INTO users (user_id, username, first_name, plan, start_date, end_date, trial_used, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
-                """, (user_id, username, first_name, "trial", now, end_date, True))
-                cur.execute("INSERT INTO payments (user_id, username, plan, amount, payment_date) VALUES (%s, %s, %s, %s, %s)", (user_id, username, "trial", 0, now))
-                conn.commit()
-                return True, "trial_nuevo"
-            
-            elif existing['status'] == 'active' and existing['end_date'] > now:
-                # Usuario activo - actualizar username
-                cur.execute("UPDATE users SET username = %s, first_name = %s WHERE user_id = %s", (username, first_name, user_id))
-                conn.commit()
-                return True, "activo"
-            
-            elif existing['status'] == 'active' and existing['end_date'] <= now:
-                # Usuario con suscripción vencida PERO que podría haber renovado recientemente
-                # Dar un margen de 1 hora para permitir renovación
-                time_since_expiry = now - existing['end_date']
-                if time_since_expiry.total_seconds() < 3600:  # 1 hora de gracia
-                    logger.info(f"Usuario {username} en periodo de gracia - permitiendo reingreso")
-                    # Extender un poco más (1 hora) para dar tiempo a renovar
-                    new_end = now + timedelta(hours=1)
-                    cur.execute("UPDATE users SET end_date = %s, updated_at = NOW() WHERE user_id = %s", (new_end, user_id))
+        """Registra usuario automáticamente al entrar al grupo"""
+        now = datetime.now()
+        
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT user_id, trial_used, status, end_date FROM users WHERE user_id = %s", (user_id,))
+                existing = cur.fetchone()
+                
+                if not existing:
+                    # Nuevo usuario - dar trial
+                    end_date = now + timedelta(days=PLANS["trial"]["days"])
+                    cur.execute("""
+                    INSERT INTO users (user_id, username, first_name, plan, start_date, end_date, trial_used, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                    """, (user_id, username, first_name, "trial", now, end_date, True))
+                    cur.execute("INSERT INTO payments (user_id, username, plan, amount, payment_date) VALUES (%s, %s, %s, %s, %s)", (user_id, username, "trial", 0, now))
                     conn.commit()
-                    return True, "periodo_gracia"
+                    return True, "trial_nuevo"
+                
+                elif existing['status'] == 'active' and existing['end_date'] > now:
+                    # Usuario activo - actualizar username
+                    cur.execute("UPDATE users SET username = %s, first_name = %s WHERE user_id = %s", (username, first_name, user_id))
+                    conn.commit()
+                    return True, "activo"
+                
+                elif existing['status'] == 'active' and existing['end_date'] <= now:
+                    # Usuario con suscripción vencida PERO que podría haber renovado recientemente
+                    # Dar un margen de 1 hora para permitir renovación
+                    time_since_expiry = now - existing['end_date']
+                    if time_since_expiry.total_seconds() < 3600:  # 1 hora de gracia
+                        logger.info(f"Usuario {username} en periodo de gracia - permitiendo reingreso")
+                        # Extender un poco más (1 hora) para dar tiempo a renovar
+                        new_end = now + timedelta(hours=1)
+                        cur.execute("UPDATE users SET end_date = %s, updated_at = NOW() WHERE user_id = %s", (new_end, user_id))
+                        conn.commit()
+                        return True, "periodo_gracia"
+                    else:
+                        return False, "expirado"
                 else:
                     return False, "expirado"
-            else:
-                return False, "expirado"
     
     async def add_or_update_user(self, username: str, plan: str, user_id: int = None) -> Tuple[bool, str]:
-    """Agrega o renueva usuario - NO expulsa durante renovación"""
-    now = datetime.now()
-    
-    if plan not in PLANS:
-        return False, "❌ Plan inválido"
-    
-    config = PLANS[plan]
-    
-    with self.get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            existing = await self.get_user_by_username(username)
-            
-            if existing:
-                user_id = existing['user_id']
+        """Agrega o renueva usuario - NO expulsa durante renovación"""
+        now = datetime.now()
+        
+        if plan not in PLANS:
+            return False, "❌ Plan inválido"
+        
+        config = PLANS[plan]
+        
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                existing = await self.get_user_by_username(username)
                 
-                # Verificar si ya usó trial
-                if plan == "trial" and existing['trial_used']:
-                    return False, "❌ Este usuario ya usó su prueba gratuita"
+                if existing:
+                    user_id = existing['user_id']
+                    
+                    # Verificar si ya usó trial
+                    if plan == "trial" and existing['trial_used']:
+                        return False, "❌ Este usuario ya usó su prueba gratuita"
+                    
+                    # ✅ IMPORTANTE: Siempre reactivar, incluso si estaba expirado
+                    end_date = now + timedelta(days=config['days'])
+                    
+                    cur.execute("""
+                    UPDATE users 
+                    SET plan = %s, start_date = %s, end_date = %s, status = 'active',
+                        updated_at = NOW(), username = %s,
+                        trial_used = trial_used OR %s
+                    WHERE user_id = %s
+                    """, (plan, now, end_date, username, plan == "trial", user_id))
+                    
+                else:
+                    if not user_id:
+                        return False, f"❌ No tengo el ID de @{username}. Pídele que envíe un mensaje al bot."
+                    
+                    end_date = now + timedelta(days=config['days'])
+                    trial_used = (plan == "trial")
+                    
+                    cur.execute("""
+                    INSERT INTO users (user_id, username, first_name, plan, start_date, end_date, trial_used, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                    """, (user_id, username, "", plan, now, end_date, trial_used))
                 
-                # ✅ IMPORTANTE: Siempre reactivar, incluso si estaba expirado
-                end_date = now + timedelta(days=config['days'])
-                
+                # Registrar pago
                 cur.execute("""
-                UPDATE users 
-                SET plan = %s, start_date = %s, end_date = %s, status = 'active',
-                    updated_at = NOW(), username = %s,
-                    trial_used = trial_used OR %s
-                WHERE user_id = %s
-                """, (plan, now, end_date, username, plan == "trial", user_id))
+                INSERT INTO payments (user_id, username, plan, amount, payment_date)
+                VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, username, plan, config['price'], now))
                 
-            else:
-                if not user_id:
-                    return False, f"❌ No tengo el ID de @{username}. Pídele que envíe un mensaje al bot."
+                conn.commit()
                 
-                end_date = now + timedelta(days=config['days'])
-                trial_used = (plan == "trial")
-                
-                cur.execute("""
-                INSERT INTO users (user_id, username, first_name, plan, start_date, end_date, trial_used, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
-                """, (user_id, username, "", plan, now, end_date, trial_used))
-            
-            # Registrar pago
-            cur.execute("""
-            INSERT INTO payments (user_id, username, plan, amount, payment_date)
-            VALUES (%s, %s, %s, %s, %s)
-            """, (user_id, username, plan, config['price'], now))
-            
-            conn.commit()
-            
-            message = f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
-            return True, message
+                message = f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
+                return True, message
     
     async def get_expiring_users(self, days_before: int) -> List[Dict]:
         """Obtiene usuarios que expiran en X días"""
