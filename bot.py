@@ -774,37 +774,44 @@ async def send_monthly_report():
             )
 
 # ---------- MAIN ----------
-async def main():
-    """Función principal"""
-    global bot_app
+def main():
+    """Función principal - SIN async"""
+    import asyncio
     
-    # Inicializar base de datos
-    await db.init_tables()
-    logger.info("📦 Base de datos lista")
+    async def setup():
+        global bot_app
+        
+        await db.init_tables()
+        logger.info("📦 Base de datos lista")
+        
+        defaults = Defaults(parse_mode="HTML")
+        bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
+        
+        bot_app.add_handler(CommandHandler("start", start))
+        bot_app.add_handler(CommandHandler("add", add_user_command))
+        bot_app.add_handler(CommandHandler("renew", renew_user))
+        bot_app.add_handler(CommandHandler("remove", remove_user))
+        bot_app.add_handler(CommandHandler("export", export_report))
+        bot_app.add_handler(CallbackQueryHandler(handle_callback))
+        
+        scheduler.add_job(check_expiring_subscriptions, 'interval', hours=1)
+        scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
+        scheduler.add_job(send_monthly_report, 'interval', hours=1)
+        scheduler.start()
+        
+        logger.info("🤖 Bot iniciado")
+        
+        # Iniciar polling
+        await bot_app.initialize()
+        await bot_app.start()
+        await bot_app.updater.start_polling()
+        
+        # Mantener vivo
+        while True:
+            await asyncio.sleep(1)
     
-    # Configurar el bot
-    defaults = Defaults(parse_mode="HTML")
-    bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
-    
-    # Handlers de comandos
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("add", add_user_command))
-    bot_app.add_handler(CommandHandler("renew", renew_user))
-    bot_app.add_handler(CommandHandler("remove", remove_user))
-    bot_app.add_handler(CommandHandler("export", export_report))
-    bot_app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Programar tareas
-    scheduler.add_job(check_expiring_subscriptions, 'interval', hours=1)  # Cada hora, pero solo actúa a las 7 AM
-    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)   # Cada 6 horas
-    scheduler.add_job(send_monthly_report, 'interval', hours=1)           # Cada hora, pero solo actúa el día 1 a las 8 AM
-    scheduler.start()
-    
-    logger.info("🤖 Bot iniciado - Los datos se guardan en PostgreSQL persistentemente")
-    logger.info(f"📊 Los usuarios activos se conservan entre reinicios")
-    
-    # Iniciar el bot
-    await bot_app.run_polling()
+    # Ejecutar
+    asyncio.run(setup())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
