@@ -193,7 +193,7 @@ class Database:
                     """)
                 logger.info("✅ Tabla 'users' verificada/creada")
                     
-                # 3. TERCERO: Crear tabla payments
+                # 3. Crear tabla payments
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS payments (
                     id SERIAL PRIMARY KEY,
@@ -206,13 +206,13 @@ class Database:
                 )
                 """)
                 logger.info("✅ Tabla 'payments' verificada/creada")
-                    
-                    # 4. CUARTO: Crear índices (AHORA las columnas ya existen)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
-                    logger.info("✅ Índices creados")
-                                
+                
+                # 4. Crear índices
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                logger.info("✅ Índices creados")
+                
                 conn.commit()
                 
                 # 5. QUINTO: Registrar grupos configurados
