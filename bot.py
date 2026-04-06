@@ -1092,6 +1092,93 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📋 Clientes potenciales - {group['group_name']}"
     )
     output.close()
+
+async def edit_group_simple(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Versión simple: /editgroup group_id campo valor"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo el Super Admin puede editar grupos")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ *Formato simple:* `/editgroup group_id campo valor`\n\n"
+            "Campos disponibles:\n"
+            "• `name` - Nombre del grupo\n"
+            "• `admin` - ID del administrador\n"
+            "• `type` - Tipo (VIP o FREE)\n\n"
+            "*Ejemplos:*\n"
+            "`/editgroup -1001234567890 name \"VIP Club\"`\n"
+            "`/editgroup -1001234567890 admin 8682208062`\n"
+            "`/editgroup -1001234567890 type FREE`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        group_id = int(context.args[0])
+        field = context.args[1].lower()
+        value = " ".join(context.args[2:]).strip('"')
+        
+        # Buscar el grupo
+        group = get_group_by_id(group_id)
+        if not group:
+            await update.message.reply_text(f"❌ No se encontró el grupo {group_id}")
+            return
+        
+        # Aplicar cambio según campo
+        if field == "name":
+            new_value = value
+            old_value = group["group_name"]
+            group["group_name"] = new_value
+        elif field == "admin":
+            new_value = int(value)
+            old_value = group["admin_id"]
+            group["admin_id"] = new_value
+        elif field == "type":
+            new_value = value.upper()
+            if new_value not in ["VIP", "FREE"]:
+                await update.message.reply_text("❌ Tipo debe ser VIP o FREE")
+                return
+            old_value = group.get("type", "VIP")
+            group["type"] = new_value
+        else:
+            await update.message.reply_text(f"❌ Campo inválido: {field}. Usa: name, admin, type")
+            return
+        
+        # Actualizar en la base de datos
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Asegurar columna group_type
+                cur.execute("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                  WHERE table_name = 'groups' AND column_name = 'group_type') THEN
+                        ALTER TABLE groups ADD COLUMN group_type TEXT DEFAULT 'VIP';
+                    END IF;
+                END $$;
+                """)
+                conn.commit()
+                
+                if field == "name":
+                    cur.execute("UPDATE groups SET group_name = %s, updated_at = NOW() WHERE group_id = %s", (new_value, group_id))
+                elif field == "admin":
+                    cur.execute("UPDATE groups SET admin_id = %s, updated_at = NOW() WHERE group_id = %s", (new_value, group_id))
+                elif field == "type":
+                    cur.execute("UPDATE groups SET group_type = %s, updated_at = NOW() WHERE group_id = %s", (new_value, group_id))
+                conn.commit()
+        
+        await update.message.reply_text(
+            f"✅ *Grupo actualizado*\n\n"
+            f"🆔 ID: `{group_id}`\n"
+            f"📌 {field}: `{old_value}` → `{new_value}`",
+            parse_mode="Markdown"
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Error: El admin_id debe ser un número")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
         
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
@@ -1128,6 +1215,7 @@ async def main():
     bot_app.add_handler(CommandHandler("addgroup", add_group_command))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
     bot_app.add_handler(CommandHandler("sync", sync_users))
+    bot_app.add_handler(CommandHandler("editgroup", edit_group_simple))
 
     # Detectar nuevos miembros
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
