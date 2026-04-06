@@ -1,5 +1,3 @@
 python-telegram-bot==20.3
-apscheduler
-pandas
-openpyxl
-psycopg2-binary
+psycopg2-binary==2.9.9
+apscheduler==3.10.4
