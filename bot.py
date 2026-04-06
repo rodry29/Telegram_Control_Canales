@@ -435,6 +435,28 @@ class Database:
             await update.message.reply_text(
                 f"✅ Usuario reactivado en BD pero hubo error al desbanear: {e}"
             )
+
+    async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los callbacks del teclado inline"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "add_user":
+        await query.message.reply_text(
+            "📝 *Agregar usuario*\n\n"
+            "Usa el comando:\n"
+            "`/add @username plan`\n\n"
+            "Planes: trial, semanal, mensual",
+            parse_mode="Markdown"
+        )
+    elif query.data == "list_active":
+        await list_active_users(update, context)
+    elif query.data == "earnings":
+        await show_earnings(update, context)
+    elif query.data == "stats":
+        await show_stats(update, context)
+    elif query.data == "export_month":
+        await export_report(update, context)  # ✅ Esto debe llamar a export_report
    
     # ---------- MANEJADOR DE NUEVOS MIEMBROS ----------
     async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -933,6 +955,28 @@ async def send_monthly_report():
                 parse_mode="Markdown"
             )
 
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los callbacks del teclado inline"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "add_user":
+        await query.message.reply_text(
+            "📝 *Agregar usuario*\n\n"
+            "Usa el comando:\n"
+            "`/add @username plan`\n\n"
+            "Planes: trial, semanal, mensual",
+            parse_mode="Markdown"
+        )
+    elif query.data == "list_active":
+        await list_active_users(update, context)
+    elif query.data == "earnings":
+        await show_earnings(update, context)
+    elif query.data == "stats":
+        await show_stats(update, context)
+    elif query.data == "export_month":
+        await export_report(update, context)  # ✅ Esto debe llamar a export_report
+        
 # ---------- MAIN ----------
 async def main():
     global bot_app
@@ -952,6 +996,8 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member_message))
     bot_app.add_handler(CommandHandler("register", register_user_command))
     bot_app.add_handler(CommandHandler("check", check_user_command))
+    # En main(), agrega este handler:
+    bot_app.add_handler(CommandHandler("export", export_report))
     
     # Detectar nuevos miembros
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member_message))
