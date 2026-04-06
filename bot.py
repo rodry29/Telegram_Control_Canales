@@ -191,7 +191,7 @@ class Database:
                         UNIQUE(user_id, group_id)
                     )
                     """)
-                    logger.info("✅ Tabla 'users' verificada/creada")
+                logger.info("✅ Tabla 'users' verificada/creada")
                     
                     # 3. TERCERO: Crear tabla payments
                     cur.execute("""
