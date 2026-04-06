@@ -437,26 +437,26 @@ class Database:
             )
 
     async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los callbacks del teclado inline"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "add_user":
-        await query.message.reply_text(
-            "📝 *Agregar usuario*\n\n"
-            "Usa el comando:\n"
-            "`/add @username plan`\n\n"
-            "Planes: trial, semanal, mensual",
-            parse_mode="Markdown"
-        )
-    elif query.data == "list_active":
-        await list_active_users(update, context)
-    elif query.data == "earnings":
-        await show_earnings(update, context)
-    elif query.data == "stats":
-        await show_stats(update, context)
-    elif query.data == "export_month":
-        await export_report(update, context)  # ✅ Esto debe llamar a export_report
+        """Maneja los callbacks del teclado inline"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "add_user":
+            await query.message.reply_text(
+                "📝 *Agregar usuario*\n\n"
+                "Usa el comando:\n"
+                "`/add @username plan`\n\n"
+                "Planes: trial, semanal, mensual",
+                parse_mode="Markdown"
+            )
+        elif query.data == "list_active":
+            await list_active_users(update, context)
+        elif query.data == "earnings":
+            await show_earnings(update, context)
+        elif query.data == "stats":
+            await show_stats(update, context)
+        elif query.data == "export_month":
+            await export_report(update, context)  # ✅ Esto debe llamar a export_report
    
     # ---------- MANEJADOR DE NUEVOS MIEMBROS ----------
     async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
