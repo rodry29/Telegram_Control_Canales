@@ -546,10 +546,10 @@ class Database:
                     except Exception as e:
                         logger.error(f"Error expulsando usuario {username}: {e}")
 
- # ---------- INSTANCIA GLOBAL ----------
-    db = Database(DATABASE_URL)
-    scheduler = AsyncIOScheduler()
-    bot_app = None
+# ---------- INSTANCIA GLOBAL ----------
+db = Database(DATABASE_URL)
+scheduler = AsyncIOScheduler()
+bot_app = None
 
 # ---------- COMANDOS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
