@@ -20,6 +20,10 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 SUPER_ADMIN_ID = 5054216496
 
+if not TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN no está configurado")
+    exit(1)
+    
 # Planes y precios
 PLANS = {
     "trial": {"days": 1, "price": 0, "name": "🎁 Trial (1 día)"},
