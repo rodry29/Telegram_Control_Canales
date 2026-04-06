@@ -475,7 +475,6 @@ class Database:
             await update.message.reply_text(
                 f"✅ Usuario reactivado en BD pero hubo error al desbanear: {e}"
             )
-    
     # ---------- INSTANCIA GLOBAL ----------
     db = Database(DATABASE_URL)
     scheduler = AsyncIOScheduler()
@@ -550,6 +549,8 @@ class Database:
                         logger.info(f"🚫 Usuario expirado {username} expulsado automáticamente")
                     except Exception as e:
                         logger.error(f"Error expulsando usuario {username}: {e}")
+
+
 
 # ---------- COMANDOS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
