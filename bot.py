@@ -21,10 +21,10 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------- CONFIGURACIÓN ----------
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("8782944509:AAFqTBOCPwJdhRgt2Qxx4Usj45DNF83Y86s")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-VIP_GROUP_ID = int(os.getenv("VIP_GROUP_ID", 0))
+ADMIN_ID = int(os.getenv("8682208062", 0))
+VIP_GROUP_ID = int(os.getenv("-1003842587095", 0))
 
 # Planes y precios (días, precio, nombre)
 PLANS = {
