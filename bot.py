@@ -475,11 +475,7 @@ class Database:
             await update.message.reply_text(
                 f"✅ Usuario reactivado en BD pero hubo error al desbanear: {e}"
             )
-    # ---------- INSTANCIA GLOBAL ----------
-    db = Database(DATABASE_URL)
-    scheduler = AsyncIOScheduler()
-    bot_app = None
-    
+   
     # ---------- MANEJADOR DE NUEVOS MIEMBROS ----------
     async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Detecta cuando un usuario entra al grupo - MODO ESTRICTO"""
@@ -550,7 +546,10 @@ class Database:
                     except Exception as e:
                         logger.error(f"Error expulsando usuario {username}: {e}")
 
-
+ # ---------- INSTANCIA GLOBAL ----------
+    db = Database(DATABASE_URL)
+    scheduler = AsyncIOScheduler()
+    bot_app = None
 
 # ---------- COMANDOS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
