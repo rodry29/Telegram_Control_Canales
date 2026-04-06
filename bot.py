@@ -1,344 +1,863 @@
-import psycopg2
+"""
+Telegram Bot para Gestión de Suscripciones VIP
+Escalable para 10k+ usuarios en Railway con PostgreSQL
+"""
+
 import os
+import csv
+import asyncio
+import logging
+from io import StringIO
 from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Tuple
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes,
-    CallbackQueryHandler
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, Defaults, ConversationHandler
 )
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-scheduler = BackgroundScheduler()
-          
-# -------- CONFIG --------
-TOKEN = "8782944509:AAFqTBOCPwJdhRgt2Qxx4Usj45DNF83Y86s"
-VIP_GROUP_ID = -1003842587095
-ADMIN_ID = 8682208062
+# ---------- CONFIGURACIÓN ----------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+VIP_GROUP_ID = int(os.getenv("VIP_GROUP_ID", 0))
 
-# -------- DB --------
-conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    plan TEXT,
-    start_date TIMESTAMP,
-    end_date TIMESTAMP,
-    status TEXT,
-    trial_used INTEGER DEFAULT 0,
-    payment_date TIMESTAMP DEFAULT NULL
-)
-""")
-conn.commit()
-# -------- PLANES --------
+# Planes y precios (días, precio, nombre)
 PLANS = {
-    "trial": 1,
-    "semanal": 7,
-    "mensual": 30
+    "trial": {"days": 1, "price": 0, "name": "🎁 Trial (1 día)"},
+    "semanal": {"days": 7, "price": 10, "name": "📅 Semanal (7 días)"},
+    "mensual": {"days": 30, "price": 20, "name": "📆 Mensual (30 días)"}
 }
 
-# -------- MENU --------
-def main_menu():
-    keyboard = [
-        [InlineKeyboardButton("➕ Agregar", callback_data="add")],
-        [InlineKeyboardButton("📊 Status de suscriptores", callback_data="list")],
-        [InlineKeyboardButton("💰 Ganancias", callback_data="ganancias")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+# Configuración de logs
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# -------- START --------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_ID:
-        return
-    await update.message.reply_text("📊 Panel CRM", reply_markup=main_menu())
+# Estados para conversación
+WAITING_FOR_USERNAME, WAITING_FOR_PLAN = range(2)
 
-# -------- BOTONES PANEL --------
-async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    if query.data == "add":
-        await query.message.reply_text("Formato:\n/add @usuario plan")
-
-    elif query.data == "renew":
-        await query.message.reply_text("Formato:\n/renovar @usuario plan")
-
-    elif query.data == "list":
-        from datetime import datetime
-
-        cursor.execute("SELECT username, end_date FROM users WHERE status='activo'")
-        users = cursor.fetchall()
-
-        if not users:
-            await query.message.reply_text("No hay usuarios activos")
-            return
-
-        msg = "📊 STATUS DE SUSCRIPTORES\n\n"
-
-        for username, end_date in users[:30]:
-            end = end_date
-            hoy = datetime.now()
-
-            dias_restantes = (end - hoy).days
-
-            msg += f"👤 {username}\n"
-            msg += f"📅 Expira: {end.date()}\n"
-            msg += f"⏳ Días restantes: {dias_restantes}\n\n"
-
-        await query.message.reply_text(msg)
-
-    elif query.data == "broadcast":
-        await query.message.reply_text("Usa:\n/msg mensaje")
-
-    elif query.data == "ganancias":
-        from datetime import datetime, timedelta
-    
-        now = datetime.now()
-
-        # Inicio mes actual
-        inicio_mes = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-        # Inicio mes anterior
-        mes_anterior = (inicio_mes - timedelta(days=1)).replace(day=1)
-
-        # ---- MES ACTUAL ----
-        cursor.execute("""
-        SELECT plan FROM users
-        WHERE payment_date >= %s
-        """, (inicio_mes,))
-        data_actual = cursor.fetchall()
-
-        # ---- MES ANTERIOR ----
-        cursor.execute("""
-        SELECT plan FROM users
-        WHERE payment_date >= %s AND payment_date < %s
-        """, (mes_anterior, inicio_mes))
-        data_anterior = cursor.fetchall()
-
-        PRICES = {
-            "trial": 0,
-            "semanal": 10,
-            "mensual": 20
-        }
-
-        # ---- CALCULO MES ACTUAL ----
-        total_actual = 0
-        conteo_actual = {"trial": 0, "semanal": 0, "mensual": 0}
-
-        for (plan,) in data_actual:
-            conteo_actual[plan] += 1
-            total_actual += PRICES.get(plan, 0)
-
-        # ---- CALCULO MES ANTERIOR ----
-        total_anterior = 0
-        for (plan,) in data_anterior:
-            total_anterior += PRICES.get(plan, 0)
-
-        # ---- CRECIMIENTO ----
-        if total_anterior > 0:
-            crecimiento = ((total_actual - total_anterior) / total_anterior) * 100
-        else:
-            crecimiento = 100 if total_actual > 0 else 0
-
-        crecimiento = round(crecimiento, 2)
-
-        # ---- MENSAJE ----
-        msg = "💰 GANANCIAS DEL MES\n\n"
-        msg += f"🆓 Trial: {conteo_actual['trial']}\n"
-        msg += f"📅 Semanal: {conteo_actual['semanal']} ($10)\n"
-        msg += f"📆 Mensual: {conteo_actual['mensual']} ($20)\n\n"
-    
-        msg += f"💵 TOTAL MES: ${total_actual}\n"
-        msg += f"📊 Mes anterior: ${total_anterior}\n"
-
-        # Emoji según crecimiento
-        if crecimiento > 0:
-            msg += f"📈 Crecimiento: +{crecimiento}%"
-        elif crecimiento < 0:
-            msg += f"📉 Crecimiento: {crecimiento}%"
-        else:
-            msg += f"➖ Sin cambio: {crecimiento}%"
-    
-        await query.message.reply_text(msg)
-
-# -------- AGREGAR --------
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_ID:
-        return
-
-    try:
-        username = context.args[0]
-        plan = context.args[1]
-
-        if plan not in PLANS:
-            await update.message.reply_text("Plan inválido")
-            return
-
-        cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
-        user = cursor.fetchone()
-
-        if plan == "trial" and user and user[5] == 1:
-            await update.message.reply_text("❌ Ya usó el trial")
-            return
-
-        days = PLANS[plan]
-        start = datetime.now()
-        end = start + timedelta(days=days)
-
-        trial_used = 1 if plan == "trial" else (user[5] if user else 0)
-
-        cursor.execute("""
-        INSERT INTO users (username, plan, start_date, end_date, status, trial_used)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (username) DO UPDATE SET
-            plan = EXCLUDED.plan,
-            start_date = EXCLUDED.start_date,
-            end_date = EXCLUDED.end_date,
-            status = EXCLUDED.status,
-            trial_used = EXCLUDED.trial_used
-        """, (username, plan, start.isoformat(), end.isoformat(), "activo", trial_used))
-        conn.commit()
-
-        try:
-            await context.bot.unban_chat_member(VIP_GROUP_ID, username)
-        except:
-            pass
-
-        await update.message.reply_text(f"✅ {username} activo hasta {end.date()}")
-
-    except Exception as e:
-        await update.message.reply_text(
-        "❌ Formato incorrecto\n\nUsa:\n/add @usuario plan\n\nPlanes:\n- trial\n- semanal\n- mensual"
-        )
-        print("ERROR ADD:", e)
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ Falta información\nUsa: /add @usuario plan")
-        return
+# ---------- BASE DE DATOS ----------
+class Database:
+    def __init__(self, db_url: str):
+        self.db_url = db_url
         
-# -------- BOTONES ALERTA --------
-def alert_buttons(username):
-    keyboard = [
-        [
-            InlineKeyboardButton("🔄 Renovar 7d", callback_data=f"renew7|{username}"),
-            InlineKeyboardButton("📆 Renovar 30d", callback_data=f"renew30|{username}")
-        ],
-        [
-            InlineKeyboardButton("➕ +1 día", callback_data=f"extend1|{username}"),
-            InlineKeyboardButton("🚪 Expulsar", callback_data=f"kick|{username}")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    def get_connection(self):
+        """Obtiene una conexión a PostgreSQL con autocommit"""
+        conn = psycopg2.connect(self.db_url)
+        conn.autocommit = True
+        return conn
+    
+    async def init_tables(self):
+        """Inicializa las tablas necesarias"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Tabla de usuarios
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    plan TEXT NOT NULL,
+                    start_date TIMESTAMP NOT NULL,
+                    end_date TIMESTAMP NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    trial_used BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+                """)
+                
+                # Tabla de pagos/transacciones
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id),
+                    username TEXT,
+                    plan TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    payment_date TIMESTAMP DEFAULT NOW()
+                )
+                """)
+                
+                # Índices para escalabilidad
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(end_date)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date)")
+                
+                conn.commit()
+        logger.info("✅ Base de datos inicializada")
+    
+    async def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """Busca usuario por username"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                return cur.fetchone()
+    
+    async def get_user_by_id(self, user_id: int) -> Optional[Dict]:
+        """Busca usuario por user_id"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+                return cur.fetchone()
+    
+    async def add_or_update_user(self, user_id: int, username: str, first_name: str, 
+                                   plan: str, days: int, amount: int) -> Tuple[bool, str]:
+        """
+        Agrega o actualiza un usuario (renovación)
+        Retorna: (éxito, mensaje)
+        """
+        now = datetime.now()
+        
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Verificar si el usuario existe
+                cur.execute("SELECT end_date, trial_used FROM users WHERE user_id = %s", (user_id,))
+                existing = cur.fetchone()
+                
+                if existing:
+                    # Verificar si ya usó trial
+                    if plan == "trial" and existing['trial_used']:
+                        return False, "❌ Este usuario ya usó su prueba gratuita"
+                    
+                    # RENOVACIÓN: empieza desde cero (fecha actual)
+                    start_date = now
+                    end_date = now + timedelta(days=days)
+                    
+                    cur.execute("""
+                    UPDATE users 
+                    SET plan = %s, start_date = %s, end_date = %s, status = 'active',
+                        updated_at = NOW(), username = %s, first_name = %s,
+                        trial_used = trial_used OR %s
+                    WHERE user_id = %s
+                    """, (plan, start_date, end_date, username, first_name, plan == "trial", user_id))
+                else:
+                    # NUEVO USUARIO
+                    start_date = now
+                    end_date = now + timedelta(days=days)
+                    trial_used = (plan == "trial")
+                    
+                    cur.execute("""
+                    INSERT INTO users (user_id, username, first_name, plan, start_date, end_date, trial_used)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (user_id, username, first_name, plan, start_date, end_date, trial_used))
+                
+                # Registrar el pago (incluye username para estadísticas)
+                cur.execute("""
+                INSERT INTO payments (user_id, username, plan, amount, payment_date)
+                VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, username, plan, amount, now))
+                
+                conn.commit()
+                
+                days_left = days
+                message = f"✅ {username or user_id} activado con {PLANS[plan]['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}\n⏳ Días: {days_left}"
+                return True, message
+    
+    async def get_expiring_users(self, days_before: int) -> List[Dict]:
+        """Obtiene usuarios que expiran exactamente en X días"""
+        target_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_before)
+        target_end = target_date + timedelta(days=1)
+        
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                SELECT user_id, username, plan, end_date
+                FROM users
+                WHERE status = 'active'
+                AND end_date >= %s AND end_date < %s
+                """, (target_date, target_end))
+                return cur.fetchall()
+    
+    async def get_expired_users(self) -> List[Dict]:
+        """Obtiene usuarios ya expirados"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                SELECT user_id, username, plan, end_date
+                FROM users
+                WHERE status = 'active'
+                AND end_date < NOW()
+                """)
+                return cur.fetchall()
+    
+    async def expire_user(self, user_id: int):
+        """Marca un usuario como expirado"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                UPDATE users SET status = 'expired', updated_at = NOW()
+                WHERE user_id = %s
+                """, (user_id,))
+                conn.commit()
+        logger.info(f"⏰ Usuario {user_id} marcado como expirado")
+    
+    async def get_monthly_report(self, year: int, month: int) -> Dict:
+        """Genera reporte mensual completo para exportar"""
+        start_date = datetime(year, month, 1)
+        if month == 12:
+            end_date = datetime(year + 1, 1, 1)
+        else:
+            end_date = datetime(year, month + 1, 1)
+        
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Todas las transacciones del mes
+                cur.execute("""
+                SELECT user_id, username, plan, amount, payment_date
+                FROM payments
+                WHERE payment_date >= %s AND payment_date < %s
+                ORDER BY payment_date DESC
+                """, (start_date, end_date))
+                transactions = cur.fetchall()
+                
+                # Resumen por plan
+                cur.execute("""
+                SELECT plan, COUNT(*) as count, SUM(amount) as total
+                FROM payments
+                WHERE payment_date >= %s AND payment_date < %s
+                GROUP BY plan
+                """, (start_date, end_date))
+                summary = cur.fetchall()
+                
+                # Total general
+                total = sum(row['total'] for row in summary)
+                
+                # Usuarios nuevos del mes
+                cur.execute("""
+                SELECT COUNT(*) as new_users
+                FROM users
+                WHERE created_at >= %s AND created_at < %s
+                """, (start_date, end_date))
+                new_users = cur.fetchone()['new_users']
+                
+                return {
+                    "year": year,
+                    "month": month,
+                    "transactions": transactions,
+                    "summary": summary,
+                    "total": total,
+                    "new_users": new_users,
+                    "start_date": start_date,
+                    "end_date": end_date
+                }
+    
+    async def get_active_users_count(self) -> int:
+        """Obtiene cantidad de usuarios activos"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users WHERE status = 'active' AND end_date > NOW()")
+                return cur.fetchone()[0]
+    
+    async def get_all_active_users(self) -> List[Dict]:
+        """Obtiene todos los usuarios activos para reporte"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                SELECT user_id, username, first_name, plan, start_date, end_date
+                FROM users
+                WHERE status = 'active' AND end_date > NOW()
+                ORDER BY end_date ASC
+                """)
+                return cur.fetchall()
 
-# -------- ACCIONES ALERTA --------
-async def alert_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- INSTANCIA GLOBAL ----------
+db = Database(DATABASE_URL)
+scheduler = AsyncIOScheduler()
+
+# ---------- FUNCIONES DEL BOT ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start - Solo para admin"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+        [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+        [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+        [InlineKeyboardButton("📈 Estadísticas", callback_data="stats")],
+        [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]
+    ]
+    await update.message.reply_text(
+        "🤖 *Panel de Control - Suscripciones VIP*\n\n"
+        "Gestiona las suscripciones de los usuarios del canal VIP.\n\n"
+        "📌 *Comandos rápidos:*\n"
+        "`/add @username plan` - Agregar usuario\n"
+        "`/renew @username plan` - Renovar usuario\n"
+        "`/remove @username` - Expulsar usuario\n"
+        "`/export` - Exportar reporte del mes actual",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# ---------- AGREGAR USUARIO (CONVERSACIÓN) ----------
+async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el proceso de agregar usuario"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    await update.message.reply_text(
+        "📝 *Agregar nuevo usuario*\n\n"
+        "Envía el *username* del usuario (ej: @usuario):\n\n"
+        "Puedes usar el `user_id` numérico si no tiene username.\n\n"
+        "Escribe *cancelar* para salir.",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_USERNAME
+
+async def get_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe el username"""
+    if update.message.text.lower() == "cancelar":
+        await update.message.reply_text("❌ Operación cancelada")
+        return ConversationHandler.END
+    
+    username = update.message.text.replace("@", "").strip()
+    context.user_data['new_username'] = username
+    
+    # Intentar obtener user_id (si es numérico)
+    if username.isdigit():
+        context.user_data['new_user_id'] = int(username)
+    else:
+        # Buscar user_id en la DB si ya existe
+        existing = await db.get_user_by_username(username)
+        if existing:
+            context.user_data['new_user_id'] = existing['user_id']
+        else:
+            # No tenemos el user_id, se pedirá después
+            context.user_data['new_user_id'] = None
+    
+    keyboard = [
+        [InlineKeyboardButton("🎁 Trial (1 día - $0)", callback_data="plan_trial")],
+        [InlineKeyboardButton("📅 Semanal (7 días - $10)", callback_data="plan_semanal")],
+        [InlineKeyboardButton("📆 Mensual (30 días - $20)", callback_data="plan_mensual")]
+    ]
+    await update.message.reply_text(
+        f"👤 Usuario: @{username}\n\n"
+        "Ahora selecciona el *plan*:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_PLAN
+
+async def get_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe el plan via callback"""
     query = update.callback_query
     await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    action, username = query.data.split("|")
-
-    if action == "renew7":
-        days = 7
-    elif action == "renew30":
-        days = 30
-    elif action == "extend1":
-        days = 1
-    elif action == "kick":
+    
+    plan = query.data.replace("plan_", "")
+    username = context.user_data.get('new_username')
+    user_id = context.user_data.get('new_user_id')
+    
+    if plan not in PLANS:
+        await query.message.reply_text("❌ Plan inválido")
+        return ConversationHandler.END
+    
+    plan_config = PLANS[plan]
+    
+    # Si no tenemos user_id, necesitamos que el admin lo proporcione
+    if not user_id:
+        await query.message.reply_text(
+            f"⚠️ No tengo el ID numérico de @{username}\n\n"
+            "Por favor, envía el `user_id` numérico del usuario.\n"
+            "Puedes obtenerlo con @userinfobot o en los logs del bot.",
+            parse_mode="Markdown"
+        )
+        context.user_data['pending_plan'] = plan
+        return WAITING_FOR_PLAN
+    
+    # Procesar la suscripción
+    success, message = await db.add_or_update_user(
+        user_id=user_id,
+        username=username,
+        first_name="",
+        plan=plan,
+        days=plan_config['days'],
+        amount=plan_config['price']
+    )
+    
+    if success:
+        # Agregar al grupo VIP si está activo
         try:
-            await context.bot.ban_chat_member(VIP_GROUP_ID, username)
+            await context.bot.unban_chat_member(VIP_GROUP_ID, user_id)
+            await context.bot.send_message(
+                VIP_GROUP_ID,
+                f"🎉 ¡Bienvenido @{username}! Tu suscripción {plan_config['name']} está activa."
+            )
         except:
             pass
+    
+    await query.message.reply_text(message)
+    
+    # Limpiar datos
+    context.user_data.clear()
+    return ConversationHandler.END
 
-        cursor.execute("UPDATE users SET status='vencido' WHERE username=%s", (username,))
-        conn.commit()
+async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela la conversación"""
+    await update.message.reply_text("❌ Operación cancelada")
+    return ConversationHandler.END
 
-        await query.message.reply_text(f"🚪 {username} expulsado")
+# ---------- COMANDOS DE ADMIN ----------
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /add @username plan - Agrega un usuario manualmente"""
+    if update.effective_user.id != ADMIN_ID:
         return
-
-    end = datetime.now() + timedelta(days=days)
-
-    cursor.execute("""
-    UPDATE users SET end_date=%s, status='activo' WHERE username=%s
-    """, (end.isoformat(), username))
-    conn.commit()
-
-    await query.message.reply_text(f"✅ {username} actualizado")
-
-# -------- RECORDATORIOS --------
-async def check_expired():
-    now = datetime.now()
-
-    cursor.execute("SELECT username, plan, end_date FROM users WHERE status='activo'")
-    users = cursor.fetchall()
-
-    for username, plan, end_date in users:
-        end = datetime.fromisoformat(end_date)
-        days_left = (end - now).days
-
-        if days_left == 1:
-            msg = f"⚠️ Vence mañana\n{username}\nPlan: {plan}\nFecha: {end.date()}"
-            from telegram import Bot
-
-            bot = Bot(token=TOKEN)
-            await bot.send_message(
-                ADMIN_ID,
-                msg,
-                reply_markup=alert_buttons(username)
+    
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ *Formato incorrecto*\n\n"
+                "Usa: `/add @username plan`\n\n"
+                "Planes disponibles:\n"
+                "• `trial` - 1 día ($0)\n"
+                "• `semanal` - 7 días ($10)\n"
+                "• `mensual` - 30 días ($20)\n\n"
+                "Ejemplo: `/add @juan semanal`",
+                parse_mode="Markdown"
             )
-
-        if now > end:
-            msg = f"❌ Vencido\n{username}\nFecha: {end.date()}"
-            bot = Bot(token=TOKEN)
-            await bot.send_message(
-                ADMIN_ID,
-                msg,
-                reply_markup=alert_buttons(username)
+            return
+        
+        username = context.args[0].replace("@", "")
+        plan = context.args[1].lower()
+        
+        if plan not in PLANS:
+            await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal o mensual")
+            return
+        
+        plan_config = PLANS[plan]
+        
+        # Buscar si el usuario ya existe en la DB
+        existing = await db.get_user_by_username(username)
+        
+        if existing:
+            user_id = existing['user_id']
+        else:
+            # Si no existe, necesitamos que el admin pase el user_id
+            await update.message.reply_text(
+                f"⚠️ No tengo registro de @{username}\n\n"
+                "Por favor, usa el formato completo:\n"
+                "`/add user_id @username plan`\n\n"
+                "Ejemplo: `/add 123456789 @juan semanal`",
+                parse_mode="Markdown"
             )
-
+            return
+        
+        success, message = await db.add_or_update_user(
+            user_id=user_id,
+            username=username,
+            first_name="",
+            plan=plan,
+            days=plan_config['days'],
+            amount=plan_config['price']
+        )
+        
+        if success:
+            # Agregar al grupo VIP
             try:
-                await bot.ban_chat_member(VIP_GROUP_ID, username)
+                await context.bot.unban_chat_member(VIP_GROUP_ID, user_id)
             except:
                 pass
+        
+        await update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"Error en add_user: {e}")
+        await update.message.reply_text("❌ Error al agregar usuario")
 
-            try:
-                cursor.execute("UPDATE users SET status='vencido' WHERE username=%s", (username,))
-                conn.commit()
-            except:
-                conn.rollback()
+async def renew_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /renew @username plan - Renueva un usuario"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Misma lógica que add_user pero con mensaje diferente
+    await add_user_command(update, context)
 
-# -------- MANEJADOR UNIFICADO --------
-async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /remove @username - Expulsa un usuario manualmente"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Usa: `/remove @username`", parse_mode="Markdown")
+        return
+    
+    username = context.args[0].replace("@", "")
+    user = await db.get_user_by_username(username)
+    
+    if not user:
+        await update.message.reply_text(f"❌ No se encontró al usuario @{username}")
+        return
+    
+    try:
+        await context.bot.ban_chat_member(VIP_GROUP_ID, user['user_id'])
+        await db.expire_user(user['user_id'])
+        await update.message.reply_text(f"✅ Usuario @{username} expulsado del canal VIP")
+    except Exception as e:
+        logger.error(f"Error removiendo usuario: {e}")
+        await update.message.reply_text("❌ Error al expulsar usuario")
+
+async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /export - Exporta reporte del mes actual a CSV"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    now = datetime.now()
+    report = await db.get_monthly_report(now.year, now.month)
+    
+    if not report['transactions']:
+        await update.message.reply_text(f"📭 No hay transacciones en {now.strftime('%B %Y')}")
+        return
+    
+    # Crear CSV en memoria
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Encabezados
+    writer.writerow(['Fecha', 'Usuario', 'Username', 'Plan', 'Monto'])
+    
+    for t in report['transactions']:
+        writer.writerow([
+            t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'),
+            t['user_id'],
+            t['username'] or '',
+            t['plan'],
+            f"${t['amount']}"
+        ])
+    
+    # Agregar resumen al final
+    writer.writerow([])
+    writer.writerow(['RESUMEN', '', '', '', ''])
+    writer.writerow(['Total del mes', f"${report['total']}"])
+    writer.writerow(['Nuevos usuarios', report['new_users']])
+    
+    for s in report['summary']:
+        writer.writerow([f"  {s['plan']}", f"{s['count']} ventas", f"${s['total']}"])
+    
+    output.seek(0)
+    
+    await update.message.reply_document(
+        document=output.getvalue().encode('utf-8'),
+        filename=f"reporte_{now.year}_{now.month:02d}.csv",
+        caption=f"📊 Reporte de {now.strftime('%B %Y')}\n💰 Total: ${report['total']}"
+    )
+    
+    output.close()
+
+async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra lista de usuarios activos"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    active_count = await db.get_active_users_count()
+    users = await db.get_all_active_users()
+    
+    if not users:
+        await message.reply_text("📭 No hay usuarios activos")
+        return
+    
+    msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
+    
+    for user in users[:30]:  # Límite de 30 por mensaje
+        days_left = (user['end_date'] - datetime.now()).days
+        emoji = "🟢" if days_left > 7 else "🟡" if days_left > 2 else "🔴"
+        msg += f"{emoji} @{user['username'] or user['user_id']}\n"
+        msg += f"   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n"
+        msg += f"   📋 Plan: {user['plan']}\n\n"
+    
+    if len(users) > 30:
+        msg += f"\n... y {len(users) - 30} más"
+    
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra reporte de ganancias del mes actual"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    now = datetime.now()
+    report = await db.get_monthly_report(now.year, now.month)
+    
+    msg = f"💰 *GANANCIAS DE {now.strftime('%B %Y').upper()}*\n\n"
+    
+    if not report['summary']:
+        msg += "📭 No hay ventas registradas este mes"
+    else:
+        for plan_data in report['summary']:
+            plan_name = PLANS.get(plan_data['plan'], {}).get('name', plan_data['plan'])
+            msg += f"• {plan_name}: {plan_data['count']} ventas - ${plan_data['total']}\n"
+        
+        msg += f"\n💵 *TOTAL MES*: ${report['total']}\n"
+        msg += f"👥 *Nuevos usuarios*: {report['new_users']}"
+    
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra estadísticas generales"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    with db.get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Total usuarios
+            cur.execute("SELECT COUNT(*) as total FROM users")
+            total = cur.fetchone()['total']
+            
+            # Usuarios activos
+            cur.execute("SELECT COUNT(*) as active FROM users WHERE status = 'active' AND end_date > NOW()")
+            active = cur.fetchone()['active']
+            
+            # Próximos a expirar (7 días)
+            cur.execute("""
+            SELECT COUNT(*) as expiring
+            FROM users
+            WHERE status = 'active' 
+            AND end_date > NOW() 
+            AND end_date < NOW() + INTERVAL '7 days'
+            """)
+            expiring = cur.fetchone()['expiring']
+            
+            # Próximos a expirar (1 día)
+            cur.execute("""
+            SELECT COUNT(*) as expiring_tomorrow
+            FROM users
+            WHERE status = 'active' 
+            AND end_date >= DATE(NOW() + INTERVAL '1 day')
+            AND end_date < DATE(NOW() + INTERVAL '2 days')
+            """)
+            expiring_tomorrow = cur.fetchone()['expiring_tomorrow']
+            
+            # Por plan
+            cur.execute("""
+            SELECT plan, COUNT(*) as count
+            FROM users
+            WHERE status = 'active' AND end_date > NOW()
+            GROUP BY plan
+            """)
+            plans = cur.fetchall()
+    
+    msg = "📈 *ESTADÍSTICAS*\n\n"
+    msg += f"👥 Total usuarios registrados: {total}\n"
+    msg += f"🟢 Activos actualmente: {active}\n"
+    msg += f"⚠️ Expiran mañana: {expiring_tomorrow}\n"
+    msg += f"⚠️ Expiran en 7 días: {expiring}\n\n"
+    msg += "*Distribución de activos:*\n"
+    
+    for plan in plans:
+        plan_name = PLANS.get(plan['plan'], {}).get('name', plan['plan'])
+        msg += f"• {plan_name}: {plan['count']}\n"
+    
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def export_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para exportar reporte del mes actual"""
+    query = update.callback_query
+    await query.answer()
+    await export_report(update, context)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los callbacks del teclado inline"""
     query = update.callback_query
     await query.answer()
     
-    if query.from_user.id != ADMIN_ID:
+    if query.data == "add_user":
+        await query.message.reply_text(
+            "📝 *Agregar usuario*\n\n"
+            "Usa el comando:\n"
+            "`/add @username plan`\n\n"
+            "O usa el botón de 'Exportar mes' para generar un reporte en Excel.",
+            parse_mode="Markdown"
+        )
+    elif query.data == "list_active":
+        await list_active_users(update, context)
+    elif query.data == "earnings":
+        await show_earnings(update, context)
+    elif query.data == "stats":
+        await show_stats(update, context)
+    elif query.data == "export_month":
+        await export_report(update, context)
+    elif query.data.startswith("plan_"):
+        # Esto viene de la conversación de agregar usuario
+        await get_plan(update, context)
+
+# ---------- TAREAS PROGRAMADAS ----------
+async def check_expiring_subscriptions():
+    """Verifica suscripciones próximas a expirar (3, 2, 1 días antes a las 7 AM)"""
+    now = datetime.now()
+    
+    # Solo ejecutar cerca de las 7 AM (margen de 30 minutos)
+    if now.hour != 7 or now.minute > 30:
         return
     
-    # Separar datos del callback
-    if "|" in query.data:
-        # Es una alerta (renew7|username, renew30|username, etc.)
-        await alert_actions(update, context)
-    else:
-        # Es un botón del panel (add, list, ganancias, etc.)
-        await panel_buttons(update, context)
+    for days in [3, 2, 1]:
+        users = await db.get_expiring_users(days)
         
-# -------- MAIN --------
-app = ApplicationBuilder().token(TOKEN).build()
+        for user in users:
+            try:
+                await application.bot.send_message(
+                    ADMIN_ID,
+                    f"⏰ *RECORDATORIO DE EXPIRACIÓN*\n\n"
+                    f"👤 Usuario: @{user['username'] or user['user_id']}\n"
+                    f"📅 Expira en {days} día(s)\n"
+                    f"📆 Fecha: {user['end_date'].strftime('%d/%m/%Y')}\n"
+                    f"📋 Plan: {user['plan']}\n\n"
+                    f"Para renovar: `/renew @{user['username']} {user['plan']}`",
+                    parse_mode="Markdown"
+                )
+                logger.info(f"Recordatorio enviado para {user['user_id']} (expira en {days} días)")
+            except Exception as e:
+                logger.error(f"Error enviando recordatorio: {e}")
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("add", add_user))
+async def check_expired_subscriptions():
+    """Verifica y expulsa usuarios con suscripción vencida"""
+    expired_users = await db.get_expired_users()
+    
+    for user in expired_users:
+        # Marcar como expirado en BD
+        await db.expire_user(user['user_id'])
+        
+        # Expulsar del grupo VIP
+        try:
+            await application.bot.ban_chat_member(VIP_GROUP_ID, user['user_id'])
+            await application.bot.send_message(
+                ADMIN_ID,
+                f"🚫 *USUARIO EXPULSADO*\n\n"
+                f"👤 @{user['username'] or user['user_id']}\n"
+                f"📅 Suscripción expirada el {user['end_date'].strftime('%d/%m/%Y')}\n"
+                f"📋 Plan: {user['plan']}",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Usuario {user['user_id']} expulsado del grupo VIP")
+        except Exception as e:
+            logger.error(f"Error expulsando usuario {user['user_id']}: {e}")
 
-app.add_handler(CallbackQueryHandler(handle_all_callbacks))
+async def send_monthly_report():
+    """Envía reporte automático al inicio de cada mes"""
+    now = datetime.now()
+    
+    # Ejecutar el primer día del mes a las 8 AM
+    if now.day == 1 and now.hour == 8:
+        last_month = now.replace(day=1) - timedelta(days=1)
+        report = await db.get_monthly_report(last_month.year, last_month.month)
+        
+        if report['transactions']:
+            # Crear CSV
+            output = StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Fecha', 'Usuario', 'Username', 'Plan', 'Monto'])
+            
+            for t in report['transactions']:
+                writer.writerow([
+                    t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'),
+                    t['user_id'],
+                    t['username'] or '',
+                    t['plan'],
+                    f"${t['amount']}"
+                ])
+            
+            output.seek(0)
+            
+            await application.bot.send_document(
+                ADMIN_ID,
+                document=output.getvalue().encode('utf-8'),
+                filename=f"reporte_{last_month.year}_{last_month.month:02d}.csv",
+                caption=f"📊 *REPORTE MENSUAL*\n"
+                       f"📅 {last_month.strftime('%B %Y')}\n"
+                       f"💰 Total: ${report['total']}\n"
+                       f"👥 Nuevos usuarios: {report['new_users']}",
+                parse_mode="Markdown"
+            )
+            output.close()
+        else:
+            await application.bot.send_message(
+                ADMIN_ID,
+                f"📊 *REPORTE MENSUAL*\n"
+                f"📅 {last_month.strftime('%B %Y')}\n"
+                f"📭 No hubo transacciones en el mes",
+                parse_mode="Markdown"
+            )
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(check_expired, "interval", hours=6)
-scheduler.start()
+# ---------- MAIN ----------
+application = None
+
+async def main():
+    """Función principal"""
+    global application
+    
+    # Inicializar base de datos
+    await db.init_tables()
+    
+    # Configurar el bot
+    defaults = Defaults(parse_mode="HTML")
+    application = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
+    
+    # Handlers de comandos
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_user_command))
+    application.add_handler(CommandHandler("renew", renew_user))
+    application.add_handler(CommandHandler("remove", remove_user))
+    application.add_handler(CommandHandler("export", export_report))
+    application.add_handler(CommandHandler("activos", list_active_users))
+    application.add_handler(CommandHandler("ganancias", show_earnings))
+    application.add_handler(CommandHandler("stats", show_stats))
+    
+    # Conversación para agregar usuario
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("adduser", add_user_start)],
+        states={
+            WAITING_FOR_USERNAME: [CommandHandler("cancel", cancel_add), 
+                                   CommandHandler("start", cancel_add),
+                                   CommandHandler("adduser", cancel_add),
+                                   CommandHandler("add", cancel_add),
+                                   CommandHandler("renew", cancel_add),
+                                   CommandHandler("remove", cancel_add)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_add)],
+    )
+    # Nota: Para manejar texto normal, necesitas un MessageHandler
+    # Por simplicidad, usamos comandos directos
+    
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Programar tareas
+    scheduler.add_job(check_expiring_subscriptions, 'interval', hours=1)  # Cada hora, pero solo actúa a las 7 AM
+    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)   # Cada 6 horas
+    scheduler.add_job(send_monthly_report, 'interval', hours=1)           # Cada hora, pero solo actúa el día 1 a las 8 AM
+    scheduler.start()
+    
+    # Iniciar el bot
+    logger.info("🤖 Bot iniciado")
+    await application.run_polling()
 
 if __name__ == "__main__":
-    app.run_polling()
+    asyncio.run(main())
