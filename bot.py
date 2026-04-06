@@ -1204,38 +1204,50 @@ async def main():
     global bot_app
     
     await db.init_tables()
-    
-    # ✅ IMPORTANTE: Cargar grupos desde la base de datos
     await db.load_groups_from_db()
-    
     logger.info(f"📦 {len(GROUPS)} grupos disponibles")
-
+    
     defaults = Defaults(parse_mode="HTML")
     bot_app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
-
-    # Comandos
+    
+    # Handlers
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("add", add_user_command))
     bot_app.add_handler(CommandHandler("groups", list_groups))
     bot_app.add_handler(CommandHandler("addgroup", add_group_command))
+    bot_app.add_handler(CommandHandler("editgroup", edit_group_command))
+    bot_app.add_handler(CommandHandler("groupinfo", group_info))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
-    bot_app.add_handler(CommandHandler("sync", sync_users))
-    bot_app.add_handler(CommandHandler("editgroup", edit_group_simple))
-
+    
     # Detectar nuevos miembros
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
-
+    
     # Tareas
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
     scheduler.start()
-
+    
     logger.info("🤖 Bot iniciado")
-
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling()
-    await asyncio.Event().wait()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    
+    # ✅ Manejo más robusto del polling
+    try:
+        await bot_app.initialize()
+        await bot_app.start()
+        
+        # Limpiar webhook antes de iniciar polling
+        await bot_app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook limpiado")
+        
+        await bot_app.updater.start_polling(
+            drop_pending_updates=True,  # Ignorar actualizaciones pendientes
+            timeout=30,  # Timeout más corto
+            read_timeout=30
+        )
+        
+        # Mantener el bot corriendo
+        await asyncio.Event().wait()
+        
+    except Exception as e:
+        logger.error(f"Error en el bot: {e}")
+        await asyncio.sleep(5)
+        # Reiniciar
+        asyncio.create_task(main())
