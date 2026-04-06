@@ -1,3 +1,21 @@
+import os
+import csv
+import asyncio
+import logging
+from io import StringIO
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Tuple
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, Defaults, ChatMemberHandler
+)
+from telegram.ext import MessageHandler, filters
+
+# ---------- CONFIGURACIÓN MULTI-GRUPO CON ROLES ----------
 SUPER_ADMIN_ID = 5054216496
 
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
@@ -40,23 +58,6 @@ def get_group_name(group_id: int) -> str:
     """Obtiene el nombre del grupo"""
     group = get_group_by_id(group_id)
     return group["group_name"] if group else f"Grupo {group_id}"
-
-import os
-import csv
-import asyncio
-import logging
-from io import StringIO
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, Defaults, ChatMemberHandler
-)
-from telegram.ext import MessageHandler, filters
 
 async def detect_new_member_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detecta cuando alguien entra al grupo mediante el mensaje de Telegram"""
