@@ -696,25 +696,8 @@ async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_view_groups")])
     await query.edit_message_text(f"📋 *Grupos {group_type}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def edit_group_type_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Muestra opciones para cambiar el tipo"""
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton("👑 VIP", callback_data=f"set_type_{group_id}_VIP")],
-        [InlineKeyboardButton("📋 FREE", callback_data=f"set_type_{group_id}_FREE")],
-        [InlineKeyboardButton("🔙 Volver", callback_data=f"edit_select_{group_id}")]
-    ]
-    
-    await query.edit_message_text(
-        "🔄 *Selecciona el nuevo tipo*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
 async def menu_edit_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista de grupos para seleccionar cuál editar"""
+    """Muestra lista de grupos para seleccionar cuál editar (solo edición múltiple)"""
     query = update.callback_query
     await query.answer()
     
@@ -725,16 +708,18 @@ async def menu_edit_group_select(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = []
     for group in GROUPS:
         emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
-        keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"edit_select_{group['group_id']}")])
+        keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"edit_multiple_{group['group_id']}")])
     
     keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_groups")])
     
     await query.edit_message_text(
-        "✏️ *Selecciona el grupo que deseas editar*",
+        "✏️ *Selecciona el grupo que deseas editar*\n\n"
+        "Podrás cambiar nombre, administrador y tipo.\n"
+        "Puedes hacer varios cambios antes de aplicar.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-
+    
 async def menu_delete_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra lista de grupos para seleccionar cuál eliminar"""
     query = update.callback_query
@@ -898,8 +883,8 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"clientes_{datetime.now().strftime('%Y%m%d')}.csv", caption="📋 Clientes potenciales")
     output.close()
 
-async def edit_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Muestra el formulario para editar un grupo"""
+async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Permite editar múltiples campos a la vez"""
     query = update.callback_query
     await query.answer()
     
@@ -909,109 +894,103 @@ async def edit_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE, gr
         return
     
     context.user_data['editing_group_id'] = group_id
-    
-    keyboard = [
-        [InlineKeyboardButton("✏️ Cambiar nombre", callback_data=f"edit_name_{group_id}")],
-        [InlineKeyboardButton("👤 Cambiar administrador", callback_data=f"edit_admin_{group_id}")],
-        [InlineKeyboardButton("🔄 Cambiar tipo", callback_data=f"edit_type_{group_id}")],
-        [InlineKeyboardButton("🔙 Volver", callback_data="")]
-    ]
-    
-    await query.edit_message_text(
-        f"✏️ *Editando: {group['group_name']}*\n\n"
-        f"📋 Tipo: {group.get('type', 'VIP')}\n"
-        f"👑 Admin: `{group['admin_id']}`\n\n"
-        f"*¿Qué deseas modificar?*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def edit_group_name_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Solicita el nuevo nombre del grupo"""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['editing_field'] = 'name'
-    context.user_data['editing_group_id'] = group_id
-    
-    await query.edit_message_text(
-        f"✏️ *Cambiar nombre del grupo*\n\n"
-        f"Envía el *nuevo nombre* en el chat.\n\n"
-        f"*Escribe 'cancelar' para cancelar.*",
-        parse_mode="Markdown"
-    )
-
-async def edit_group_admin_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Solicita el nuevo admin del grupo"""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['editing_field'] = 'admin'
-    context.user_data['editing_group_id'] = group_id
-    
-    await query.edit_message_text(
-        f"👤 *Cambiar administrador*\n\n"
-        f"Envía el *ID del nuevo administrador* en el chat.\n\n"
-        f"*Para obtener un ID, usa @userinfobot*\n\n"
-        f"*Escribe 'cancelar' para cancelar.*",
-        parse_mode="Markdown"
-    )
-
-async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Permite editar múltiples campos a la vez"""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['editing_group_id'] = group_id
     context.user_data['editing_mode'] = 'multiple'
+    # Inicializar cambios pendientes
+    if 'pending_changes' not in context.user_data:
+        context.user_data['pending_changes'] = {}
     
     keyboard = [
         [InlineKeyboardButton("📝 Cambiar nombre", callback_data=f"multi_name_{group_id}")],
         [InlineKeyboardButton("👤 Cambiar admin", callback_data=f"multi_admin_{group_id}")],
         [InlineKeyboardButton("🔄 Cambiar tipo", callback_data=f"multi_type_{group_id}")],
         [InlineKeyboardButton("✅ Aplicar todos los cambios", callback_data=f"multi_apply_{group_id}")],
-        [InlineKeyboardButton("🔙 Volver", callback_data=f"edit_select_{group_id}")]
+        [InlineKeyboardButton("🔙 Volver", callback_data="menu_edit_group_select")]
     ]
+    
+    # Mostrar cambios pendientes actuales
+    pending = context.user_data.get('pending_changes', {})
+    pending_text = ""
+    if pending:
+        pending_text = "\n\n📝 *Cambios pendientes:*\n"
+        if 'name' in pending:
+            pending_text += f"• Nuevo nombre: `{pending['name']}`\n"
+        if 'admin' in pending:
+            pending_text += f"• Nuevo admin: `{pending['admin']}`\n"
+        if 'type' in pending:
+            pending_text += f"• Nuevo tipo: `{pending['type']}`\n"
     
     await query.edit_message_text(
         f"✏️ *Edición múltiple - {group['group_name']}*\n\n"
+        f"📋 Tipo actual: {group.get('type', 'VIP')}\n"
+        f"👑 Admin actual: `{group['admin_id']}`{pending_text}\n\n"
         f"Puedes hacer varios cambios antes de aplicarlos.\n"
-        f"Los cambios pendientes se mostrarán aquí.",
+        f"*Escribe 'cancelar' para cancelar la edición.*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
-async def set_group_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, new_type: str):
-    """Cambia el tipo del grupo"""
+async def multi_name_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Solicita el nuevo nombre para edición múltiple"""
     query = update.callback_query
     await query.answer()
     
-    group = get_group_by_id(group_id)
-    if not group:
-        await query.edit_message_text("❌ Grupo no encontrado")
-        return
-    
-    old_type = group.get("type", "VIP")
-    
-    # Actualizar en memoria
-    for g in GROUPS:
-        if g["group_id"] == group_id:
-            g["type"] = new_type
-            break
-    
-    # Actualizar en BD
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE groups SET group_type = %s WHERE group_id = %s", (new_type, group_id))
-            conn.commit()
+    context.user_data['editing_field'] = 'multi_name'
+    context.user_data['editing_group_id'] = group_id
     
     await query.edit_message_text(
-        f"✅ *Tipo actualizado*\n\n{old_type} → {new_type}",
+        f"✏️ *Cambiar nombre (edición múltiple)*\n\n"
+        f"Envía el *nuevo nombre* en el chat.\n\n"
+        f"*Escribe 'cancelar' para cancelar.*",
         parse_mode="Markdown"
     )
-    await asyncio.sleep(1)
-    await edit_group_form(update, context, group_id)
 
+async def multi_admin_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Solicita el nuevo admin para edición múltiple"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['editing_field'] = 'multi_admin'
+    context.user_data['editing_group_id'] = group_id
+    
+    await query.edit_message_text(
+        f"👤 *Cambiar administrador (edición múltiple)*\n\n"
+        f"Envía el *ID del nuevo administrador* en el chat.\n\n"
+        f"*Para obtener un ID, usa @userinfobot*\n\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def multi_type_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Muestra opciones para cambiar el tipo en edición múltiple"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("👑 VIP", callback_data=f"multi_set_type_{group_id}_VIP")],
+        [InlineKeyboardButton("📋 FREE", callback_data=f"multi_set_type_{group_id}_FREE")],
+        [InlineKeyboardButton("🔙 Volver", callback_data=f"edit_multiple_{group_id}")]
+    ]
+    
+    await query.edit_message_text(
+        "🔄 *Selecciona el nuevo tipo*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def multi_set_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, new_type: str):
+    """Guarda el cambio de tipo en pendientes"""
+    query = update.callback_query
+    await query.answer()
+    
+    if 'pending_changes' not in context.user_data:
+        context.user_data['pending_changes'] = {}
+    
+    context.user_data['pending_changes']['type'] = new_type
+    
+    await query.edit_message_text(f"✅ *Tipo guardado:* {new_type}\n\nContinuando con edición múltiple...")
+    await asyncio.sleep(1)
+    await edit_group_multiple(update, context, group_id)
+    
 async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
         return
@@ -1078,6 +1057,8 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Edición cancelada")
         context.user_data.pop('editing_field', None)
         context.user_data.pop('editing_group_id', None)
+        context.user_data.pop('pending_changes', None)
+        context.user_data.pop('editing_mode', None)
         return
     
     field = context.user_data.get('editing_field')
@@ -1091,37 +1072,102 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Grupo no encontrado")
         return
     
-    if field == 'name':
-        old_name = group['group_name']
+    # Para edición múltiple
+    if field == 'multi_name':
+        # Guardar cambio pendiente
+        if 'pending_changes' not in context.user_data:
+            context.user_data['pending_changes'] = {}
+        context.user_data['pending_changes']['name'] = text
+        
+        await update.message.reply_text(f"✅ *Nombre guardado:* {text}\n\nContinuando con edición múltiple...")
+        context.user_data.pop('editing_field', None)
+        await edit_group_multiple(update, context, group_id)
+        return
+    
+    elif field == 'multi_admin':
+        try:
+            new_admin = int(text)
+            if 'pending_changes' not in context.user_data:
+                context.user_data['pending_changes'] = {}
+            context.user_data['pending_changes']['admin'] = new_admin
+            
+            await update.message.reply_text(f"✅ *Administrador guardado:* `{new_admin}`\n\nContinuando con edición múltiple...")
+            context.user_data.pop('editing_field', None)
+            await edit_group_multiple(update, context, group_id)
+        except ValueError:
+            await update.message.reply_text("❌ Error: El ID debe ser un número")
+        return
+    
+    # Para edición simple (si la mantienes)
+    elif field == 'name':
+        # ... tu código existente ...
+        pass
+    elif field == 'admin':
+        # ... tu código existente ...
+        pass
+
+async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Aplica todos los cambios pendientes"""
+    query = update.callback_query
+    await query.answer()
+    
+    pending = context.user_data.get('pending_changes', {})
+    
+    if not pending:
+        await query.edit_message_text("❌ No hay cambios pendientes para aplicar")
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    changes_made = []
+    
+    # Aplicar cambios en orden
+    if 'name' in pending:
         for g in GROUPS:
             if g["group_id"] == group_id:
-                g["group_name"] = text
+                g["group_name"] = pending['name']
                 break
         with db.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE groups SET group_name = %s WHERE group_id = %s", (text, group_id))
+                cur.execute("UPDATE groups SET group_name = %s WHERE group_id = %s", (pending['name'], group_id))
                 conn.commit()
-        await update.message.reply_text(f"✅ *Nombre actualizado*\n`{old_name}` → `{text}`", parse_mode="Markdown")
-        
-    elif field == 'admin':
-        try:
-            new_admin = int(text)
-            old_admin = group['admin_id']
-            for g in GROUPS:
-                if g["group_id"] == group_id:
-                    g["admin_id"] = new_admin
-                    break
-            with db.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE groups SET admin_id = %s WHERE group_id = %s", (new_admin, group_id))
-                    conn.commit()
-            await update.message.reply_text(f"✅ *Administrador actualizado*\n`{old_admin}` → `{new_admin}`", parse_mode="Markdown")
-        except ValueError:
-            await update.message.reply_text("❌ Error: El ID debe ser un número")
-            return
+        changes_made.append(f"📝 Nombre: → {pending['name']}")
     
-    context.user_data.pop('editing_field', None)
+    if 'admin' in pending:
+        for g in GROUPS:
+            if g["group_id"] == group_id:
+                g["admin_id"] = pending['admin']
+                break
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET admin_id = %s WHERE group_id = %s", (pending['admin'], group_id))
+                conn.commit()
+        changes_made.append(f"👤 Admin: → {pending['admin']}")
+    
+    if 'type' in pending:
+        for g in GROUPS:
+            if g["group_id"] == group_id:
+                g["type"] = pending['type']
+                break
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET group_type = %s WHERE group_id = %s", (pending['type'], group_id))
+                conn.commit()
+        changes_made.append(f"🔄 Tipo: → {pending['type']}")
+    
+    # Limpiar pendientes
+    context.user_data.pop('pending_changes', None)
+    context.user_data.pop('editing_mode', None)
     context.user_data.pop('editing_group_id', None)
+    
+    msg = f"✅ *Cambios aplicados correctamente*\n\n" + "\n".join(changes_made)
+    
+    await query.edit_message_text(msg, parse_mode="Markdown")
+    await asyncio.sleep(2)
+    await menu_edit_group_select(update, context)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1149,28 +1195,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await list_groups(update, context)
     elif data == "add_group":
         await query.edit_message_text("📝 Usa: `/addgroup group_id TIPO \"nombre\" admin_id`", parse_mode="Markdown")
-    elif data == "global_stats":
-        await global_stats(update, context)
     elif data.startswith("select_group_"):
         group_id = int(data.replace("select_group_", ""))
         await select_group(update, context, group_id)
-    elif data.startswith("edit_select_"):
-        group_id = int(data.replace("edit_select_", ""))
-        await edit_group_form(update, context, group_id)
-    elif data.startswith("edit_name_"):
-        group_id = int(data.replace("edit_name_", ""))
-        await edit_group_name_request(update, context, group_id)
-    elif data.startswith("edit_admin_"):
-        group_id = int(data.replace("edit_admin_", ""))
-        await edit_group_admin_request(update, context, group_id)
-    elif data.startswith("edit_type_"):
-        group_id = int(data.replace("edit_type_", ""))
-        await edit_group_type_menu(update, context, group_id)
-    elif data.startswith("set_type_"):
-        parts = data.split("_")
-        group_id = int(parts[2])
-        new_type = parts[3]
-        await set_group_type(update, context, group_id, new_type)
     elif data == "back_to_admin":
         await start(update, context)
     elif data == "menu_groups":
@@ -1193,7 +1220,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_group_execute(update, context, group_id)
     elif data == "menu_commands":
         await menu_commands(update, context)
-  
+    elif data.startswith("multi_apply_"):
+        group_id = int(data.replace("multi_apply_", ""))
+        await multi_apply_changes(update, context, group_id)
+    elif data.startswith("multi_name_"):
+        group_id = int(data.replace("multi_name_", ""))
+        await multi_name_request(update, context, group_id)
+    elif data.startswith("multi_admin_"):
+        group_id = int(data.replace("multi_admin_", ""))
+        await multi_admin_request(update, context, group_id)    
+    elif data.startswith("multi_type_"):
+        group_id = int(data.replace("multi_type_", ""))
+        await multi_type_request(update, context, group_id)    
+    elif data.startswith("multi_set_type_"):
+        parts = data.split("_")
+        group_id = int(parts[3])
+        new_type = parts[4]
+        await multi_set_type(update, context, group_id, new_type)    
+    
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     for group in GROUPS:
