@@ -278,7 +278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 Ganancias", callback_data="total_earnings")],
             [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
         ]
-         await update.message.reply_text(
+        await update.message.reply_text(
             f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
@@ -548,86 +548,6 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"clientes_{datetime.now().strftime('%Y%m%d')}.csv", caption="📋 Clientes potenciales")
     output.close()
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "add_user":
-        await query.edit_message_text("📝 Usa: `/add @username plan`", parse_mode="Markdown")
-    elif data == "list_active":
-        await list_active_users(update, context)
-    elif data == "earnings":
-        await show_earnings(update, context)
-    elif data == "export_month":
-        await export_report(update, context)
-    elif data == "list_potential":
-        await list_potential_clients(update, context)
-    elif data == "export_clients":
-        await export_clients(update, context)
-    elif data == "vip_groups":
-        await show_groups_by_type(update, context, "VIP")
-    elif data == "free_groups":
-        await show_groups_by_type(update, context, "FREE")
-    elif data == "total_earnings":
-        await total_earnings(update, context)
-    elif data == "all_groups":
-        await list_groups(update, context)
-    elif data == "add_group":
-        await query.edit_message_text("📝 Usa: `/addgroup group_id TIPO \"nombre\" admin_id`", parse_mode="Markdown")
-    elif data == "global_stats":
-        await global_stats(update, context)
-    elif data.startswith("select_group_"):
-        group_id = int(data.replace("select_group_", ""))
-        await select_group(update, context, group_id)
-    elif data == "edit_group_menu":
-        await edit_group_menu(update, context)
-    elif data.startswith("edit_select_"):
-        group_id = int(data.replace("edit_select_", ""))
-        await edit_group_form(update, context, group_id)
-    elif data.startswith("edit_name_"):
-        group_id = int(data.replace("edit_name_", ""))
-        await edit_group_name_request(update, context, group_id)
-    elif data.startswith("edit_admin_"):
-        group_id = int(data.replace("edit_admin_", ""))
-        await edit_group_admin_request(update, context, group_id)
-    elif data.startswith("edit_type_"):
-        group_id = int(data.replace("edit_type_", ""))
-        await edit_group_type_menu(update, context, group_id)
-    elif data.startswith("set_type_"):
-        parts = data.split("_")
-        group_id = int(parts[2])
-        new_type = parts[3]
-        await set_group_type(update, context, group_id, new_type)
-    elif data == "back_to_admin":
-        await start(update, context)
-
-async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.new_chat_members:
-        return
-    chat_id = update.message.chat_id
-    group = get_group_by_id(chat_id)
-    if not group:
-        return
-    for new_member in update.message.new_chat_members:
-        if new_member.id == context.bot.id:
-            continue
-        user_id = new_member.id
-        username = new_member.username or f"user_{user_id}"
-        first_name = new_member.first_name or ""
-        if group["type"] == "VIP":
-            registered, result = await db.register_user_auto(chat_id, user_id, username, first_name)
-            if registered and result == "trial_nuevo":
-                await context.bot.send_message(user_id, f"🎉 Bienvenido @{username}!\n✨ Trial gratis de 1 día", parse_mode="Markdown")
-        else:
-            existing = await db.get_user_by_username(username, chat_id)
-            if not existing:
-                with db.get_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                                   (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
-                        conn.commit()
-                await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
-
 async def edit_group_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra el menú para seleccionar qué grupo editar"""
     query = update.callback_query
@@ -757,6 +677,33 @@ async def set_group_type(update: Update, context: ContextTypes.DEFAULT_TYPE, gro
     await asyncio.sleep(1)
     await edit_group_form(update, context, group_id)
 
+async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+    chat_id = update.message.chat_id
+    group = get_group_by_id(chat_id)
+    if not group:
+        return
+    for new_member in update.message.new_chat_members:
+        if new_member.id == context.bot.id:
+            continue
+        user_id = new_member.id
+        username = new_member.username or f"user_{user_id}"
+        first_name = new_member.first_name or ""
+        if group["type"] == "VIP":
+            registered, result = await db.register_user_auto(chat_id, user_id, username, first_name)
+            if registered and result == "trial_nuevo":
+                await context.bot.send_message(user_id, f"🎉 Bienvenido @{username}!\n✨ Trial gratis de 1 día", parse_mode="Markdown")
+        else:
+            existing = await db.get_user_by_username(username, chat_id)
+            if not existing:
+                with db.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                                   (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
+                        conn.commit()
+                await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
+                
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja la entrada de texto para editar grupo"""
     user_id = update.effective_user.id
@@ -814,6 +761,62 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data.pop('editing_field', None)
     context.user_data.pop('editing_group_id', None)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "add_user":
+        await query.edit_message_text("📝 Usa: `/add @username plan`", parse_mode="Markdown")
+    elif data == "list_active":
+        await list_active_users(update, context)
+    elif data == "earnings":
+        await show_earnings(update, context)
+    elif data == "export_month":
+        await export_report(update, context)
+    elif data == "list_potential":
+        await list_potential_clients(update, context)
+    elif data == "export_clients":
+        await export_clients(update, context)
+    elif data == "vip_groups":
+        await show_groups_by_type(update, context, "VIP")
+    elif data == "free_groups":
+        await show_groups_by_type(update, context, "FREE")
+    elif data == "total_earnings":
+        await total_earnings(update, context)
+    elif data == "all_groups":
+        await list_groups(update, context)
+    elif data == "add_group":
+        await query.edit_message_text("📝 Usa: `/addgroup group_id TIPO \"nombre\" admin_id`", parse_mode="Markdown")
+    elif data == "global_stats":
+        await global_stats(update, context)
+    elif data.startswith("select_group_"):
+        group_id = int(data.replace("select_group_", ""))
+        await select_group(update, context, group_id)
+    elif data == "edit_group_menu":
+        await edit_group_menu(update, context)
+    elif data.startswith("edit_select_"):
+        group_id = int(data.replace("edit_select_", ""))
+        await edit_group_form(update, context, group_id)
+    elif data.startswith("edit_name_"):
+        group_id = int(data.replace("edit_name_", ""))
+        await edit_group_name_request(update, context, group_id)
+    elif data.startswith("edit_admin_"):
+        group_id = int(data.replace("edit_admin_", ""))
+        await edit_group_admin_request(update, context, group_id)
+    elif data.startswith("edit_type_"):
+        group_id = int(data.replace("edit_type_", ""))
+        await edit_group_type_menu(update, context, group_id)
+    elif data.startswith("set_type_"):
+        parts = data.split("_")
+        group_id = int(parts[2])
+        new_type = parts[3]
+        await set_group_type(update, context, group_id, new_type)
+    elif data == "back_to_admin":
+        await start(update, context)
+
+
+
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     for group in GROUPS:
