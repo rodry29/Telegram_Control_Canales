@@ -1437,7 +1437,7 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
     bot_app.add_handler(CommandHandler("backup", manual_backup))
     bot_app.add_handler(CommandHandler("restore", restore_backup))
-    scheduler.add_job(check_expired_subscriptions, 'interval', minutes=1)
+    scheduler.add_job(check_expired_subscriptions, 'interval', hours=3)
     scheduler.start()
     scheduler.add_job(auto_backup, 'interval', hours=24)  # Revisa cada 24 horas si es momento de backup
     logger.info("🤖 Bot iniciado")
