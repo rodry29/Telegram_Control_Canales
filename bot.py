@@ -59,6 +59,8 @@ def get_group_by_id(group_id: int) -> Optional[dict]:
     return None
 
 def get_groups_by_admin(admin_id: int, group_type: str = None) -> list:
+    print(f"🔍 Buscando grupos para admin: {admin_id}")
+    print(f"🔍 GROUPS actual: {GROUPS}")
     if admin_id == SUPER_ADMIN_ID:
         groups = GROUPS
     else:
@@ -66,7 +68,7 @@ def get_groups_by_admin(admin_id: int, group_type: str = None) -> list:
     if group_type:
         groups = [g for g in groups if g.get("type", "VIP") == group_type]
     return groups
-
+    
 def can_manage_group(user_id: int, group_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID:
         return True
