@@ -885,15 +885,18 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     """Permite editar múltiples campos a la vez"""
-    print(f"🔔 edit_group_multiple llamado para grupo: {group_id}")
-    logger.info(f"🔔 edit_group_multiple llamado para grupo: {group_id}")
+        # 🔍 LOGS DE DEPURACIÓN
+    print(f"🔴 edit_group_multiple INICIADA para grupo: {group_id}")
+    logger.info(f"🔴 edit_group_multiple INICIADA para grupo: {group_id}")
     query = update.callback_query
     await query.answer()
-    
+    print(f"🔴 query.answer() completado")
     group = get_group_by_id(group_id)
     if not group:
+        print(f"🔴 ERROR: Grupo {group_id} no encontrado")
         await query.edit_message_text("❌ Grupo no encontrado")
         return
+    print(f"🔴 Grupo encontrado: {group['group_name']}")
     
     context.user_data['editing_group_id'] = group_id
     context.user_data['editing_mode'] = 'multiple'
@@ -1241,6 +1244,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_id = int(parts[3])
         new_type = parts[4]
         await multi_set_type(update, context, group_id, new_type)    
+    elif data.startswith("edit_multiple_"):
+        print(f"🔴 Procesando edit_multiple_: {data}")
+        group_id = int(data.replace("edit_multiple_", ""))
+        print(f"🔴 group_id extraído: {group_id}")
+        await edit_group_multiple(update, context, group_id)
     
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
