@@ -1104,23 +1104,53 @@ async def multi_set_type(update: Update, context: ContextTypes.DEFAULT_TYPE, gro
     await edit_group_multiple(update, context, group_id)
     
 async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.new_chat_members:
+    print("🔴 detect_new_member llamada")
+    
+    if not update.message:
+        print("🔴 No hay update.message")
         return
+    
+    if not update.message.new_chat_members:
+        print("🔴 No hay new_chat_members")
+        return
+    
     chat_id = update.message.chat_id
+    print(f"🔴 Chat ID: {chat_id}")
+    
     group = get_group_by_id(chat_id)
+    print(f"🔴 Grupo encontrado: {group}")
+    
     if not group:
+        print(f"🔴 Grupo {chat_id} no está configurado")
         return
+    
+    print(f"🔴 Tipo de grupo: {group['type']}")
+    
     for new_member in update.message.new_chat_members:
         if new_member.id == context.bot.id:
+            print("🔴 Es el bot mismo, ignorar")
             continue
+        
         user_id = new_member.id
         username = new_member.username or f"user_{user_id}"
         first_name = new_member.first_name or ""
+        
+        print(f"🔴 Nuevo miembro: @{username} ({user_id})")
+        
         if group["type"] == "VIP":
+            print("🔴 Procesando registro VIP...")
             registered, result = await db.register_user_auto(chat_id, user_id, username, first_name)
+            print(f"🔴 Registrado: {registered}, Resultado: {result}")
+            
             if registered and result == "trial_nuevo":
-                await context.bot.send_message(user_id, f"🎉 Bienvenido @{username}!\n✨ Trial gratis de 1 día", parse_mode="Markdown")
+                print("🔴 Enviando mensaje de bienvenida")
+                await context.bot.send_message(
+                    user_id,
+                    f"🎉 Bienvenido @{username}!\n✨ Trial gratis de 1 día",
+                    parse_mode="Markdown"
+                )
         else:
+            print("🔴 Grupo FREE - solo registrar como cliente potencial")
             existing = await db.get_user_by_username(username, chat_id)
             if not existing:
                 with db.get_connection() as conn:
@@ -1129,7 +1159,7 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
                         conn.commit()
                 await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
-
+                
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /searchgrupo nombre - Busca grupos por nombre"""
     if update.effective_user.id != SUPER_ADMIN_ID:
@@ -1390,7 +1420,7 @@ async def main():
     bot_app.add_handler(CommandHandler("backup", manual_backup))
     bot_app.add_handler(CommandHandler("restore", restore_backup))
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
-    scheduler.start()
+        scheduler.start()
     scheduler.add_job(auto_backup, 'interval', hours=24)  # Revisa cada 24 horas si es momento de backup
     logger.info("🤖 Bot iniciado")
     await bot_app.initialize()
