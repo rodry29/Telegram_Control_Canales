@@ -359,7 +359,7 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{emoji} @{user['username'] or user['user_id']}\n   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n   📋 {user['plan']}\n\n"
     await message.reply_text(msg, parse_mode="Markdown")
 
-async function show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
         await query.answer()
