@@ -278,10 +278,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 Ganancias", callback_data="total_earnings")],
             [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
         ]
-         await update.message.reply_text(
-            f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
+     await update.message.reply_text(
+        f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
         )
         return
     user_groups = get_groups_by_admin(user_id)
