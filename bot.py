@@ -269,21 +269,34 @@ bot_app = None
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"🔴 /start RECIBIDO - User: {update.effective_user.id}, Chat: {update.effective_chat.id}")
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    
     if user_id == SUPER_ADMIN_ID:
+        # Calcular estadísticas rápidas
         vip_count = len([g for g in GROUPS if g.get("type", "VIP") == "VIP"])
         free_count = len([g for g in GROUPS if g.get("type", "VIP") == "FREE"])
+        total_earnings = await db.get_total_monthly_earnings()
+        total_users = 0
+        for group in GROUPS:
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM users WHERE group_id = %s", (group["group_id"],))
+                    total_users += cur.fetchone()[0]
+        
         keyboard = [
-            [InlineKeyboardButton(f"👑 Grupos VIP ({vip_count})", callback_data="vip_groups")],
-            [InlineKeyboardButton(f"📋 Grupos FREE ({free_count})", callback_data="free_groups")],
-            [InlineKeyboardButton("✏️ Editar grupo", callback_data="edit_group_menu")],
+            [InlineKeyboardButton("📋 Grupos", callback_data="menu_groups")],
             [InlineKeyboardButton("💰 Ganancias", callback_data="total_earnings")],
-            [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
+            [InlineKeyboardButton("📟 Comandos", callback_data="menu_commands")],
         ]
+        
         await update.message.reply_text(
-            f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}",
+            f"👑 *Panel Super Administrador*\n\n"
+            f"📊 *Resumen rápido:*\n"
+            f"• 👑 Grupos VIP: {vip_count}\n"
+            f"• 📋 Grupos FREE: {free_count}\n"
+            f"• 👥 Total usuarios: {total_users}\n"
+            f"• 💰 Ganancias del mes: ${total_earnings}\n\n"
+            f"Selecciona una opción:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -301,6 +314,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             keyboard = [[InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")], [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]]
             await update.message.reply_text(f"📋 *Panel FREE - {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def menu_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menú principal de grupos"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
+        [InlineKeyboardButton("👁️ Ver grupos", callback_data="menu_view_groups")],
+        [InlineKeyboardButton("✏️ Editar grupo", callback_data="menu_edit_group_select")],
+        [InlineKeyboardButton("❌ Eliminar grupo", callback_data="menu_delete_group_select")],
+        [InlineKeyboardButton("🔙 Volver", callback_data="back_to_admin")],
+    ]
+    
+    await query.edit_message_text(
+        "📋 *Gestión de Grupos*\n\n"
+        "Selecciona una opción:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def menu_view_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menú para seleccionar qué tipo de grupos ver"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("👑 Grupos VIP", callback_data="view_vip_groups")],
+        [InlineKeyboardButton("📋 Grupos FREE", callback_data="view_free_groups")],
+        [InlineKeyboardButton("🔙 Volver", callback_data="menu_groups")],
+    ]
+    
+    await query.edit_message_text(
+        "👁️ *Ver Grupos*\n\n"
+        "Selecciona el tipo de grupo:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra las ganancias totales del mes de todos los grupos (solo Super Admin)"""
@@ -420,6 +471,172 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"reporte_{now.year}_{now.month:02d}.csv", caption=f"📊 Reporte de {now.strftime('%B %Y')}")
     output.close()
 
+async def auto_backup():
+    """Genera backup automático cada 15 días y lo envía al Super Admin"""
+    global bot_app
+    
+    if not bot_app:
+        return
+    
+    # Verificar cuándo fue el último backup
+    last_backup_file = "last_backup.txt"
+    last_backup_date = None
+    
+    try:
+        if os.path.exists(last_backup_file):
+            with open(last_backup_file, 'r') as f:
+                last_backup_date = datetime.fromisoformat(f.read().strip())
+    except:
+        pass
+    
+    now = datetime.now()
+    
+    # Si no hay registro de último backup o pasaron 15 días
+    if not last_backup_date or (now - last_backup_date).days >= 15:
+        
+        # Crear backup
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['group_id', 'group_name', 'group_type', 'admin_id', 'backup_date'])
+        
+        for group in GROUPS:
+            writer.writerow([
+                group['group_id'],
+                group['group_name'],
+                group.get('type', 'VIP'),
+                group['admin_id'],
+                now.strftime('%Y-%m-%d %H:%M:%S')
+            ])
+        
+        output.seek(0)
+        
+        # Enviar backup al Super Admin
+        try:
+            await bot_app.bot.send_document(
+                SUPER_ADMIN_ID,
+                document=output.getvalue().encode('utf-8-sig'),
+                filename=f"backup_automatico_{now.strftime('%Y%m%d')}.csv",
+                caption=f"📦 *Backup Automático*\n\n"
+                        f"📅 Fecha: {now.strftime('%d/%m/%Y %H:%M:%S')}\n"
+                        f"📊 Grupos incluidos: {len(GROUPS)}\n\n"
+                        f"*Próximo backup:* {(now + timedelta(days=15)).strftime('%d/%m/%Y')}\n\n"
+                        f"⚠️ Guarda este archivo en un lugar seguro.",
+                parse_mode="Markdown"
+            )
+            output.close()
+            
+            # Registrar fecha del backup
+            with open(last_backup_file, 'w') as f:
+                f.write(now.isoformat())
+            
+            logger.info(f"✅ Backup automático enviado a {SUPER_ADMIN_ID}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error enviando backup automático: {e}")
+
+async def manual_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /backup - Genera backup manual inmediato"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo Super Admin")
+        return
+    
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['group_id', 'group_name', 'group_type', 'admin_id', 'backup_date'])
+    
+    now = datetime.now()
+    for group in GROUPS:
+        writer.writerow([
+            group['group_id'],
+            group['group_name'],
+            group.get('type', 'VIP'),
+            group['admin_id'],
+            now.strftime('%Y-%m-%d %H:%M:%S')
+        ])
+    
+    output.seek(0)
+    await update.message.reply_document(
+        document=output.getvalue().encode('utf-8-sig'),
+        filename=f"backup_manual_{now.strftime('%Y%m%d_%H%M%S')}.csv",
+        caption=f"📦 *Backup Manual*\n\n"
+                f"📅 Fecha: {now.strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"📊 Grupos incluidos: {len(GROUPS)}",
+        parse_mode="Markdown"
+    )
+    output.close()
+
+async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /restore - Restaura configuración desde archivo CSV"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo Super Admin")
+        return
+    
+    if not update.message.document:
+        await update.message.reply_text(
+            "❌ Envía el archivo CSV de backup junto con el comando.\n\n"
+            "Ejemplo: Envía `/restore` y luego el archivo adjunto.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await update.message.reply_text("🔄 Restaurando configuración...")
+    
+    try:
+        file = await update.message.document.get_file()
+        file_content = await file.download_as_bytearray()
+        
+        import io
+        content = file_content.decode('utf-8')
+        reader = csv.reader(io.StringIO(content))
+        
+        headers = next(reader)  # Saltar encabezados
+        
+        restored_count = 0
+        for row in reader:
+            if len(row) >= 4:
+                group_id = int(row[0])
+                group_name = row[1]
+                group_type = row[2]
+                admin_id = int(row[3])
+                
+                existing = get_group_by_id(group_id)
+                if existing:
+                    # Actualizar grupo existente
+                    for g in GROUPS:
+                        if g["group_id"] == group_id:
+                            g["group_name"] = group_name
+                            g["type"] = group_type
+                            g["admin_id"] = admin_id
+                            break
+                    with db.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                            UPDATE groups SET group_name=%s, group_type=%s, admin_id=%s
+                            WHERE group_id=%s
+                            """, (group_name, group_type, admin_id, group_id))
+                            conn.commit()
+                else:
+                    # Crear nuevo grupo
+                    GROUPS.append({
+                        "group_id": group_id,
+                        "group_name": group_name,
+                        "type": group_type,
+                        "admin_id": admin_id
+                    })
+                    await db.save_group(group_id, group_name, admin_id, group_type)
+                
+                restored_count += 1
+        
+        await update.message.reply_text(
+            f"✅ *Restauración completa*\n\n"
+            f"📊 Grupos restaurados: {restored_count}\n"
+            f"🔄 Reinicia el bot para aplicar todos los cambios.",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al restaurar: {e}")
+
 async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
@@ -459,56 +676,185 @@ async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-async def global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query:
-        await query.answer()
-        message = query.message
-    else:
-        message = update.message
-    if update.effective_user.id != SUPER_ADMIN_ID:
-        await message.reply_text("❌ No autorizado")
-        return
-    total_users, total_active, total_monthly = 0, 0, 0
-    msg = "🌍 *ESTADÍSTICAS GLOBALES*\n\n"
-    for group in GROUPS:
-        with db.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s", (group["group_id"],))
-                total = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='active' AND end_date>NOW()", (group["group_id"],))
-                active = cur.fetchone()[0]
-                cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE group_id=%s AND payment_date>=date_trunc('month',NOW())", (group["group_id"],))
-                monthly = cur.fetchone()[0]
-                total_users += total
-                total_active += active
-                total_monthly += monthly
-        msg += f"📌 *{group['group_name']}*\n   👥 {active}/{total} activos\n   💰 ${monthly}\n\n"
-    msg += f"━━━━━━━━━━━━━━━\n📊 *TOTALES*\n👥 Usuarios: {total_active}/{total_users}\n💰 Ganancias mes: ${total_monthly}"
-    await message.reply_text(msg, parse_mode="Markdown")
+async def view_vip_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra todos los grupos VIP"""
+    await show_groups_by_type(update, context, "VIP", True)
+
+async def view_free_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra todos los grupos FREE"""
+    await show_groups_by_type(update, context, "FREE", True)
 
 async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_type: str, select_mode: bool = False):
+    """Muestra grupos por tipo (VIP o FREE)"""
     query = update.callback_query
     groups = [g for g in GROUPS if g.get("type", "VIP") == group_type]
     if not groups:
         await query.edit_message_text(f"📭 No hay grupos {group_type}")
         return
     keyboard = [[InlineKeyboardButton(f"📌 {g['group_name']}", callback_data=f"select_group_{g['group_id']}")] for g in groups]
+    if select_mode:
+        keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_view_groups")])
     await query.edit_message_text(f"📋 *Grupos {group_type}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+async def edit_group_type_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Muestra opciones para cambiar el tipo"""
     query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("👑 VIP", callback_data=f"set_type_{group_id}_VIP")],
+        [InlineKeyboardButton("📋 FREE", callback_data=f"set_type_{group_id}_FREE")],
+        [InlineKeyboardButton("🔙 Volver", callback_data=f"edit_select_{group_id}")]
+    ]
+    
+    await query.edit_message_text(
+        "🔄 *Selecciona el nuevo tipo*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def menu_edit_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra lista de grupos para seleccionar cuál editar"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not GROUPS:
+        await query.edit_message_text("📭 No hay grupos configurados")
+        return
+    
+    keyboard = []
+    for group in GROUPS:
+        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+        keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"edit_select_{group['group_id']}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_groups")])
+    
+    await query.edit_message_text(
+        "✏️ *Selecciona el grupo que deseas editar*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def menu_delete_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra lista de grupos para seleccionar cuál eliminar"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not GROUPS:
+        await query.edit_message_text("📭 No hay grupos configurados")
+        return
+    
+    keyboard = []
+    for group in GROUPS:
+        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+        keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"delete_confirm_{group['group_id']}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_groups")])
+    
+    await query.edit_message_text(
+        "❌ *Eliminar Grupo*\n\n"
+        "⚠️ Esta acción es irreversible.\n"
+        "Selecciona el grupo que deseas eliminar:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def delete_group_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Solicita confirmación para eliminar un grupo"""
+    query = update.callback_query
+    await query.answer()
+    
     group = get_group_by_id(group_id)
     if not group:
         await query.edit_message_text("❌ Grupo no encontrado")
         return
-    context.user_data['current_group'] = group_id
-    if group.get("type", "VIP") == "VIP":
-        keyboard = [[InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")], [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")], [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")], [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]]
-        await query.edit_message_text(f"👑 *Panel VIP - {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    else:
-        keyboard = [[InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")], [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]]
-        await query.edit_message_text(f"📋 *Panel FREE - {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"delete_yes_{group_id}")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="menu_groups")],
+    ]
+    
+    await query.edit_message_text(
+        f"⚠️ *Confirmar eliminación*\n\n"
+        f"¿Estás seguro de que quieres eliminar el grupo?\n\n"
+        f"📌 *{group['group_name']}*\n"
+        f"🆔 ID: `{group['group_id']}`\n"
+        f"👑 Admin: `{group['admin_id']}`\n\n"
+        f"*Esta acción no se puede deshacer.*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def delete_group_execute(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Elimina el grupo de la base de datos y memoria"""
+    query = update.callback_query
+    await query.answer()
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    group_name = group['group_name']
+    
+    # Eliminar de memoria
+    global GROUPS
+    GROUPS = [g for g in GROUPS if g["group_id"] != group_id]
+    
+    # Eliminar de base de datos
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM groups WHERE group_id = %s", (group_id,))
+            conn.commit()
+    
+    await query.edit_message_text(
+        f"✅ *Grupo eliminado*\n\n"
+        f"📌 {group_name}\n"
+        f"🆔 ID: `{group_id}`\n\n"
+        f"El grupo ha sido eliminado correctamente.",
+        parse_mode="Markdown"
+    )
+    
+    # Volver al menú de grupos después de 2 segundos
+    await asyncio.sleep(2)
+    await menu_groups(update, context)
+
+async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la lista de comandos disponibles"""
+    query = update.callback_query
+    await query.answer()
+    
+    commands_text = """
+📟 *Comandos Disponibles*
+
+*Super Admin:*
+• `/start` - Panel principal
+• `/addgroup` - Agregar nuevo grupo
+• `/groups` - Ver todos los grupos
+• `/global` - Estadísticas globales
+
+*Admin de Grupo:*
+• `/start` - Panel de control
+• `/add @user plan` - Agregar usuario
+• `/add` en el grupo - Mismo que arriba
+
+*Planes disponibles:*
+• `trial` - 1 día ($0)
+• `semanal` - 7 días ($10)
+• `mensual` - 30 días ($20)
+
+*Ejemplos:*
+• `/add @juan semanal`
+• `/add @maria mensual`
+"""
+    
+    keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data="back_to_admin")]]
+    
+    await query.edit_message_text(
+        commands_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -552,28 +898,6 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"clientes_{datetime.now().strftime('%Y%m%d')}.csv", caption="📋 Clientes potenciales")
     output.close()
 
-async def edit_group_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el menú para seleccionar qué grupo editar"""
-    query = update.callback_query
-    await query.answer()
-    
-    if not GROUPS:
-        await query.edit_message_text("📭 No hay grupos configurados")
-        return
-    
-    keyboard = []
-    for group in GROUPS:
-        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
-        keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"edit_select_{group['group_id']}")])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_admin")])
-    
-    await query.edit_message_text(
-        "✏️ *Selecciona el grupo que deseas editar*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
 async def edit_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     """Muestra el formulario para editar un grupo"""
     query = update.callback_query
@@ -590,7 +914,7 @@ async def edit_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE, gr
         [InlineKeyboardButton("✏️ Cambiar nombre", callback_data=f"edit_name_{group_id}")],
         [InlineKeyboardButton("👤 Cambiar administrador", callback_data=f"edit_admin_{group_id}")],
         [InlineKeyboardButton("🔄 Cambiar tipo", callback_data=f"edit_type_{group_id}")],
-        [InlineKeyboardButton("🔙 Volver", callback_data="edit_group_menu")]
+        [InlineKeyboardButton("🔙 Volver", callback_data="")]
     ]
     
     await query.edit_message_text(
@@ -633,19 +957,26 @@ async def edit_group_admin_request(update: Update, context: ContextTypes.DEFAULT
         parse_mode="Markdown"
     )
 
-async def edit_group_type_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Muestra opciones para cambiar el tipo"""
+async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Permite editar múltiples campos a la vez"""
     query = update.callback_query
     await query.answer()
     
+    context.user_data['editing_group_id'] = group_id
+    context.user_data['editing_mode'] = 'multiple'
+    
     keyboard = [
-        [InlineKeyboardButton("👑 VIP", callback_data=f"set_type_{group_id}_VIP")],
-        [InlineKeyboardButton("📋 FREE", callback_data=f"set_type_{group_id}_FREE")],
+        [InlineKeyboardButton("📝 Cambiar nombre", callback_data=f"multi_name_{group_id}")],
+        [InlineKeyboardButton("👤 Cambiar admin", callback_data=f"multi_admin_{group_id}")],
+        [InlineKeyboardButton("🔄 Cambiar tipo", callback_data=f"multi_type_{group_id}")],
+        [InlineKeyboardButton("✅ Aplicar todos los cambios", callback_data=f"multi_apply_{group_id}")],
         [InlineKeyboardButton("🔙 Volver", callback_data=f"edit_select_{group_id}")]
     ]
     
     await query.edit_message_text(
-        "🔄 *Selecciona el nuevo tipo*",
+        f"✏️ *Edición múltiple - {group['group_name']}*\n\n"
+        f"Puedes hacer varios cambios antes de aplicarlos.\n"
+        f"Los cambios pendientes se mostrarán aquí.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -707,6 +1038,32 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
                         conn.commit()
                 await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
+
+async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /searchgrupo nombre - Busca grupos por nombre"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo Super Admin")
+        return
+    
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Usa: `/searchgrupo nombre`", parse_mode="Markdown")
+        return
+    
+    search_term = " ".join(context.args).lower()
+    results = [g for g in GROUPS if search_term in g['group_name'].lower()]
+    
+    if not results:
+        await update.message.reply_text(f"📭 No se encontraron grupos con '{search_term}'")
+        return
+    
+    msg = f"🔍 *Resultados para '{search_term}'*\n\n"
+    for group in results:
+        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+        msg += f"{emoji} *{group['group_name']}*\n"
+        msg += f"   🆔 ID: `{group['group_id']}`\n"
+        msg += f"   👑 Admin: `{group['admin_id']}`\n\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
                 
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja la entrada de texto para editar grupo"""
@@ -797,8 +1154,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("select_group_"):
         group_id = int(data.replace("select_group_", ""))
         await select_group(update, context, group_id)
-    elif data == "edit_group_menu":
-        await edit_group_menu(update, context)
     elif data.startswith("edit_select_"):
         group_id = int(data.replace("edit_select_", ""))
         await edit_group_form(update, context, group_id)
@@ -818,9 +1173,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_group_type(update, context, group_id, new_type)
     elif data == "back_to_admin":
         await start(update, context)
-
-
-
+    elif data == "menu_groups":
+        await menu_groups(update, context)
+    elif data == "menu_view_groups":
+        await menu_view_groups(update, context)
+    elif data == "view_vip_groups":
+        await view_vip_groups(update, context)
+    elif data == "view_free_groups":
+        await view_free_groups(update, context)
+    elif data == "menu_edit_group_select":
+        await menu_edit_group_select(update, context)
+    elif data == "menu_delete_group_select":
+        await menu_delete_group_select(update, context)
+    elif data.startswith("delete_confirm_"):
+        group_id = int(data.replace("delete_confirm_", ""))
+        await delete_group_confirm(update, context, group_id)
+    elif data.startswith("delete_yes_"):
+        group_id = int(data.replace("delete_yes_", ""))
+        await delete_group_execute(update, context, group_id)
+    elif data == "menu_commands":
+        await menu_commands(update, context)
+  
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     for group in GROUPS:
@@ -838,7 +1211,6 @@ async def check_expired_subscriptions():
 # ==================== MAIN ====================
 async def main():
     global bot_app
-    print("🚀 Iniciando bot...")
     await db.init_tables()
     await db.load_groups_from_db()
     logger.info(f"📦 {len(GROUPS)} grupos disponibles")
@@ -851,8 +1223,11 @@ async def main():
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
+    bot_app.add_handler(CommandHandler("backup", manual_backup))
+    bot_app.add_handler(CommandHandler("restore", restore_backup))
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
     scheduler.start()
+    scheduler.add_job(auto_backup, 'interval', hours=24)  # Revisa cada 24 horas si es momento de backup
     logger.info("🤖 Bot iniciado")
     await bot_app.initialize()
     await bot_app.start()
