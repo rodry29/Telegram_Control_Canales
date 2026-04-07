@@ -258,8 +258,14 @@ class Database:
     async def get_expired_users(self, group_id: int):
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id, username, plan, end_date FROM users WHERE group_id=%s AND status='active' AND end_date<NOW()", (group_id,))
-                return cur.fetchall()
+                cur.execute("""
+                SELECT user_id, username, plan, end_date 
+                FROM users 
+                WHERE group_id=%s AND status='active' AND end_date < NOW()
+                """, (group_id,))
+                results = cur.fetchall()
+                print(f"🔴 get_expired_users para grupo {group_id}: {len(results)} usuarios")
+                return results
 
     async def expire_user(self, user_id: int, group_id: int):
         with self.get_connection() as conn:
@@ -1390,17 +1396,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
+    print("🔴 EJECUTANDO check_expired_subscriptions")
+    logger.info("🔴 EJECUTANDO check_expired_subscriptions")
+    
     for group in GROUPS:
+        print(f"🔴 Revisando grupo: {group['group_name']} (tipo: {group.get('type', 'VIP')})")
+        
         if group.get("type", "VIP") != "VIP":
+            print(f"🔴 Grupo {group['group_name']} no es VIP, saltando")
             continue
+        
         expired_users = await db.get_expired_users(group["group_id"])
+        print(f"🔴 Usuarios expirados en {group['group_name']}: {len(expired_users)}")
+        
         for user in expired_users:
+            print(f"🔴 Procesando expulsión de: {user['username']}")
             await db.expire_user(user['user_id'], group["group_id"])
             try:
                 await bot_app.bot.ban_chat_member(group["group_id"], user['user_id'])
-                await bot_app.bot.send_message(group["admin_id"], f"🚫 @{user['username']} expulsado")
-            except:
-                pass
+                await bot_app.bot.send_message(group["admin_id"], f"🚫 @{user['username']} expulsado - suscripción vencida")
+                print(f"🔴 Usuario {user['username']} expulsado")
+            except Exception as e:
+                print(f"🔴 Error expulsando: {e}")
+                logger.error(f"Error expulsando: {e}")
 
 # ==================== MAIN ====================
 async def main():
@@ -1419,7 +1437,7 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
     bot_app.add_handler(CommandHandler("backup", manual_backup))
     bot_app.add_handler(CommandHandler("restore", restore_backup))
-    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
+    scheduler.add_job(check_expired_subscriptions, 'interval', minutes=1)
     scheduler.start()
     scheduler.add_job(auto_backup, 'interval', hours=24)  # Revisa cada 24 horas si es momento de backup
     logger.info("🤖 Bot iniciado")
