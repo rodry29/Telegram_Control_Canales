@@ -307,7 +307,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-   user_groups = get_groups_by_admin(user_id)
+    user_groups = get_groups_by_admin(user_id)
     
     print(f"🔍 Admin {user_id} - Grupos encontrados: {user_groups}")
     
