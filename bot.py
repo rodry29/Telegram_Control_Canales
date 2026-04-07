@@ -270,7 +270,8 @@ bot_app = None
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
+    chat_id = update.effective_chat.id
+    print(f"🔴 /start - User: {user_id}, Chat: {chat_id}, Type: {update.effective_chat.type}")
     if user_id == SUPER_ADMIN_ID:
         # Calcular estadísticas rápidas
         vip_count = len([g for g in GROUPS if g.get("type", "VIP") == "VIP"])
