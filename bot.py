@@ -401,6 +401,47 @@ async def menu_view_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Selecciona un grupo para gestionar (desde el menú de ver grupos)"""
+    query = update.callback_query
+    await query.answer()
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    # Guardar el grupo actual en el contexto
+    context.user_data['current_group'] = group_id
+    
+    # Mostrar panel según el tipo de grupo
+    if group.get("type", "VIP") == "VIP":
+        keyboard = [
+            [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+            [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+            [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+            [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]
+        ]
+        await query.edit_message_text(
+            f"👑 *Panel VIP - {group['group_name']}*\n\n"
+            f"🆔 ID: `{group['group_id']}`\n"
+            f"👑 Admin: `{group['admin_id']}`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        keyboard = [
+            [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
+            [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]
+        ]
+        await query.edit_message_text(
+            f"📋 *Panel FREE - {group['group_name']}*\n\n"
+            f"🆔 ID: `{group['group_id']}`\n"
+            f"👑 Admin: `{group['admin_id']}`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
 async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra las ganancias totales del mes de todos los grupos (solo Super Admin)"""
     query = update.callback_query
