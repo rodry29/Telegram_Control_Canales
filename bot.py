@@ -885,6 +885,8 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     """Permite editar múltiples campos a la vez"""
+    print(f"🔔 edit_group_multiple llamado para grupo: {group_id}")
+    logger.info(f"🔔 edit_group_multiple llamado para grupo: {group_id}")
     query = update.callback_query
     await query.answer()
     
@@ -1173,6 +1175,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    print(f"🔔 CALLBACK RECIBIDO: {data}")
+    logger.info(f"🔔 CALLBACK RECIBIDO: {data}")
     if data == "add_user":
         await query.edit_message_text("📝 Usa: `/add @username plan`", parse_mode="Markdown")
     elif data == "list_active":
