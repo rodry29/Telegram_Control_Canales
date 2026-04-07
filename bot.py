@@ -269,7 +269,9 @@ bot_app = None
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"🔴 /start RECIBIDO - User: {update.effective_user.id}, Chat: {update.effective_chat.id}")
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if user_id == SUPER_ADMIN_ID:
         vip_count = len([g for g in GROUPS if g.get("type", "VIP") == "VIP"])
         free_count = len([g for g in GROUPS if g.get("type", "VIP") == "FREE"])
