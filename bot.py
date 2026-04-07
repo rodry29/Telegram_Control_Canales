@@ -60,13 +60,18 @@ def get_group_by_id(group_id: int) -> Optional[dict]:
 
 def get_groups_by_admin(admin_id: int, group_type: str = None) -> list:
     print(f"🔍 Buscando grupos para admin: {admin_id}")
-    print(f"🔍 GROUPS actual: {GROUPS}")
+    print(f"🔍 GROUPS: {GROUPS}")
+    
     if admin_id == SUPER_ADMIN_ID:
         groups = GROUPS
     else:
         groups = [g for g in GROUPS if g["admin_id"] == admin_id]
+    
+    print(f"🔍 Resultado: {groups}")
+    
     if group_type:
         groups = [g for g in groups if g.get("type", "VIP") == group_type]
+    
     return groups
     
 def can_manage_group(user_id: int, group_id: int) -> bool:
@@ -302,19 +307,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    user_groups = get_groups_by_admin(user_id)
+   user_groups = get_groups_by_admin(user_id)
+    
+    print(f"🔍 Admin {user_id} - Grupos encontrados: {user_groups}")
+    
     if not user_groups:
-        await update.message.reply_text("❌ No tienes grupos asignados")
+        await update.message.reply_text(
+            "❌ No tienes grupos asignados como administrador.\n\n"
+            "Contacta al Super Administrador para que te asigne un grupo."
+        )
         return
+    
+    # Si tiene un solo grupo, mostrar panel directamente
     if len(user_groups) == 1:
         group = user_groups[0]
         context.user_data['current_group'] = group['group_id']
+        
+        # Mostrar panel según el tipo de grupo
         if group.get("type", "VIP") == "VIP":
-            keyboard = [[InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")], [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")], [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")], [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]]
-            await update.message.reply_text(f"👑 *Panel VIP - {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            keyboard = [
+                [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+                [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+                [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")]
+            ]
+            await update.message.reply_text(
+                f"👑 *Panel VIP - {group['group_name']}*\n\n"
+                f"🆔 ID del grupo: `{group['group_id']}`\n\n"
+                f"Comandos disponibles:\n"
+                f"• `/add @usuario plan` - Agregar suscripción\n"
+                f"• Los usuarios expiran automáticamente",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
         else:
-            keyboard = [[InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")], [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]]
-            await update.message.reply_text(f"📋 *Panel FREE - {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            keyboard = [
+                [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
+                [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]
+            ]
+            await update.message.reply_text(
+                f"📋 *Panel FREE - {group['group_name']}*\n\n"
+                f"🆔 ID del grupo: `{group['group_id']}`",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+    else:
+        # Múltiples grupos - mostrar selector
+        keyboard = []
+        for group in user_groups:
+            emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+            keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"select_group_{group['group_id']}")])
+        
+        await update.message.reply_text(
+            "📋 *Selecciona el grupo que quieres gestionar*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
 
 async def menu_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menú principal de grupos"""
@@ -683,19 +730,37 @@ async def view_vip_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def view_free_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra todos los grupos FREE"""
+    print("🔴 Entrando a view_free_groups")
+    logger.info("🔴 Entrando a view_free_groups")
     await show_groups_by_type(update, context, "FREE", True)
 
 async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_type: str, select_mode: bool = False):
     """Muestra grupos por tipo (VIP o FREE)"""
+    print(f"🔴 show_groups_by_type INICIADA - group_type: {group_type}")
+    logger.info(f"🔴 show_groups_by_type INICIADA - group_type: {group_type}")
+    
     query = update.callback_query
+    print(f"🔴 query obtenida: {query}")
+    
     groups = [g for g in GROUPS if g.get("type", "VIP") == group_type]
+    print(f"🔴 Grupos encontrados para {group_type}: {len(groups)}")
+    
     if not groups:
+        print(f"🔴 No hay grupos {group_type} - enviando mensaje")
         await query.edit_message_text(f"📭 No hay grupos {group_type}")
         return
+    
     keyboard = [[InlineKeyboardButton(f"📌 {g['group_name']}", callback_data=f"select_group_{g['group_id']}")] for g in groups]
     if select_mode:
         keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_view_groups")])
-    await query.edit_message_text(f"📋 *Grupos {group_type}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    print(f"🔴 Enviando mensaje con {len(keyboard)} botones")
+    await query.edit_message_text(
+        f"📋 *Grupos {group_type}*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    print("🔴 Mensaje enviado correctamente")
 
 async def menu_edit_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra lista de grupos para seleccionar cuál editar (solo edición múltiple)"""
@@ -1215,6 +1280,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "view_vip_groups":
         await view_vip_groups(update, context)
     elif data == "view_free_groups":
+        print("🔴 view_free_groups llamado desde handle_callback")
         await view_free_groups(update, context)
     elif data == "menu_edit_group_select":
         await menu_edit_group_select(update, context)
