@@ -274,10 +274,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton(f"👑 Grupos VIP ({vip_count})", callback_data="vip_groups")],
             [InlineKeyboardButton(f"📋 Grupos FREE ({free_count})", callback_data="free_groups")],
+            [InlineKeyboardButton("✏️ Editar grupo", callback_data="edit_group_menu")],
             [InlineKeyboardButton("💰 Ganancias", callback_data="total_earnings")],
             [InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")],
         ]
-        await update.message.reply_text(f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+         await update.message.reply_text(
+            f"👑 *Panel Super Admin*\nVIP: {vip_count} | FREE: {free_count}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
         return
     user_groups = get_groups_by_admin(user_id)
     if not user_groups:
@@ -574,6 +579,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("select_group_"):
         group_id = int(data.replace("select_group_", ""))
         await select_group(update, context, group_id)
+    elif data == "edit_group_menu":
+        await edit_group_menu(update, context)
+    elif data.startswith("edit_select_"):
+        group_id = int(data.replace("edit_select_", ""))
+        await edit_group_form(update, context, group_id)
+    elif data.startswith("edit_name_"):
+        group_id = int(data.replace("edit_name_", ""))
+        await edit_group_name_request(update, context, group_id)
+    elif data.startswith("edit_admin_"):
+        group_id = int(data.replace("edit_admin_", ""))
+        await edit_group_admin_request(update, context, group_id)
+    elif data.startswith("edit_type_"):
+        group_id = int(data.replace("edit_type_", ""))
+        await edit_group_type_menu(update, context, group_id)
+    elif data.startswith("set_type_"):
+        parts = data.split("_")
+        group_id = int(parts[2])
+        new_type = parts[3]
+        await set_group_type(update, context, group_id, new_type)
+    elif data == "back_to_admin":
+        await start(update, context)
 
 async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
@@ -602,6 +628,192 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         conn.commit()
                 await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
 
+async def edit_group_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el menú para seleccionar qué grupo editar"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not GROUPS:
+        await query.edit_message_text("📭 No hay grupos configurados")
+        return
+    
+    keyboard = []
+    for group in GROUPS:
+        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+        keyboard.append([InlineKeyboardButton(f"{emoji} {group['group_name']}", callback_data=f"edit_select_{group['group_id']}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_admin")])
+    
+    await query.edit_message_text(
+        "✏️ *Selecciona el grupo que deseas editar*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def edit_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Muestra el formulario para editar un grupo"""
+    query = update.callback_query
+    await query.answer()
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    context.user_data['editing_group_id'] = group_id
+    
+    keyboard = [
+        [InlineKeyboardButton("✏️ Cambiar nombre", callback_data=f"edit_name_{group_id}")],
+        [InlineKeyboardButton("👤 Cambiar administrador", callback_data=f"edit_admin_{group_id}")],
+        [InlineKeyboardButton("🔄 Cambiar tipo", callback_data=f"edit_type_{group_id}")],
+        [InlineKeyboardButton("🔙 Volver", callback_data="edit_group_menu")]
+    ]
+    
+    await query.edit_message_text(
+        f"✏️ *Editando: {group['group_name']}*\n\n"
+        f"📋 Tipo: {group.get('type', 'VIP')}\n"
+        f"👑 Admin: `{group['admin_id']}`\n\n"
+        f"*¿Qué deseas modificar?*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def edit_group_name_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Solicita el nuevo nombre del grupo"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['editing_field'] = 'name'
+    context.user_data['editing_group_id'] = group_id
+    
+    await query.edit_message_text(
+        f"✏️ *Cambiar nombre del grupo*\n\n"
+        f"Envía el *nuevo nombre* en el chat.\n\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def edit_group_admin_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Solicita el nuevo admin del grupo"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['editing_field'] = 'admin'
+    context.user_data['editing_group_id'] = group_id
+    
+    await query.edit_message_text(
+        f"👤 *Cambiar administrador*\n\n"
+        f"Envía el *ID del nuevo administrador* en el chat.\n\n"
+        f"*Para obtener un ID, usa @userinfobot*\n\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def edit_group_type_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Muestra opciones para cambiar el tipo"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("👑 VIP", callback_data=f"set_type_{group_id}_VIP")],
+        [InlineKeyboardButton("📋 FREE", callback_data=f"set_type_{group_id}_FREE")],
+        [InlineKeyboardButton("🔙 Volver", callback_data=f"edit_select_{group_id}")]
+    ]
+    
+    await query.edit_message_text(
+        "🔄 *Selecciona el nuevo tipo*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def set_group_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, new_type: str):
+    """Cambia el tipo del grupo"""
+    query = update.callback_query
+    await query.answer()
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    old_type = group.get("type", "VIP")
+    
+    # Actualizar en memoria
+    for g in GROUPS:
+        if g["group_id"] == group_id:
+            g["type"] = new_type
+            break
+    
+    # Actualizar en BD
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE groups SET group_type = %s WHERE group_id = %s", (new_type, group_id))
+            conn.commit()
+    
+    await query.edit_message_text(
+        f"✅ *Tipo actualizado*\n\n{old_type} → {new_type}",
+        parse_mode="Markdown"
+    )
+    await asyncio.sleep(1)
+    await edit_group_form(update, context, group_id)
+
+async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja la entrada de texto para editar grupo"""
+    user_id = update.effective_user.id
+    
+    if user_id != SUPER_ADMIN_ID:
+        return
+    
+    text = update.message.text.strip()
+    
+    if text.lower() == 'cancelar':
+        await update.message.reply_text("❌ Edición cancelada")
+        context.user_data.pop('editing_field', None)
+        context.user_data.pop('editing_group_id', None)
+        return
+    
+    field = context.user_data.get('editing_field')
+    group_id = context.user_data.get('editing_group_id')
+    
+    if not field or not group_id:
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
+    
+    if field == 'name':
+        old_name = group['group_name']
+        for g in GROUPS:
+            if g["group_id"] == group_id:
+                g["group_name"] = text
+                break
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET group_name = %s WHERE group_id = %s", (text, group_id))
+                conn.commit()
+        await update.message.reply_text(f"✅ *Nombre actualizado*\n`{old_name}` → `{text}`", parse_mode="Markdown")
+        
+    elif field == 'admin':
+        try:
+            new_admin = int(text)
+            old_admin = group['admin_id']
+            for g in GROUPS:
+                if g["group_id"] == group_id:
+                    g["admin_id"] = new_admin
+                    break
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE groups SET admin_id = %s WHERE group_id = %s", (new_admin, group_id))
+                    conn.commit()
+            await update.message.reply_text(f"✅ *Administrador actualizado*\n`{old_admin}` → `{new_admin}`", parse_mode="Markdown")
+        except ValueError:
+            await update.message.reply_text("❌ Error: El ID debe ser un número")
+            return
+    
+    context.user_data.pop('editing_field', None)
+    context.user_data.pop('editing_group_id', None)
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     for group in GROUPS:
@@ -631,6 +843,7 @@ async def main():
     bot_app.add_handler(CommandHandler("addgroup", add_group_command))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
     scheduler.start()
     logger.info("🤖 Bot iniciado")
