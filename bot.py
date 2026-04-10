@@ -191,8 +191,8 @@ class Database:
                     INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, trial_used, status)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active')
                     """, (user_id, group_id, username, first_name, "trial", now, end_date, True))
-                    cur.execute("INSERT INTO payments (user_id, group_id, username, plan, amount, payment_date) VALUES (%s, %s, %s, %s, %s, %s)", 
-                               (user_id, group_id, username, "trial", 0, now))
+                    cur.execute("INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, payment_date) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
+                               (user_id, group_id, username, first_name, "trial", 0, now))
                     conn.commit()
                     return True, "trial_nuevo"
                 elif existing['status'] == 'active' and existing['end_date'] > now:
@@ -202,25 +202,26 @@ class Database:
                     return True, "activo"
                 return False, "expirado"
 
-    async def add_or_update_user(self, group_id: int, username: str, plan: str):
+    async def add_or_update_user(self, group_id: int, username: str, plan: str, first_name: str = ""):
         now = datetime.now()
         if plan not in PLANS:
             return False, "❌ Plan inválido"
         config = PLANS[plan]
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id, trial_used, status FROM users WHERE LOWER(username) = LOWER(%s) AND group_id = %s", (username, group_id))
+                cur.execute("SELECT user_id, trial_used, status, first_name FROM users WHERE LOWER(username) = LOWER(%s) AND group_id = %s", (username, group_id))
                 existing = cur.fetchone()
                 if existing:
                     if plan == "trial" and existing['trial_used']:
                         return False, "❌ Este usuario ya usó su prueba gratuita"
                     end_date = now + timedelta(days=config['days'])
+                    # Actualizar también el first_name si cambió
                     cur.execute("""
-                    UPDATE users SET plan=%s, start_date=%s, end_date=%s, status='active', updated_at=NOW(), username=%s, trial_used=trial_used OR %s
+                    UPDATE users SET plan=%s, start_date=%s, end_date=%s, status='active', updated_at=NOW(), username=%s, first_name=%s, trial_used=trial_used OR %s
                     WHERE user_id=%s AND group_id=%s
-                    """, (plan, now, end_date, username, plan == "trial", existing['user_id'], group_id))
-                    cur.execute("INSERT INTO payments (user_id, group_id, username, plan, amount, payment_date) VALUES (%s, %s, %s, %s, %s, %s)",
-                               (existing['user_id'], group_id, username, plan, config['price'], now))
+                    """, (plan, now, end_date, username, first_name or existing.get('first_name', ''), plan == "trial", existing['user_id'], group_id))
+                    cur.execute("INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, payment_date) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                               (existing['user_id'], group_id, username, first_name or existing.get('first_name', ''), plan, config['price'], now))
                     conn.commit()
                     return True, f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
                 return False, f"❌ No tengo registro de @{username}. Pídele que envíe un mensaje al bot."
@@ -489,7 +490,16 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if plan not in PLANS:
         await update.message.reply_text("❌ Plan inválido")
         return
-    success, msg = await db.add_or_update_user(current_group, username, plan)
+    
+    first_name = ""
+    try:
+        user_info = await context.bot.get_chat_member(current_group, username)
+        if user_info and user_info.user:
+            first_name = user_info.user.first_name or ""
+    except:
+        pass
+    
+    success, msg = await db.add_or_update_user(current_group, username, plan, first_name)
     await update.message.reply_text(msg)
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -499,19 +509,40 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = query.message
     else:
         message = update.message
+    
     group_id = context.user_data.get('current_group')
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
         return
+    
     users = await db.get_all_active_users(group_id)
+    
     if not users:
         await message.reply_text("📭 No hay usuarios activos")
         return
+    
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
     for user in users[:30]:
         days_left = int(user['days_left']) if user['days_left'] else 0
         emoji = "🟢" if days_left > 7 else "🟡" if days_left > 2 else "🔴"
-        msg += f"{emoji} @{user['username'] or user['user_id']}\n   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n   📋 {user['plan']}\n\n"
+        
+        # Construir nombre para mostrar
+        first_name = user.get('first_name', '') or 'Sin nombre'
+        username = user.get('username', '')
+        
+        if username and not username.startswith('user_'):
+            display = f"{first_name} (@{username})"
+        else:
+            display = f"{first_name} (ID: `{user['user_id']}`)"
+        
+        # Enlace para abrir chat
+        chat_link = f"tg://user?id={user['user_id']}"
+        
+        msg += f"{emoji} {display}\n"
+        msg += f"   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n"
+        msg += f"   📋 Plan: {user['plan']}\n"
+        msg += f"   🔗 [Abrir chat]({chat_link})\n\n"
+    
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -521,22 +552,44 @@ async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = query.message
     else:
         message = update.message
+    
     group_id = context.user_data.get('current_group')
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
         return
+    
     earnings = await db.get_monthly_earnings(group_id)
     now = datetime.now()
+    
     msg = f"💰 *GANANCIAS DE {now.strftime('%B %Y').upper()}*\n\n"
     if not earnings['summary']:
         msg += "📭 No hay ventas"
     else:
         for plan in earnings['summary']:
             plan_name = PLANS.get(plan['plan'], {}).get('name', plan['plan'])
-            msg += f"• {plan_name}: {plan['count']} - ${plan['total']}\n"
+            msg += f"• {plan_name}: {plan['count']} ventas - ${plan['total']}\n"
         msg += f"\n💵 *TOTAL*: ${earnings['total']}\n👥 *Nuevos*: {earnings['new_users']}"
+    
+    # Agregar detalle de usuarios que pagaron este mes
+    with db.get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+            SELECT user_id, username, first_name, plan, amount, payment_date
+            FROM payments
+            WHERE group_id=%s AND payment_date >= date_trunc('month', NOW())
+            ORDER BY payment_date DESC
+            LIMIT 10
+            """, (group_id,))
+            recent = cur.fetchall()
+    
+    if recent:
+        msg += "\n\n📋 *Últimos pagos:*\n"
+        for p in recent:
+            name = p['first_name'] or p['username'] or f"ID:{p['user_id']}"
+            msg += f"• {name} - {p['plan']} - ${p['amount']}\n"
+    
     await message.reply_text(msg, parse_mode="Markdown")
-
+    
 async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
@@ -544,26 +597,51 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = query.message
     else:
         message = update.message
+    
     group_id = context.user_data.get('current_group')
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
         return
+    
     now = datetime.now()
     start_date = datetime(now.year, now.month, 1)
+    
     with db.get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT user_id, username, plan, amount, payment_date FROM payments WHERE group_id=%s AND payment_date>=%s ORDER BY payment_date DESC", (group_id, start_date))
+            cur.execute("""
+            SELECT user_id, username, first_name, plan, amount, payment_date 
+            FROM payments 
+            WHERE group_id=%s AND payment_date>=%s 
+            ORDER BY payment_date DESC
+            """, (group_id, start_date))
             transactions = cur.fetchall()
+    
     if not transactions:
         await message.reply_text(f"📭 No hay transacciones en {now.strftime('%B %Y')}")
         return
+    
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Fecha', 'User ID', 'Username', 'Plan', 'Monto'])
+    writer.writerow(['Fecha', 'User ID', 'Username', 'Nombre', 'Plan', 'Monto', 'Link de contacto'])
+    
     for t in transactions:
-        writer.writerow([t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'), t['user_id'], t['username'] or 'Sin username', t['plan'].upper(), f"${t['amount']}"])
+        chat_link = f"tg://user?id={t['user_id']}"
+        writer.writerow([
+            t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'),
+            t['user_id'],
+            t['username'] or 'Sin username',
+            t['first_name'] or 'Sin nombre',
+            t['plan'].upper(),
+            f"${t['amount']}",
+            chat_link
+        ])
+    
     output.seek(0)
-    await message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"reporte_{now.year}_{now.month:02d}.csv", caption=f"📊 Reporte de {now.strftime('%B %Y')}")
+    await message.reply_document(
+        document=output.getvalue().encode('utf-8-sig'),
+        filename=f"reporte_{now.year}_{now.month:02d}.csv",
+        caption=f"📊 Reporte de {now.strftime('%B %Y')}"
+    )
     output.close()
 
 async def auto_backup():
@@ -1157,7 +1235,7 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             print("🔴 Grupo FREE - solo registrar como cliente potencial")
-            existing = await db.get_user_by_username(username, chat_id)
+            existing = await db.register_user_auto(chat_id, user_id, username, first_name)
             if not existing:
                 with db.get_connection() as conn:
                     with conn.cursor() as cur:
@@ -1253,6 +1331,40 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif field == 'admin':
         # ... tu código existente ...
         pass
+
+async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /getlink @username - Obtiene enlace para abrir chat"""
+    if update.effective_user.id not in [SUPER_ADMIN_ID, 8682208062]:
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Usa: `/getlink @username` o `/getlink ID`", parse_mode="Markdown")
+        return
+    
+    identifier = context.args[0].replace("@", "")
+    
+    try:
+        # Si es número, buscar por ID
+        if identifier.isdigit():
+            user_id = int(identifier)
+            chat_link = f"tg://user?id={user_id}"
+            await update.message.reply_text(f"🔗 Enlace para abrir chat:\n`{chat_link}`", parse_mode="Markdown")
+        else:
+            # Buscar por username
+            group_id = context.user_data.get('current_group')
+            if not group_id:
+                await update.message.reply_text("❌ Selecciona un grupo con /start")
+                return
+            user = await db.get_user_by_username(identifier, group_id)
+            if user:
+                chat_link = f"tg://user?id={user['user_id']}"
+                name = user.get('first_name', 'Usuario') or user.get('username', identifier)
+                await update.message.reply_text(f"🔗 Enlace para abrir chat con {name}:\n`{chat_link}`", parse_mode="Markdown")
+            else:
+                await update.message.reply_text(f"❌ No se encontró al usuario @{identifier}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     """Aplica todos los cambios pendientes"""
@@ -1437,6 +1549,7 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
     bot_app.add_handler(CommandHandler("backup", manual_backup))
     bot_app.add_handler(CommandHandler("restore", restore_backup))
+    bot_app.add_handler(CommandHandler("getlink", get_link))
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=3)
     scheduler.start()
     scheduler.add_job(auto_backup, 'interval', hours=24)  # Revisa cada 24 horas si es momento de backup
