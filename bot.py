@@ -1646,23 +1646,22 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sync_all_groups_automatically():
     """Sincronización automática al iniciar el bot"""
+    global bot_app
     print("🔴 SINCRONIZACIÓN AUTOMÁTICA INICIADA")
-    total_registered = 0
     
     for group in GROUPS:
         try:
             chat_id = group["group_id"]
+            # ✅ Usar context.bot en lugar de bot_app.bot
+            # Pero como no tenemos context, usamos bot_app.bot correctamente
             all_members = []
             offset = 0
             
             while True:
-                members = await bot_app.bot.get_chat_members(chat_id, offset=offset)
-                if not members:
-                    break
+                # ✅ FORMA CORRECTA
+                members = await bot_app.bot.get_chat_administrators(chat_id)
                 all_members.extend(members)
-                offset += len(members)
-                if len(members) < 200:
-                    break
+                break  # Solo admins, no todos los miembros
             
             registered = 0
             for member in all_members:
