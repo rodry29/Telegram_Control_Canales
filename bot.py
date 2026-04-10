@@ -382,6 +382,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("🔴 COMANDO TEST RECIBIDO")
+    await update.message.reply_text("✅ El bot funciona!")
 
 async def menu_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menú principal de grupos"""
@@ -1769,6 +1772,8 @@ async def main():
     bot_app.add_handler(CommandHandler("getlink", get_link))
     bot_app.add_handler(CommandHandler("syncgroup", sync_group))
     bot_app.add_handler(CommandHandler("syncall", sync_all_groups))
+    # En main():
+    bot_app.add_handler(CommandHandler("test", test))
     
     # Configurar tareas programadas UNA SOLA VEZ (hours=6 es el correcto)
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
