@@ -1698,6 +1698,11 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def scheduled_sync():
+    """Sincronización programada (cada 24 horas)"""
+    print("🔴 Ejecutando sincronización programada...")
+    await sync_all_groups_automatically()
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1828,6 +1833,14 @@ async def main():
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
+    await sync_all_groups_automatically()
+    
+    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
+    scheduler.start()
+    scheduler.add_job(scheduled_sync, 'interval', hours=24)
+    scheduler.add_job(auto_backup, 'interval', hours=24)
+    logger.info("🤖 Bot iniciado")
+    
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
