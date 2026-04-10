@@ -200,7 +200,7 @@ class Database:
                 else:
                     cur.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username,))
                 return cur.fetchone()
-
+                
     async def register_user_auto(self, group_id: int, user_id: int, username: str, first_name: str):
         now = datetime.now()
         with self.get_connection() as conn:
@@ -296,152 +296,7 @@ class Database:
                 cur.execute("UPDATE users SET status='expired' WHERE user_id=%s AND group_id=%s", (user_id, group_id))
                 conn.commit()
 
-    async def sync_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /syncgroup - Sincroniza todos los miembros del grupo actual"""
-        user_id = update.effective_user.id
-        chat_id = update.effective_chat.id
-        
-        # Verificar permisos (Super Admin o Admin del grupo)
-        group = get_group_by_id(chat_id)
-        if not group:
-            await update.message.reply_text("❌ Este grupo no está configurado")
-            return
-        
-        if user_id != SUPER_ADMIN_ID and group["admin_id"] != user_id:
-            await update.message.reply_text("❌ No autorizado")
-            return
-        
-        await update.message.reply_text("🔄 Sincronizando miembros del grupo... Esto puede tomar unos segundos.")
-        
-        try:
-            # Obtener todos los miembros del grupo
-            offset = 0
-            all_members = []
-            while True:
-                members = await context.bot.get_chat_members(chat_id, offset=offset)
-                if not members:
-                    break
-                all_members.extend(members)
-                offset += len(members)
-                if len(members) < 200:
-                    break
-            
-            print(f"🔴 Total miembros encontrados: {len(all_members)}")
-            
-            registered = 0
-            already_exists = 0
-            errors = 0
-            
-            for member in all_members:
-                if member.user.id == context.bot.id:
-                    continue
-                
-                user_id_member = member.user.id
-                username = member.user.username or f"user_{user_id_member}"
-                first_name = member.user.first_name or ""
-                
-                # Verificar si ya existe en BD
-                existing = await db.get_user_by_username(username, chat_id)
-                
-                if not existing:
-                    try:
-                        if group["type"] == "VIP":
-                            # Grupo VIP: registrar con trial
-                            await db.register_user_auto(chat_id, user_id_member, username, first_name)
-                        else:
-                            # Grupo FREE: registrar como potencial
-                            with db.get_connection() as conn:
-                                with conn.cursor() as cur:
-                                    cur.execute("""
-                                    INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                    """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
-                                    conn.commit()
-                        registered += 1
-                        print(f"🔴 Registrado: {username} ({user_id_member})")
-                    except Exception as e:
-                        errors += 1
-                        print(f"🔴 Error registrando {username}: {e}")
-                else:
-                    already_exists += 1
-            
-            msg = f"✅ *Sincronización completada*\n\n"
-            msg += f"📊 *Grupo:* {group['group_name']}\n"
-            msg += f"👥 *Miembros totales:* {len(all_members)}\n"
-            msg += f"🆕 *Nuevos registrados:* {registered}\n"
-            msg += f"📌 *Ya existían:* {already_exists}\n"
-            if errors > 0:
-                msg += f"⚠️ *Errores:* {errors}\n"
-            
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error durante la sincronización: {e}")
-            print(f"🔴 Error en sync_group: {e}")
 
-    async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /syncall - Sincroniza TODOS los grupos (solo Super Admin)"""
-        if update.effective_user.id != SUPER_ADMIN_ID:
-            await update.message.reply_text("❌ Solo Super Admin")
-            return
-        
-        await update.message.reply_text("🔄 Sincronizando todos los grupos... Esto puede tomar varios minutos.")
-        
-        total_registered = 0
-        results = []
-        
-        for group in GROUPS:
-            chat_id = group["group_id"]
-            group_name = group["group_name"]
-            
-            try:
-                # Obtener miembros
-                offset = 0
-                all_members = []
-                while True:
-                    members = await context.bot.get_chat_members(chat_id, offset=offset)
-                    if not members:
-                        break
-                    all_members.extend(members)
-                    offset += len(members)
-                    if len(members) < 200:
-                        break
-                
-                registered = 0
-                for member in all_members:
-                    if member.user.id == context.bot.id:
-                        continue
-                    
-                    user_id_member = member.user.id
-                    username = member.user.username or f"user_{user_id_member}"
-                    first_name = member.user.first_name or ""
-                    
-                    existing = await db.get_user_by_username(username, chat_id)
-                    
-                    if not existing:
-                        if group["type"] == "VIP":
-                            await db.register_user_auto(chat_id, user_id_member, username, first_name)
-                        else:
-                            with db.get_connection() as conn:
-                                with conn.cursor() as cur:
-                                    cur.execute("""
-                                    INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                    """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
-                                    conn.commit()
-                        registered += 1
-                
-                results.append(f"📌 {group_name}: {registered} nuevos")
-                total_registered += registered
-                
-            except Exception as e:
-                results.append(f"❌ {group_name}: Error - {e}")
-        
-        msg = f"✅ *Sincronización global completada*\n\n"
-        msg += "\n".join(results)
-        msg += f"\n\n📊 *Total nuevos registros:* {total_registered}"
-        
-        await update.message.reply_text(msg, parse_mode="Markdown")
 
 # ==================== INSTANCIA GLOBAL ====================
 db = Database(DATABASE_URL)
@@ -1695,6 +1550,153 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(msg, parse_mode="Markdown")
     await asyncio.sleep(2)
     await menu_edit_group_select(update, context)
+
+async def sync_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /syncgroup - Sincroniza todos los miembros del grupo actual"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Verificar permisos (Super Admin o Admin del grupo)
+    group = get_group_by_id(chat_id)
+    if not group:
+        await update.message.reply_text("❌ Este grupo no está configurado")
+        return
+    
+    if user_id != SUPER_ADMIN_ID and group["admin_id"] != user_id:
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    await update.message.reply_text("🔄 Sincronizando miembros del grupo... Esto puede tomar unos segundos.")
+    
+    try:
+        # Obtener todos los miembros del grupo
+        offset = 0
+        all_members = []
+        while True:
+            members = await context.bot.get_chat_members(chat_id, offset=offset)
+            if not members:
+                break
+            all_members.extend(members)
+            offset += len(members)
+            if len(members) < 200:
+                break
+        
+        print(f"🔴 Total miembros encontrados: {len(all_members)}")
+        
+        registered = 0
+        already_exists = 0
+        errors = 0
+        
+        for member in all_members:
+            if member.user.id == context.bot.id:
+                continue
+            
+            user_id_member = member.user.id
+            username = member.user.username or f"user_{user_id_member}"
+            first_name = member.user.first_name or ""
+            
+            # Verificar si ya existe en BD
+            existing = await db.get_user_by_username(username, chat_id)
+            
+            if not existing:
+                try:
+                    if group["type"] == "VIP":
+                        # Grupo VIP: registrar con trial
+                        await db.register_user_auto(chat_id, user_id_member, username, first_name)
+                    else:
+                        # Grupo FREE: registrar como potencial
+                        with db.get_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
+                                conn.commit()
+                    registered += 1
+                    print(f"🔴 Registrado: {username} ({user_id_member})")
+                except Exception as e:
+                    errors += 1
+                    print(f"🔴 Error registrando {username}: {e}")
+            else:
+                already_exists += 1
+        
+        msg = f"✅ *Sincronización completada*\n\n"
+        msg += f"📊 *Grupo:* {group['group_name']}\n"
+        msg += f"👥 *Miembros totales:* {len(all_members)}\n"
+        msg += f"🆕 *Nuevos registrados:* {registered}\n"
+        msg += f"📌 *Ya existían:* {already_exists}\n"
+        if errors > 0:
+            msg += f"⚠️ *Errores:* {errors}\n"
+        
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error durante la sincronización: {e}")
+        print(f"🔴 Error en sync_group: {e}")
+
+async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /syncall - Sincroniza TODOS los grupos (solo Super Admin)"""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo Super Admin")
+        return
+    
+    await update.message.reply_text("🔄 Sincronizando todos los grupos... Esto puede tomar varios minutos.")
+    
+    total_registered = 0
+    results = []
+    
+    for group in GROUPS:
+        chat_id = group["group_id"]
+        group_name = group["group_name"]
+        
+        try:
+            # Obtener miembros
+            offset = 0
+            all_members = []
+            while True:
+                members = await context.bot.get_chat_members(chat_id, offset=offset)
+                if not members:
+                    break
+                all_members.extend(members)
+                offset += len(members)
+                if len(members) < 200:
+                    break
+            
+            registered = 0
+            for member in all_members:
+                if member.user.id == context.bot.id:
+                    continue
+                
+                user_id_member = member.user.id
+                username = member.user.username or f"user_{user_id_member}"
+                first_name = member.user.first_name or ""
+                
+                existing = await db.get_user_by_username(username, chat_id)
+                
+                if not existing:
+                    if group["type"] == "VIP":
+                        await db.register_user_auto(chat_id, user_id_member, username, first_name)
+                    else:
+                        with db.get_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
+                                conn.commit()
+                    registered += 1
+            
+            results.append(f"📌 {group_name}: {registered} nuevos")
+            total_registered += registered
+            
+        except Exception as e:
+            results.append(f"❌ {group_name}: Error - {e}")
+    
+    msg = f"✅ *Sincronización global completada*\n\n"
+    msg += "\n".join(results)
+    msg += f"\n\n📊 *Total nuevos registros:* {total_registered}"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
