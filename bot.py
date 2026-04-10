@@ -244,6 +244,17 @@ class Database:
                 return cur.fetchone()
         return await self._run(_get)
 
+    async def get_user_by_id(self, user_id: int, group_id: int):
+        """Lookup por user_id+group_id — usa el índice idx_users_uid_gid, muy rápido."""
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT user_id FROM users WHERE user_id=%s AND group_id=%s LIMIT 1",
+                    (user_id, group_id)
+                )
+                return cur.fetchone()
+        return await self._run(_get)
+
     async def register_user_auto(self, group_id: int, user_id: int,
                                   username: str, first_name: str):
         now = datetime.now()
@@ -1326,6 +1337,76 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"No se pudo notificar al admin: {e}")
 
+
+async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Se dispara cuando cualquier usuario escribe en un grupo configurado.
+    Captura usuarios que estaban en el grupo antes del bot, o que entraron
+    mientras el bot estaba caído — no detectables via NEW_CHAT_MEMBERS.
+
+    - FREE: registra como cliente potencial y avisa al admin.
+    - VIP:  avisa al admin para que los active manualmente con /add.
+            NO se les da trial automático (podrían ser intrusos).
+    """
+    if not update.message or update.effective_chat.type not in ("group", "supergroup"):
+        return
+
+    chat_id = update.effective_chat.id
+    group   = get_group_by_id(chat_id)
+    if not group:
+        return
+
+    user       = update.effective_user
+    user_id    = user.id
+    username   = user.username or f"user_{user_id}"
+    first_name = user.first_name or ""
+
+    # Verificar si ya está registrado (usa índice user_id+group_id, muy rápido)
+    existing = await db.get_user_by_id(user_id, chat_id)
+    if existing:
+        return  # Ya conocido, no hacer nada
+
+    display_name = first_name if first_name else (
+        username if not username.startswith("user_") else f"Usuario {user_id}"
+    )
+    chat_link = f"tg://user?id={user_id}"
+
+    if group["type"] == "FREE":
+        is_new = await db.register_free_user(chat_id, user_id, username, first_name)
+        if is_new:
+            logger.info(f"📋 Potencial detectado en FREE {group['group_name']}: {display_name}")
+            try:
+                await context.bot.send_message(
+                    group["admin_id"],
+                    f"📋 *Nuevo cliente potencial detectado*\n\n"
+                    f"👤 *Nombre:* {display_name}\n"
+                    f"🆔 *ID:* `{user_id}`\n"
+                    f"📌 *Grupo:* {group['group_name']}\n"
+                    f"🔗 [Abrir chat]({chat_link})\n\n"
+                    f"_Registrado al escribir en el grupo._",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo notificar al admin (potencial): {e}")
+
+    else:  # VIP
+        # Avisar al admin — él decide si activar o expulsar
+        logger.info(f"⚠️ Sin registro en VIP {group['group_name']}: {display_name}")
+        try:
+            await context.bot.send_message(
+                group["admin_id"],
+                f"⚠️ *Usuario sin registro en grupo VIP*\n\n"
+                f"👤 *Nombre:* {display_name}\n"
+                f"🆔 *ID:* `{user_id}`\n"
+                f"📌 *Grupo:* {group['group_name']}\n"
+                f"🔗 [Abrir chat]({chat_link})\n\n"
+                f"Para activarlo usa:\n`/add @{username} semanal`\n"
+                f"Para expulsarlo: hazlo desde Telegram directamente.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo notificar al admin (VIP sin registro): {e}")
+
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID:
         await update.message.reply_text("❌ Solo Super Admin")
@@ -1428,170 +1509,42 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {e}")
 
 async def sync_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    group   = get_group_by_id(chat_id)
-    if not group:
-        await update.message.reply_text("❌ Este grupo no está configurado")
-        return
-    if user_id != SUPER_ADMIN_ID and group["admin_id"] != user_id:
-        await update.message.reply_text("❌ No autorizado")
-        return
-    await update.message.reply_text("🔄 Sincronizando miembros del grupo... Esto puede tomar unos segundos.")
-    try:
-        offset, all_members = 0, []
-        while True:
-            members = await context.bot.get_chat_members(chat_id, offset=offset)
-            if not members:
-                break
-            all_members.extend(members)
-            offset += len(members)
-            if len(members) < 200:
-                break
-        registered = already_exists = errors = 0
-        for member in all_members:
-            if member.user.id == context.bot.id:
-                continue
-            uid  = member.user.id
-            uname = member.user.username or f"user_{uid}"
-            fname = member.user.first_name or ""
-            existing = await db.get_user_by_username(uname, chat_id)
-            if not existing:
-                try:
-                    if group["type"] == "VIP":
-                        await db.register_user_auto(chat_id, uid, uname, fname)
-                    else:
-                        await db.register_free_user(chat_id, uid, uname, fname)
-                    registered += 1
-                except Exception as e:
-                    errors += 1
-                    logger.error(f"Error registrando {uname}: {e}")
-            else:
-                already_exists += 1
-        msg = (
-            f"✅ *Sincronización completada*\n\n"
-            f"📊 *Grupo:* {group['group_name']}\n"
-            f"👥 *Miembros totales:* {len(all_members)}\n"
-            f"🆕 *Nuevos registrados:* {registered}\n"
-            f"📌 *Ya existían:* {already_exists}\n"
-        )
-        if errors > 0:
-            msg += f"⚠️ *Errores:* {errors}\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error durante la sincronización: {e}")
-        logger.error(f"Error en sync_group: {e}")
+    """
+    NOTA: La API de Telegram eliminó get_chat_members para bots.
+    El registro de usuarios se hace automáticamente cuando entran al grupo
+    via detect_new_member(). Este comando informa sobre esa limitación.
+    """
+    await update.message.reply_text(
+        "ℹ️ *Sincronización manual no disponible*\n\n"
+        "La API de Telegram no permite a los bots listar todos los miembros de un grupo.\n\n"
+        "Los usuarios se registran automáticamente al *entrar al grupo*.\n"
+        "Para registrar un usuario manualmente usa:\n"
+        "`/add @username plan`",
+        parse_mode="Markdown"
+    )
 
 async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    La API de Telegram no permite listar miembros de grupos a bots.
+    Muestra resumen de usuarios activos por grupo.
+    """
     if update.effective_user.id != SUPER_ADMIN_ID:
         await update.message.reply_text("❌ Solo Super Admin")
         return
-    await update.message.reply_text("🔄 Sincronizando todos los grupos... Esto puede tomar varios minutos.")
-    total_registered, results = 0, []
+    msg = "📊 *Estado actual de grupos*\n\n"
     for group in GROUPS:
-        chat_id = group["group_id"]
-        try:
-            offset, all_members = 0, []
-            while True:
-                members = await context.bot.get_chat_members(chat_id, offset=offset)
-                if not members:
-                    break
-                all_members.extend(members)
-                offset += len(members)
-                if len(members) < 200:
-                    break
-            registered = 0
-            for member in all_members:
-                if member.user.id == context.bot.id:
-                    continue
-                uid   = member.user.id
-                uname = member.user.username or f"user_{uid}"
-                fname = member.user.first_name or ""
-                existing = await db.get_user_by_username(uname, chat_id)
-                if not existing:
-                    if group["type"] == "VIP":
-                        await db.register_user_auto(chat_id, uid, uname, fname)
-                    else:
-                        await db.register_free_user(chat_id, uid, uname, fname)
-                    registered += 1
-            results.append(f"📌 {group['group_name']}: {registered} nuevos")
-            total_registered += registered
-        except Exception as e:
-            results.append(f"❌ {group['group_name']}: Error - {e}")
-    msg = (
-        f"✅ *Sincronización global completada*\n\n"
-        + "\n".join(results)
-        + f"\n\n📊 *Total nuevos registros:* {total_registered}"
+        users = await db.get_all_active_users(group["group_id"])
+        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+        msg += f"{emoji} *{group['group_name']}*: {len(users)} usuarios activos\n"
+    msg += (
+        "\n\nℹ️ La API de Telegram no permite listar miembros de grupos.\n"
+        "Los usuarios se registran al *entrar al grupo* automáticamente."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def _sync_all_groups_silent():
-    global bot_app
-    if not bot_app:
-        return
-    logger.info("🔄 INICIANDO SINCRONIZACIÓN AUTOMÁTICA (24h)")
-    total_registered = 0
-    for group in GROUPS:
-        try:
-            chat_id    = group["group_id"]
-            group_type = group["type"]
-            admin_id   = group["admin_id"]
-            all_members, offset = [], 0
-            while True:
-                try:
-                    members = await bot_app.bot.get_chat_members(chat_id, offset=offset)
-                    if not members:
-                        break
-                    all_members.extend(members)
-                    offset += len(members)
-                    if len(members) < 200:
-                        break
-                except Exception as e:
-                    logger.warning(f"Error obteniendo miembros de {group['group_name']}: {e}")
-                    break
-            registered = 0
-            for member in all_members:
-                if member.user.id == bot_app.bot.id:
-                    continue
-                uid   = member.user.id
-                uname = member.user.username or f"user_{uid}"
-                fname = member.user.first_name or ""
-                existing = await db.get_user_by_username(uname, chat_id)
-                if not existing:
-                    try:
-                        if group_type == "VIP":
-                            await db.register_user_auto(chat_id, uid, uname, fname)
-                        else:
-                            await db.register_free_user(chat_id, uid, uname, fname)
-                        registered += 1
-                    except Exception as e:
-                        logger.error(f"Error registrando {uname}: {e}")
-            total_registered += registered
-            if registered > 0:
-                try:
-                    await bot_app.bot.send_message(
-                        admin_id,
-                        f"📊 *Sincronización automática - {group['group_name']}*\n\n🆕 Nuevos usuarios registrados: {registered}",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"Error sincronizando grupo {group.get('group_name', group_id)}: {e}")
-    logger.info(f"✅ Sincronización automática completada: {total_registered} nuevos usuarios")
-    if total_registered > 0:
-        try:
-            await bot_app.bot.send_message(
-                SUPER_ADMIN_ID,
-                f"📊 *Sincronización automática (24h)*\n\n🆕 Nuevos usuarios registrados: {total_registered}",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-async def scheduled_sync():
-    logger.info("🔄 Ejecutando sincronización programada...")
-    await _sync_all_groups_silent()
+# Nota: get_chat_members fue eliminado de la API de Telegram para bots.
+# El registro ocurre en detect_new_member() cuando los usuarios entran al grupo.
+# No hay sincronización automática en background.
 
 # ==================== CALLBACK HANDLER (con manejo de errores) ====================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1725,12 +1678,17 @@ async def main():
     bot_app.add_handler(CommandHandler("test",        test))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
+    # Detecta usuarios ya existentes en el grupo que nunca dispararon NEW_CHAT_MEMBERS
+    bot_app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+        detect_active_member
+    ))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
 
     # Tareas programadas
     scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
     scheduler.add_job(auto_backup,                 'interval', hours=24)
-    scheduler.add_job(scheduled_sync,              'interval', hours=24)
+    # scheduled_sync eliminado: get_chat_members no disponible en PTB v20+
     scheduler.start()
 
     logger.info("🤖 Bot iniciado")
@@ -1738,8 +1696,7 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
-    # Sincronización silenciosa al arrancar (en background para no retrasar el inicio)
-    asyncio.create_task(_sync_all_groups_silent())
+    # Registro de usuarios: ocurre via detect_new_member() en tiempo real
 
     await asyncio.Event().wait()
 
