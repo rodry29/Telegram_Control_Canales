@@ -1645,49 +1645,85 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def _sync_all_groups_silent():
-    """Sincronización automática sin enviar mensajes al chat (solo notifica al Super Admin al final)"""
+    """Sincronización automática sin enviar mensajes al chat (cada 24 horas)"""
+    global bot_app
+    
+    if not bot_app:
+        print("🔴 bot_app no disponible para sincronización")
+        return
+    
+    print("🔴 INICIANDO SINCRONIZACIÓN AUTOMÁTICA (24h)")
     total_registered = 0
+    
     for group in GROUPS:
         try:
             chat_id = group["group_id"]
+            group_name = group["group_name"]
+            print(f"🔴 Sincronizando grupo: {group_name}")
+            
+            # Método correcto para obtener miembros
             all_members = []
             offset = 0
+            
             while True:
-                members = await bot_app.bot.get_chat_members(chat_id, offset=offset)
-                if not members:
-                    break
-                all_members.extend(members)
-                offset += len(members)
-                if len(members) < 200:
+                try:
+                    # Usar el bot de la aplicación
+                    members = await bot_app.bot.get_chat_members(chat_id, offset=offset)
+                    if not members:
+                        break
+                    all_members.extend(members)
+                    offset += len(members)
+                    if len(members) < 200:
+                        break
+                except Exception as e:
+                    print(f"🔴 Error obteniendo miembros de {group_name}: {e}")
                     break
             
             registered = 0
             for member in all_members:
                 if member.user.id == bot_app.bot.id:
                     continue
+                
                 user_id_member = member.user.id
                 username = member.user.username or f"user_{user_id_member}"
                 first_name = member.user.first_name or ""
+                
                 existing = await db.get_user_by_username(username, chat_id)
+                
                 if not existing:
-                    if group["type"] == "VIP":
-                        await db.register_user_auto(chat_id, user_id_member, username, first_name)
-                    else:
-                        with db.get_connection() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute("""
-                                INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
-                                conn.commit()
-                    registered += 1
+                    try:
+                        if group["type"] == "VIP":
+                            await db.register_user_auto(chat_id, user_id_member, username, first_name)
+                        else:
+                            with db.get_connection() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("""
+                                    INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                    """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
+                                    conn.commit()
+                        registered += 1
+                        print(f"🔴 Registrado: {username} en {group_name}")
+                    except Exception as e:
+                        print(f"🔴 Error registrando {username}: {e}")
+            
             total_registered += registered
-            print(f"✅ {group['group_name']}: {registered} nuevos registros")
+            print(f"✅ {group_name}: {registered} nuevos registros")
+            
         except Exception as e:
-            print(f"❌ Error en grupo {group['group_name']}: {e}")
+            print(f"❌ Error en grupo {group_name}: {e}")
+    
+    print(f"✅ Sincronización automática completada: {total_registered} nuevos usuarios")
     
     if total_registered > 0:
-        await bot_app.bot.send_message(SUPER_ADMIN_ID, f"📊 *Sincronización automática*\n\n🆕 Nuevos usuarios registrados: {total_registered}", parse_mode="Markdown")
+        try:
+            await bot_app.bot.send_message(
+                SUPER_ADMIN_ID,
+                f"📊 *Sincronización automática (24h)*\n\n🆕 Nuevos usuarios registrados: {total_registered}",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
 
 async def scheduled_sync():
     """Sincronización programada (cada 24 horas)"""
