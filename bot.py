@@ -1310,6 +1310,20 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
                         conn.commit()
+
+                display_name = first_name if first_name else username if not username.startswith('user_') else f"Usuario {user_id}"
+                chat_link = f"tg://user?id={user_id}"
+                
+                await context.bot.send_message(
+                    group["admin_id"],
+                    f"📋 *Nuevo cliente potencial*\n\n"
+                    f"👤 *Nombre:* {display_name}\n"
+                    f"🆔 *ID:* `{user_id}`\n"
+                    f"📌 *Grupo:* {group['group_name']}\n"
+                    f"🔗 [Abrir chat]({chat_link})",
+                    parse_mode="Markdown"
+                )
+                print(f"🔴 Notificación enviada: {display_name}")
                 await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
                 
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1659,15 +1673,17 @@ async def _sync_all_groups_silent():
         try:
             chat_id = group["group_id"]
             group_name = group["group_name"]
+            group_type = group["type"]
+            admin_id = group["admin_id"]
+            
             print(f"🔴 Sincronizando grupo: {group_name}")
             
-            # Método correcto para obtener miembros
+            # Obtener todos los miembros del grupo
             all_members = []
             offset = 0
             
             while True:
                 try:
-                    # Usar el bot de la aplicación
                     members = await bot_app.bot.get_chat_members(chat_id, offset=offset)
                     if not members:
                         break
@@ -1679,6 +1695,8 @@ async def _sync_all_groups_silent():
                     print(f"🔴 Error obteniendo miembros de {group_name}: {e}")
                     break
             
+            print(f"🔴 Total miembros en {group_name}: {len(all_members)}")
+            
             registered = 0
             for member in all_members:
                 if member.user.id == bot_app.bot.id:
@@ -1688,11 +1706,12 @@ async def _sync_all_groups_silent():
                 username = member.user.username or f"user_{user_id_member}"
                 first_name = member.user.first_name or ""
                 
+                # Verificar si ya existe en BD
                 existing = await db.get_user_by_username(username, chat_id)
                 
                 if not existing:
                     try:
-                        if group["type"] == "VIP":
+                        if group_type == "VIP":
                             await db.register_user_auto(chat_id, user_id_member, username, first_name)
                         else:
                             with db.get_connection() as conn:
@@ -1703,18 +1722,30 @@ async def _sync_all_groups_silent():
                                     """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
                                     conn.commit()
                         registered += 1
-                        print(f"🔴 Registrado: {username} en {group_name}")
+                        print(f"🔴 Registrado: {first_name or username} ({user_id_member}) en {group_name}")
                     except Exception as e:
                         print(f"🔴 Error registrando {username}: {e}")
             
             total_registered += registered
-            print(f"✅ {group_name}: {registered} nuevos registros")
+            print(f"✅ {group_name}: {registered} nuevos registros (Total en BD: {len(all_members) - (registered - len(await db.get_all_active_users(chat_id)) if False else '?')})")
             
+            # Notificar al admin del grupo si hay nuevos registros
+            if registered > 0:
+                try:
+                    await bot_app.bot.send_message(
+                        admin_id,
+                        f"📊 *Sincronización automática - {group_name}*\n\n🆕 Nuevos usuarios registrados: {registered}",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+                
         except Exception as e:
             print(f"❌ Error en grupo {group_name}: {e}")
     
     print(f"✅ Sincronización automática completada: {total_registered} nuevos usuarios")
     
+    # Notificar al Super Admin
     if total_registered > 0:
         try:
             await bot_app.bot.send_message(
