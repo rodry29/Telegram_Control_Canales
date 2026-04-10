@@ -127,17 +127,6 @@ class Database:
                     user_id BIGINT NOT NULL,
                     group_id BIGINT NOT NULL,
                     username TEXT,
-                    plan TEXT NOT NULL,
-                    amount INTEGER NOT NULL,
-                    payment_date TIMESTAMP DEFAULT NOW()
-                )
-                """)
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    group_id BIGINT NOT NULL,
-                    username TEXT,
                     first_name TEXT,
                     plan TEXT NOT NULL,
                     amount INTEGER NOT NULL,
@@ -1057,54 +1046,6 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el número de clientes potenciales registrados en el mes"""
-    query = update.callback_query
-    await query.answer()
-    
-    group_id = context.user_data.get('current_group')
-    if not group_id:
-        await query.edit_message_text("❌ Selecciona un grupo con /start")
-        return
-    
-    group = get_group_by_id(group_id)
-    if not group or group.get("type") != "FREE":
-        await query.edit_message_text("❌ Este comando solo funciona en grupos FREE")
-        return
-    
-    now = datetime.now()
-    start_of_month = datetime(now.year, now.month, 1)
-    
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            # Contar clientes potenciales registrados este mes
-            cur.execute("""
-            SELECT COUNT(*) as count
-            FROM users 
-            WHERE group_id=%s 
-            AND status='potencial' 
-            AND created_at >= %s
-            """, (group_id, start_of_month))
-            result = cur.fetchone()
-            count_this_month = result[0] if result else 0
-            
-            # Contar total histórico
-            cur.execute("""
-            SELECT COUNT(*) as total
-            FROM users 
-            WHERE group_id=%s 
-            AND status='potencial'
-            """, (group_id,))
-            result_total = cur.fetchone()
-            total_all_time = result_total[0] if result_total else 0
-    
-    msg = f"📋 *CLIENTES POTENCIALES - {group['group_name']}*\n\n"
-    msg += f"📅 *Este mes:* {count_this_month} nuevos clientes\n"
-    msg += f"📊 *Total histórico:* {total_all_time} clientes\n\n"
-    msg += f"📌 *Registrados en {now.strftime('%B %Y')}:* {count_this_month}"
-    
-    await query.edit_message_text(msg, parse_mode="Markdown")
-
-async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra estadísticas de clientes potenciales"""
     query = update.callback_query
     await query.answer()
@@ -1357,12 +1298,14 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             print("🔴 Grupo FREE - solo registrar como cliente potencial")
-            existing = await db.register_user_auto(chat_id, user_id, username, first_name)
+            existing = await db.get_user_by_username(username, chat_id)
             if not existing:
                 with db.get_connection() as conn:
                     with conn.cursor() as cur:
-                        cur.execute("INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                                   (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
+                        cur.execute("""
+                        INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (user_id, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
                         conn.commit()
                 await context.bot.send_message(group["admin_id"], f"📋 Nuevo cliente potencial: @{username} en {group['group_name']}")
                 
@@ -1701,7 +1644,7 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scheduled_sync():
     """Sincronización programada (cada 24 horas)"""
     print("🔴 Ejecutando sincronización programada...")
-    await sync_all_groups_automatically()
+    await sync_all_groups(update=None, context=None)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1826,20 +1769,21 @@ async def main():
     bot_app.add_handler(CommandHandler("getlink", get_link))
     bot_app.add_handler(CommandHandler("syncgroup", sync_group))
     bot_app.add_handler(CommandHandler("syncall", sync_all_groups))
-    scheduler.add_job(check_expired_subscriptions, 'interval', hours=3)
+    
+    # Configurar tareas programadas UNA SOLA VEZ (hours=6 es el correcto)
+    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
+    scheduler.add_job(auto_backup, 'interval', hours=24)
+    scheduler.add_job(scheduled_sync, 'interval', hours=24)
     scheduler.start()
-    scheduler.add_job(auto_backup, 'interval', hours=24)  # Revisa cada 24 horas si es momento de backup
+    
     logger.info("🤖 Bot iniciado")
+    
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
-    await sync_all_groups_automatically()
     
-    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
-    scheduler.start()
-    scheduler.add_job(scheduled_sync, 'interval', hours=24)
-    scheduler.add_job(auto_backup, 'interval', hours=24)
-    logger.info("🤖 Bot iniciado")
+    # Sincronización automática al iniciar
+    await sync_all_groups_automatically()
     
     await asyncio.Event().wait()
 
