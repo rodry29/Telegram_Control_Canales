@@ -1644,36 +1644,31 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def sync_all_groups_automatically():
-    """Sincronización automática al iniciar el bot"""
-    global bot_app
-    print("🔴 SINCRONIZACIÓN AUTOMÁTICA INICIADA")
-    
+async def _sync_all_groups_silent():
+    """Sincronización automática sin enviar mensajes al chat (solo notifica al Super Admin al final)"""
+    total_registered = 0
     for group in GROUPS:
         try:
             chat_id = group["group_id"]
-            # ✅ Usar context.bot en lugar de bot_app.bot
-            # Pero como no tenemos context, usamos bot_app.bot correctamente
             all_members = []
             offset = 0
-            
             while True:
-                # ✅ FORMA CORRECTA
-                members = await bot_app.bot.get_chat_administrators(chat_id)
+                members = await bot_app.bot.get_chat_members(chat_id, offset=offset)
+                if not members:
+                    break
                 all_members.extend(members)
-                break  # Solo admins, no todos los miembros
+                offset += len(members)
+                if len(members) < 200:
+                    break
             
             registered = 0
             for member in all_members:
                 if member.user.id == bot_app.bot.id:
                     continue
-                
                 user_id_member = member.user.id
                 username = member.user.username or f"user_{user_id_member}"
                 first_name = member.user.first_name or ""
-                
                 existing = await db.get_user_by_username(username, chat_id)
-                
                 if not existing:
                     if group["type"] == "VIP":
                         await db.register_user_auto(chat_id, user_id_member, username, first_name)
@@ -1686,26 +1681,18 @@ async def sync_all_groups_automatically():
                                 """, (user_id_member, chat_id, username, first_name, "FREE", datetime.now(), datetime.now() + timedelta(days=365), "potencial", False))
                                 conn.commit()
                     registered += 1
-            
             total_registered += registered
             print(f"✅ {group['group_name']}: {registered} nuevos registros")
-            
         except Exception as e:
             print(f"❌ Error en grupo {group['group_name']}: {e}")
     
-    print(f"✅ Sincronización completada: {total_registered} nuevos usuarios")
-    
-    if total_registered > 0 and bot_app:
-        await bot_app.bot.send_message(
-            SUPER_ADMIN_ID,
-            f"📊 *Sincronización automática*\n\n🆕 Nuevos usuarios registrados: {total_registered}",
-            parse_mode="Markdown"
-        )
+    if total_registered > 0:
+        await bot_app.bot.send_message(SUPER_ADMIN_ID, f"📊 *Sincronización automática*\n\n🆕 Nuevos usuarios registrados: {total_registered}", parse_mode="Markdown")
 
 async def scheduled_sync():
     """Sincronización programada (cada 24 horas)"""
     print("🔴 Ejecutando sincronización programada...")
-    await sync_all_groups(update=None, context=None)
+    await _sync_all_groups_silent()
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1845,8 +1832,8 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
     
-    # Sincronización automática al iniciar
-    await sync_all_groups_automatically()
+    # Sincronización automática al iniciar (versión silenciosa)
+    await _sync_all_groups_silent()
     
     await asyncio.Event().wait()
 
