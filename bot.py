@@ -1033,24 +1033,122 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el número de clientes potenciales registrados en el mes"""
     query = update.callback_query
     await query.answer()
+    
     group_id = context.user_data.get('current_group')
     if not group_id:
         await query.edit_message_text("❌ Selecciona un grupo con /start")
         return
-    with db.get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT user_id, username, first_name, created_at FROM users WHERE group_id=%s AND status='potencial' ORDER BY created_at DESC", (group_id,))
-            clients = cur.fetchall()
-    if not clients:
-        await query.edit_message_text("📭 No hay clientes potenciales")
+    
+    group = get_group_by_id(group_id)
+    if not group or group.get("type") != "FREE":
+        await query.edit_message_text("❌ Este comando solo funciona en grupos FREE")
         return
-    msg = f"📋 *CLIENTES POTENCIALES*\n\n"
-    for c in clients[:30]:
-        msg += f"👤 @{c['username'] or c['user_id']}\n   📅 Registrado: {c['created_at'].strftime('%d/%m/%Y')}\n\n"
+    
+    now = datetime.now()
+    start_of_month = datetime(now.year, now.month, 1)
+    
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            # Contar clientes potenciales registrados este mes
+            cur.execute("""
+            SELECT COUNT(*) as count
+            FROM users 
+            WHERE group_id=%s 
+            AND status='potencial' 
+            AND created_at >= %s
+            """, (group_id, start_of_month))
+            result = cur.fetchone()
+            count_this_month = result[0] if result else 0
+            
+            # Contar total histórico
+            cur.execute("""
+            SELECT COUNT(*) as total
+            FROM users 
+            WHERE group_id=%s 
+            AND status='potencial'
+            """, (group_id,))
+            result_total = cur.fetchone()
+            total_all_time = result_total[0] if result_total else 0
+    
+    msg = f"📋 *CLIENTES POTENCIALES - {group['group_name']}*\n\n"
+    msg += f"📅 *Este mes:* {count_this_month} nuevos clientes\n"
+    msg += f"📊 *Total histórico:* {total_all_time} clientes\n\n"
+    msg += f"📌 *Registrados en {now.strftime('%B %Y')}:* {count_this_month}"
+    
     await query.edit_message_text(msg, parse_mode="Markdown")
 
+async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra estadísticas de clientes potenciales"""
+    query = update.callback_query
+    await query.answer()
+    
+    group_id = context.user_data.get('current_group')
+    if not group_id:
+        await query.edit_message_text("❌ Selecciona un grupo con /start")
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group or group.get("type") != "FREE":
+        await query.edit_message_text("❌ Este comando solo funciona en grupos FREE")
+        return
+    
+    now = datetime.now()
+    start_of_month = datetime(now.year, now.month, 1)
+    
+    # Calcular inicio del mes anterior
+    if now.month == 1:
+        start_last_month = datetime(now.year - 1, 12, 1)
+        end_last_month = datetime(now.year, 1, 1)
+    else:
+        start_last_month = datetime(now.year, now.month - 1, 1)
+        end_last_month = datetime(now.year, now.month, 1)
+    
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            # Este mes
+            cur.execute("""
+            SELECT COUNT(*) FROM users 
+            WHERE group_id=%s AND status='potencial' AND created_at >= %s
+            """, (group_id, start_of_month))
+            count_month = cur.fetchone()[0]
+            
+            # Mes anterior
+            cur.execute("""
+            SELECT COUNT(*) FROM users 
+            WHERE group_id=%s AND status='potencial' 
+            AND created_at >= %s AND created_at < %s
+            """, (group_id, start_last_month, end_last_month))
+            count_last_month = cur.fetchone()[0]
+            
+            # Total histórico
+            cur.execute("""
+            SELECT COUNT(*) FROM users 
+            WHERE group_id=%s AND status='potencial'
+            """, (group_id,))
+            total_all = cur.fetchone()[0]
+    
+    # Calcular crecimiento
+    if count_last_month > 0:
+        growth = ((count_month - count_last_month) / count_last_month) * 100
+        growth_emoji = "📈" if growth > 0 else "📉" if growth < 0 else "➖"
+        growth_text = f"{growth_emoji} {growth:+.1f}% vs mes anterior"
+    else:
+        if count_month > 0:
+            growth_text = "📊 Primer mes con registros"
+        else:
+            growth_text = "📊 Sin registros este mes"
+    
+    msg = f"📋 *CLIENTES POTENCIALES - {group['group_name']}*\n\n"
+    msg += f"📅 *{now.strftime('%B %Y')}:* {count_month} nuevos\n"
+    msg += f"📆 *Mes anterior:* {count_last_month}\n"
+    msg += f"📊 *Total histórico:* {total_all}\n\n"
+    msg += f"{growth_text}"
+    
+    await query.edit_message_text(msg, parse_mode="Markdown")
+    
 async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
