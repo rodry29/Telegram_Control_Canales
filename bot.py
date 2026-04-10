@@ -144,7 +144,7 @@ class Database:
                     payment_date TIMESTAMP DEFAULT NOW()
                 )
                 """)
-                 cur.execute("""
+                cur.execute("""
                 DO $$ 
                 BEGIN 
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
