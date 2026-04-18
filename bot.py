@@ -53,7 +53,8 @@ for _group_config in GROUPS_CONFIG.split(","):
                 "group_id":   int(_parts[0]),
                 "type":       _parts[1].upper(),
                 "group_name": _parts[2],
-                "admin_id":   int(_parts[3])
+                "admin_id":   int(_parts[3]),
+                "settings":   {}
             })
 
 # ==================== FUNCIONES DE UTILIDAD ====================
@@ -77,6 +78,31 @@ def can_manage_group(user_id: int, group_id: int) -> bool:
         return True
     group = get_group_by_id(group_id)
     return group and group["admin_id"] == user_id
+
+def get_group_plan_config(group_id: int, plan: str) -> dict:
+    """
+    Devuelve la configuración efectiva de un plan para un grupo específico.
+    Prioridad: configuración del grupo > PLANS global.
+    Retorna dict con keys: days, price, name
+    """
+    base   = dict(PLANS.get(plan, {}))   # copia para no mutar global
+    group  = get_group_by_id(group_id)
+    if not group or not base:
+        return base
+    settings = group.get("settings", {})
+    if plan == "trial":
+        if "trial_days" in settings:
+            base["days"]  = settings["trial_days"]
+            base["name"]  = f"🎁 Trial ({settings['trial_days']} día{'s' if settings['trial_days'] != 1 else ''})"
+    elif plan == "semanal":
+        if "price_semanal" in settings:
+            base["price"] = settings["price_semanal"]
+            base["name"]  = f"📅 Semanal (7 días) - ${settings['price_semanal']}"
+    elif plan == "mensual":
+        if "price_mensual" in settings:
+            base["price"] = settings["price_mensual"]
+            base["name"]  = f"📆 Mensual (30 días) - ${settings['price_mensual']}"
+    return base
 
 # ==================== BASE DE DATOS (con pool de conexiones) ====================
 class Database:
@@ -196,7 +222,8 @@ class Database:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT group_id, group_name, admin_id,
-                           COALESCE(group_type, 'VIP') as group_type
+                           COALESCE(group_type, 'VIP') as group_type,
+                           COALESCE(settings, '{}') as settings
                     FROM groups
                 """)
                 return cur.fetchall()
@@ -204,11 +231,13 @@ class Database:
         if rows:
             GROUPS.clear()
             for g in rows:
+                settings = g["settings"] if isinstance(g["settings"], dict) else {}
                 GROUPS.append({
                     "group_id":   g["group_id"],
                     "group_name": g["group_name"],
                     "admin_id":   g["admin_id"],
-                    "type":       g["group_type"]
+                    "type":       g["group_type"],
+                    "settings":   settings   # {"trial_days":1, "price_semanal":10, "price_mensual":20}
                 })
             logger.info(f"📦 {len(GROUPS)} grupos cargados desde BD")
             return True
@@ -259,6 +288,7 @@ class Database:
                                   username: str, first_name: str):
         now = datetime.now()
 
+        trial_cfg = get_group_plan_config(group_id, "trial")
         def _register(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -267,7 +297,7 @@ class Database:
                 )
                 existing = cur.fetchone()
                 if not existing:
-                    end_date = now + timedelta(days=PLANS["trial"]["days"])
+                    end_date = now + timedelta(days=trial_cfg["days"])
                     cur.execute("""
                         INSERT INTO users
                             (user_id, group_id, username, first_name, plan,
@@ -310,7 +340,7 @@ class Database:
         now = datetime.now()
         if plan not in PLANS:
             return False, "❌ Plan inválido"
-        config = PLANS[plan]
+        config = get_group_plan_config(group_id, plan)
 
         def _add(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -484,7 +514,7 @@ class Database:
         return await self._run(_get)
 
     async def update_group_fields(self, group_id: int, changes: dict):
-        """Aplica cambios de nombre/admin/tipo en una sola transacción."""
+        """Aplica cambios de nombre/admin/tipo/settings en una sola transacción."""
         if not changes:
             return
 
@@ -499,6 +529,12 @@ class Database:
                 if 'type' in changes:
                     cur.execute("UPDATE groups SET group_type=%s WHERE group_id=%s",
                                 (changes['type'], group_id))
+                if 'settings' in changes:
+                    import json
+                    cur.execute(
+                        "UPDATE groups SET settings=%s WHERE group_id=%s",
+                        (json.dumps(changes['settings']), group_id)
+                    )
 
         await self._run(_upd)
 
@@ -565,14 +601,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group = user_groups[0]
         context.user_data['current_group'] = group['group_id']
         if group.get("type", "VIP") == "VIP":
+            cfg_t = get_group_plan_config(group['group_id'], "trial")
+            cfg_s = get_group_plan_config(group['group_id'], "semanal")
+            cfg_m = get_group_plan_config(group['group_id'], "mensual")
             keyboard = [
                 [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
                 [InlineKeyboardButton("💰 Ganancias",        callback_data="earnings")],
-                [InlineKeyboardButton("📥 Exportar mes",     callback_data="export_month")]
+                [InlineKeyboardButton("📥 Exportar mes",     callback_data="export_month")],
+                [InlineKeyboardButton("⚙️ Precios y Trial",  callback_data=f"cfg_group_{group['group_id']}")]
             ]
             await send(
                 f"👑 *Panel VIP - {group['group_name']}*\n\n"
                 f"🆔 ID del grupo: `{group['group_id']}`\n\n"
+                f"💡 *Tarifas actuales:*\n"
+                f"• ⏱ Trial: {cfg_t['days']} día(s)\n"
+                f"• 📅 Semanal: ${cfg_s['price']}\n"
+                f"• 📆 Mensual: ${cfg_m['price']}\n\n"
                 f"Comandos disponibles:\n"
                 f"• `/add @usuario plan` - Agregar suscripción\n"
                 f"• Los usuarios expiran automáticamente",
@@ -646,16 +690,24 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
         return
     context.user_data['current_group'] = group_id
     if group.get("type", "VIP") == "VIP":
+        cfg    = get_group_plan_config(group_id, "trial")
         keyboard = [
             [InlineKeyboardButton("➕ Agregar usuario",  callback_data="add_user")],
             [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
             [InlineKeyboardButton("💰 Ganancias",        callback_data="earnings")],
-            [InlineKeyboardButton("📥 Exportar mes",     callback_data="export_month")]
+            [InlineKeyboardButton("📥 Exportar mes",     callback_data="export_month")],
+            [InlineKeyboardButton("⚙️ Precios y Trial",  callback_data=f"cfg_group_{group_id}")]
         ]
+        cfg_s = get_group_plan_config(group_id, "semanal")
+        cfg_m = get_group_plan_config(group_id, "mensual")
         await query.edit_message_text(
             f"👑 *Panel VIP - {group['group_name']}*\n\n"
             f"🆔 ID: `{group['group_id']}`\n"
-            f"👑 Admin: `{group['admin_id']}`",
+            f"👑 Admin: `{group['admin_id']}`\n\n"
+            f"💡 *Tarifas actuales:*\n"
+            f"• ⏱ Trial: {cfg['days']} día(s)\n"
+            f"• 📅 Semanal: ${cfg_s['price']}\n"
+            f"• 📆 Mensual: ${cfg_m['price']}",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -1407,6 +1459,128 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logger.warning(f"No se pudo notificar al admin (VIP sin registro): {e}")
 
+
+# ==================== CONFIGURACIÓN DE PRECIOS Y TRIAL POR GRUPO ====================
+
+async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Menú principal de configuración de un grupo (precios y trial)."""
+    query = update.callback_query
+    await query.answer()
+
+    group    = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+
+    settings = group.get("settings", {})
+    cfg_trial   = get_group_plan_config(group_id, "trial")
+    cfg_semanal = get_group_plan_config(group_id, "semanal")
+    cfg_mensual = get_group_plan_config(group_id, "mensual")
+
+    keyboard = [
+        [InlineKeyboardButton(f"⏱ Trial: {cfg_trial['days']} día(s)",      callback_data=f"cfg_trial_{group_id}")],
+        [InlineKeyboardButton(f"💲 Semanal: ${cfg_semanal['price']}",       callback_data=f"cfg_price_semanal_{group_id}")],
+        [InlineKeyboardButton(f"💲 Mensual: ${cfg_mensual['price']}",       callback_data=f"cfg_price_mensual_{group_id}")],
+        [InlineKeyboardButton("🔙 Volver",                                   callback_data=f"select_group_{group_id}")]
+    ]
+    await query.edit_message_text(
+        f"⚙️ *Configuración - {group['group_name']}*\n\n"
+        f"Ajusta los precios y duración del trial para este grupo.\n"
+        f"Los cambios aplican inmediatamente a nuevas suscripciones.\n\n"
+        f"• ⏱ *Trial:* {cfg_trial['days']} día(s)\n"
+        f"• 📅 *Semanal:* ${cfg_semanal['price']}\n"
+        f"• 📆 *Mensual:* ${cfg_mensual['price']}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def cfg_trial_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Solicita nueva duración del trial."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['cfg_field']    = 'trial_days'
+    context.user_data['cfg_group_id'] = group_id
+    cfg = get_group_plan_config(group_id, "trial")
+    await query.edit_message_text(
+        f"⏱ *Cambiar duración del Trial*\n\n"
+        f"Valor actual: *{cfg['days']} día(s)*\n\n"
+        f"Envía el nuevo número de días (ej: `3`)\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def cfg_price_request(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                             group_id: int, plan: str):
+    """Solicita nuevo precio para semanal o mensual."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['cfg_field']    = f'price_{plan}'
+    context.user_data['cfg_group_id'] = group_id
+    cfg       = get_group_plan_config(group_id, plan)
+    plan_name = "Semanal (7 días)" if plan == "semanal" else "Mensual (30 días)"
+    await query.edit_message_text(
+        f"💲 *Cambiar precio {plan_name}*\n\n"
+        f"Valor actual: *${cfg['price']}*\n\n"
+        f"Envía el nuevo precio en dólares (ej: `15`)\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa el valor ingresado para trial_days o price_plan."""
+    if update.effective_chat.type != "private":
+        return
+    field    = context.user_data.get('cfg_field')
+    group_id = context.user_data.get('cfg_group_id')
+    if not field or not group_id:
+        return
+    if not can_manage_group(update.effective_user.id, group_id):
+        return
+
+    text = update.message.text.strip()
+    if text.lower() == 'cancelar':
+        context.user_data.pop('cfg_field', None)
+        context.user_data.pop('cfg_group_id', None)
+        await update.message.reply_text("❌ Configuración cancelada")
+        return
+
+    try:
+        value = int(text)
+        if value <= 0:
+            raise ValueError("debe ser positivo")
+    except ValueError:
+        await update.message.reply_text("❌ Ingresa un número entero positivo (ej: `5`)", parse_mode="Markdown")
+        return
+
+    # Actualizar settings en memoria
+    group    = get_group_by_id(group_id)
+    settings = dict(group.get("settings", {}))
+    settings[field] = value
+    group["settings"] = settings
+
+    # Persistir en BD
+    await db.update_group_fields(group_id, {'settings': settings})
+
+    context.user_data.pop('cfg_field', None)
+    context.user_data.pop('cfg_group_id', None)
+
+    # Mensaje de confirmación
+    if field == "trial_days":
+        label = f"Trial: *{value} día(s)*"
+    elif field == "price_semanal":
+        label = f"Semanal: *${value}*"
+    elif field == "price_mensual":
+        label = f"Mensual: *${value}*"
+    else:
+        label = f"{field}: *{value}*"
+
+    await update.message.reply_text(
+        f"✅ *Configuración actualizada*\n\n"
+        f"• {label}\n\n"
+        f"El cambio aplica a todas las nuevas suscripciones del grupo *{group['group_name']}*.",
+        parse_mode="Markdown"
+    )
+
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID:
         await update.message.reply_text("❌ Solo Super Admin")
@@ -1430,6 +1604,10 @@ async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Primero procesar input de configuración de precios/trial (cualquier admin)
+    if context.user_data.get('cfg_field') and context.user_data.get('cfg_group_id'):
+        await handle_cfg_input(update, context)
+        return
     if update.effective_user.id != SUPER_ADMIN_ID:
         return
     text = update.message.text.strip()
@@ -1625,6 +1803,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("edit_multiple_"):
             group_id = int(data.replace("edit_multiple_", ""))
             await edit_group_multiple(update, context, group_id)
+        # ── Configuración de precios y trial ──
+        elif data.startswith("cfg_group_"):
+            group_id = int(data.replace("cfg_group_", ""))
+            await menu_group_settings(update, context, group_id)
+        elif data.startswith("cfg_trial_"):
+            group_id = int(data.replace("cfg_trial_", ""))
+            await cfg_trial_request(update, context, group_id)
+        elif data.startswith("cfg_price_semanal_"):
+            group_id = int(data.replace("cfg_price_semanal_", ""))
+            await cfg_price_request(update, context, group_id, "semanal")
+        elif data.startswith("cfg_price_mensual_"):
+            group_id = int(data.replace("cfg_price_mensual_", ""))
+            await cfg_price_request(update, context, group_id, "mensual")
         else:
             logger.warning(f"Callback desconocido: {data}")
 
