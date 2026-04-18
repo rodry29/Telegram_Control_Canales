@@ -36,10 +36,15 @@ if not DATABASE_URL:
     logger.critical("❌ ERROR: No se encontró DATABASE_URL")
     exit(1)
 
+# Duración base de planes:
+#  - trial: en MINUTOS (configurable por grupo via settings["trial_minutes"])
+#  - semanal/mensual: en DÍAS (configurable via settings["duration_semanal"] / "duration_mensual"])
+# Precio: configurable por grupo (settings) Y por transacción (/add @user plan precio)
+# amount en BD: NUMERIC(10,2) — soporta centavos (5.99, 3.99, etc.)
 PLANS = {
-    "trial":   {"days": 1,  "price": 0,  "name": "🎁 Trial (1 día)"},
-    "semanal": {"days": 7,  "price": 10, "name": "📅 Semanal (7 días)"},
-    "mensual": {"days": 30, "price": 20, "name": "📆 Mensual (30 días)"}
+    "trial":   {"minutes": 1440, "price": 0,  "name": "🎁 Trial (1 día)"},
+    "semanal": {"days": 7,       "price": 10, "name": "📅 Semanal (7 días)"},
+    "mensual": {"days": 30,      "price": 20, "name": "📆 Mensual (30 días)"}
 }
 
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
@@ -81,28 +86,54 @@ def can_manage_group(user_id: int, group_id: int) -> bool:
 
 def get_group_plan_config(group_id: int, plan: str) -> dict:
     """
-    Devuelve la configuración efectiva de un plan para un grupo específico.
-    Prioridad: configuración del grupo > PLANS global.
-    Retorna dict con keys: days, price, name
+    Devuelve la configuración efectiva de un plan para un grupo.
+    Prioridad: settings del grupo > PLANS global.
+
+    Trial → duración en MINUTOS  (settings["trial_minutes"])
+    Semanal/Mensual → duración en DÍAS (settings["duration_semanal/mensual"])
+                    → precio base en $ con centavos (settings["price_semanal/mensual"])
+    El precio base es solo referencia; /add permite precio por transacción.
     """
-    base   = dict(PLANS.get(plan, {}))   # copia para no mutar global
-    group  = get_group_by_id(group_id)
+    base     = dict(PLANS.get(plan, {}))
+    group    = get_group_by_id(group_id)
     if not group or not base:
         return base
     settings = group.get("settings", {})
+
     if plan == "trial":
-        if "trial_days" in settings:
-            base["days"]  = settings["trial_days"]
-            base["name"]  = f"🎁 Trial ({settings['trial_days']} día{'s' if settings['trial_days'] != 1 else ''})"
+        mins = settings.get("trial_minutes", base.get("minutes", 1440))
+        base["minutes"] = mins
+        h, m = divmod(mins, 60)
+        if h >= 24:
+            d = h // 24; base["name"] = f"🎁 Trial ({d} día{'s' if d != 1 else ''})"
+        elif h > 0:
+            base["name"] = f"🎁 Trial ({h}h {m}m)" if m else f"🎁 Trial ({h}h)"
+        else:
+            base["name"] = f"🎁 Trial ({m} min)"
     elif plan == "semanal":
-        if "price_semanal" in settings:
-            base["price"] = settings["price_semanal"]
-            base["name"]  = f"📅 Semanal (7 días) - ${settings['price_semanal']}"
+        base["days"]  = settings.get("duration_semanal", base.get("days", 7))
+        base["price"] = float(settings.get("price_semanal", base.get("price", 10)))
+        base["name"]  = f"📅 Semanal ({base['days']} días) - ${base['price']:.2f}"
     elif plan == "mensual":
-        if "price_mensual" in settings:
-            base["price"] = settings["price_mensual"]
-            base["name"]  = f"📆 Mensual (30 días) - ${settings['price_mensual']}"
+        base["days"]  = settings.get("duration_mensual", base.get("days", 30))
+        base["price"] = float(settings.get("price_mensual", base.get("price", 20)))
+        base["name"]  = f"📆 Mensual ({base['days']} días) - ${base['price']:.2f}"
     return base
+
+def fmt_price(amount) -> str:
+    """Formatea precio: muestra centavos solo si son distintos de 00."""
+    f = float(amount)
+    return f"${f:.2f}" if f != int(f) else f"${int(f)}"
+
+def fmt_minutes(mins: int) -> str:
+    """Convierte minutos a string legible."""
+    h, m = divmod(mins, 60)
+    if h >= 24:
+        d = h // 24
+        return f"{d} día{'s' if d != 1 else ''}"
+    elif h > 0:
+        return f"{h}h {m}m" if m else f"{h}h"
+    return f"{m} min"
 
 # ==================== BASE DE DATOS (con pool de conexiones) ====================
 class Database:
@@ -199,15 +230,35 @@ class Database:
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS payments (
-                        id           SERIAL PRIMARY KEY,
-                        user_id      BIGINT NOT NULL,
-                        group_id     BIGINT NOT NULL,
-                        username     TEXT,
-                        first_name   TEXT,
-                        plan         TEXT NOT NULL,
-                        amount       INTEGER NOT NULL,
-                        payment_date TIMESTAMP DEFAULT NOW()
+                        id              SERIAL PRIMARY KEY,
+                        user_id         BIGINT NOT NULL,
+                        group_id        BIGINT NOT NULL,
+                        username        TEXT,
+                        first_name      TEXT,
+                        plan            TEXT NOT NULL,
+                        amount          NUMERIC(10,2) NOT NULL,
+                        duration_minutes INTEGER,
+                        payment_date    TIMESTAMP DEFAULT NOW()
                     )
+                """)
+                # Migración: si la columna amount ya existe como INTEGER, convertirla
+                cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='payments' AND column_name='amount'
+                            AND data_type='integer'
+                        ) THEN
+                            ALTER TABLE payments ALTER COLUMN amount TYPE NUMERIC(10,2);
+                        END IF;
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='payments' AND column_name='duration_minutes'
+                        ) THEN
+                            ALTER TABLE payments ADD COLUMN duration_minutes INTEGER;
+                        END IF;
+                    END $$;
                 """)
                 # Índices para queries frecuentes con 10k usuarios
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group    ON users(group_id, status)")
@@ -289,6 +340,7 @@ class Database:
         now = datetime.now()
 
         trial_cfg = get_group_plan_config(group_id, "trial")
+        trial_minutes = trial_cfg.get("minutes", 1440)
         def _register(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -297,7 +349,7 @@ class Database:
                 )
                 existing = cur.fetchone()
                 if not existing:
-                    end_date = now + timedelta(days=trial_cfg["days"])
+                    end_date = now + timedelta(minutes=trial_minutes)
                     cur.execute("""
                         INSERT INTO users
                             (user_id, group_id, username, first_name, plan,
@@ -306,9 +358,11 @@ class Database:
                     """, (user_id, group_id, username, first_name, "trial", now, end_date, True))
                     cur.execute("""
                         INSERT INTO payments
-                            (user_id, group_id, username, first_name, plan, amount, payment_date)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s)
-                    """, (user_id, group_id, username, first_name, "trial", 0, now))
+                            (user_id, group_id, username, first_name, plan,
+                             amount, duration_minutes, payment_date)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (user_id, group_id, username, first_name, "trial",
+                          0, trial_minutes, now))
                     return True, "trial_nuevo"
                 elif existing['status'] == 'active' and existing['end_date'] > now:
                     cur.execute(
@@ -336,11 +390,24 @@ class Database:
         return await self._run(_reg)
 
     async def add_or_update_user(self, group_id: int, username: str,
-                                  plan: str, first_name: str = ""):
+                                  plan: str, first_name: str = "",
+                                  custom_price: float = None,
+                                  custom_days: int = None):
+        """
+        custom_price: precio específico para esta transacción (ej: 5.99)
+                      Si es None, usa el precio del grupo o el global.
+        custom_days:  duración en días para esta transacción (planes pagos)
+                      Si es None, usa la duración del grupo o la global.
+        """
         now = datetime.now()
         if plan not in PLANS:
             return False, "❌ Plan inválido"
         config = get_group_plan_config(group_id, plan)
+
+        # Aplicar overrides por transacción
+        effective_price = custom_price if custom_price is not None else config.get('price', 0)
+        effective_days  = custom_days  if custom_days  is not None else config.get('days', 7)
+        effective_mins  = config.get('minutes', effective_days * 1440)  # para trial
 
         def _add(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -352,7 +419,14 @@ class Database:
                 if existing:
                     if plan == "trial" and existing['trial_used']:
                         return False, "❌ Este usuario ya usó su prueba gratuita"
-                    end_date = now + timedelta(days=config['days'])
+                    if plan == "trial":
+                        end_date     = now + timedelta(minutes=effective_mins)
+                        dur_minutes  = effective_mins
+                        expiry_str   = end_date.strftime('%d/%m/%Y %H:%M')
+                    else:
+                        end_date     = now + timedelta(days=effective_days)
+                        dur_minutes  = effective_days * 1440
+                        expiry_str   = end_date.strftime('%d/%m/%Y')
                     fn = first_name or existing.get('first_name', '')
                     cur.execute("""
                         UPDATE users SET
@@ -364,11 +438,17 @@ class Database:
                           plan == "trial", existing['user_id'], group_id))
                     cur.execute("""
                         INSERT INTO payments
-                            (user_id, group_id, username, first_name, plan, amount, payment_date)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            (user_id, group_id, username, first_name, plan,
+                             amount, duration_minutes, payment_date)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                     """, (existing['user_id'], group_id, username, fn,
-                          plan, config['price'], now))
-                    return True, f"✅ @{username} activado con {config['name']}\n📅 Expira: {end_date.strftime('%d/%m/%Y')}"
+                          plan, effective_price, dur_minutes, now))
+                    price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
+                    return True, (
+                        f"✅ *@{username}* activado\n"
+                        f"📋 Plan: {plan} | 💰 {price_str}\n"
+                        f"📅 Expira: {expiry_str}"
+                    )
                 return False, f"❌ No tengo registro de @{username}. Pídele que envíe un mensaje al bot."
 
         return await self._run(_add)
@@ -407,7 +487,8 @@ class Database:
                 new_users = cur.fetchone()['new_users']
                 # últimos 10 pagos
                 cur.execute("""
-                    SELECT user_id, username, first_name, plan, amount, payment_date
+                    SELECT user_id, username, first_name, plan, amount,
+                           duration_minutes, payment_date
                     FROM payments
                     WHERE group_id=%s AND payment_date >= date_trunc('month', NOW())
                     ORDER BY payment_date DESC
@@ -504,7 +585,8 @@ class Database:
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT user_id, username, first_name, plan, amount, payment_date
+                    SELECT user_id, username, first_name, plan, amount,
+                           duration_minutes, payment_date
                     FROM payments
                     WHERE group_id=%s AND payment_date>=%s
                     ORDER BY payment_date DESC
@@ -601,9 +683,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group = user_groups[0]
         context.user_data['current_group'] = group['group_id']
         if group.get("type", "VIP") == "VIP":
-            cfg_t = get_group_plan_config(group['group_id'], "trial")
-            cfg_s = get_group_plan_config(group['group_id'], "semanal")
-            cfg_m = get_group_plan_config(group['group_id'], "mensual")
+            cfg_t = get_group_plan_config(group["group_id"], "trial")
+            cfg_s = get_group_plan_config(group["group_id"], "semanal")
+            cfg_m = get_group_plan_config(group["group_id"], "mensual")
             keyboard = [
                 [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
                 [InlineKeyboardButton("💰 Ganancias",        callback_data="earnings")],
@@ -614,7 +696,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👑 *Panel VIP - {group['group_name']}*\n\n"
                 f"🆔 ID del grupo: `{group['group_id']}`\n\n"
                 f"💡 *Tarifas actuales:*\n"
-                f"• ⏱ Trial: {cfg_t['days']} día(s)\n"
+                f"• ⏱ Trial: {fmt_minutes(cfg_t.get('minutes', 1440))}\n"
                 f"• 📅 Semanal: ${cfg_s['price']}\n"
                 f"• 📆 Mensual: ${cfg_m['price']}\n\n"
                 f"Comandos disponibles:\n"
@@ -705,7 +787,7 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             f"🆔 ID: `{group['group_id']}`\n"
             f"👑 Admin: `{group['admin_id']}`\n\n"
             f"💡 *Tarifas actuales:*\n"
-            f"• ⏱ Trial: {cfg['days']} día(s)\n"
+            f"• ⏱ Trial: {fmt_minutes(cfg.get('minutes', 1440))}\n"
             f"• 📅 Semanal: ${cfg_s['price']}\n"
             f"• 📆 Mensual: ${cfg_m['price']}",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -742,8 +824,8 @@ async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id     = update.effective_user.id
-    chat_id     = update.effective_chat.id
+    user_id       = update.effective_user.id
+    chat_id       = update.effective_chat.id
     current_group = context.user_data.get('current_group')
     if not current_group:
         group = get_group_by_id(chat_id)
@@ -756,16 +838,49 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No autorizado")
         return
     if len(context.args) < 2:
+        cfg_t = get_group_plan_config(current_group, "trial")
+        cfg_s = get_group_plan_config(current_group, "semanal")
+        cfg_m = get_group_plan_config(current_group, "mensual")
         await update.message.reply_text(
-            "❌ Usa: `/add @username plan`\nPlanes: trial, semanal, mensual",
+            "❌ *Uso:* `/add @username plan [precio] [días]`\n\n"
+            "*Planes disponibles:*\n"
+            f"• `trial`   — {cfg_t['name']}\n"
+            f"• `semanal` — {cfg_s['name']}\n"
+            f"• `mensual` — {cfg_m['name']}\n\n"
+            "*Ejemplos:*\n"
+            "`/add @juan semanal`          → precio del grupo\n"
+            "`/add @juan semanal 5.99`     → precio custom\n"
+            "`/add @juan semanal 5.99 10`  → precio y días custom",
             parse_mode="Markdown"
         )
         return
+
     username = context.args[0].replace("@", "")
     plan     = context.args[1].lower()
     if plan not in PLANS:
         await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal, mensual")
         return
+
+    # Parámetros opcionales: precio y días por transacción
+    custom_price = None
+    custom_days  = None
+    if len(context.args) >= 3:
+        try:
+            custom_price = float(context.args[2].replace(",", "."))
+            if custom_price < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Precio inválido. Usa punto o coma decimal (ej: `5.99`)", parse_mode="Markdown")
+            return
+    if len(context.args) >= 4:
+        try:
+            custom_days = int(context.args[3])
+            if custom_days <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Días inválidos. Debe ser un número entero positivo.", parse_mode="Markdown")
+            return
+
     first_name = ""
     try:
         member = await context.bot.get_chat_member(current_group, username)
@@ -773,8 +888,11 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             first_name = member.user.first_name or ""
     except Exception:
         pass
-    success, msg = await db.add_or_update_user(current_group, username, plan, first_name)
-    await update.message.reply_text(msg)
+
+    success, msg = await db.add_or_update_user(
+        current_group, username, plan, first_name, custom_price, custom_days
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -788,19 +906,34 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("📭 No hay usuarios activos")
         return
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
+    now = datetime.now()
     for user in users[:30]:
-        days_left  = int(user['days_left']) if user['days_left'] else 0
-        emoji      = "🟢" if days_left > 7 else "🟡" if days_left > 2 else "🔴"
+        end_date   = user['end_date']
+        remaining  = end_date - now
+        total_mins = int(remaining.total_seconds() / 60)
+        if total_mins < 0:
+            total_mins = 0
+        days_left  = total_mins // 1440
+        # Ícono según tiempo restante
+        emoji = "🟢" if days_left > 7 else "🟡" if days_left > 1 else "🔴"
+        # Texto de expiración legible
+        if total_mins < 60:
+            expiry_text = f"{total_mins} min restantes"
+            expiry_date = end_date.strftime('%d/%m/%Y %H:%M')
+        elif total_mins < 1440:
+            h = total_mins // 60; m = total_mins % 60
+            expiry_text = f"{h}h {m}m restantes" if m else f"{h}h restantes"
+            expiry_date = end_date.strftime('%d/%m/%Y %H:%M')
+        else:
+            expiry_text = f"{days_left} días restantes"
+            expiry_date = end_date.strftime('%d/%m/%Y')
         first_name = user.get('first_name', '') or 'Sin nombre'
         username   = user.get('username', '')
-        if username and not username.startswith('user_'):
-            display = f"{first_name} (@{username})"
-        else:
-            display = f"{first_name} (ID: `{user['user_id']}`)"
-        chat_link = f"tg://user?id={user['user_id']}"
+        display    = f"{first_name} (@{username})" if username and not username.startswith('user_') else f"{first_name} (ID: `{user['user_id']}`)"
+        chat_link  = f"tg://user?id={user['user_id']}"
         msg += (
             f"{emoji} {display}\n"
-            f"   📅 Expira: {user['end_date'].strftime('%d/%m/%Y')} ({days_left} días)\n"
+            f"   📅 Expira: {expiry_date} ({expiry_text})\n"
             f"   📋 Plan: {user['plan']}\n"
             f"   🔗 [Abrir chat]({chat_link})\n\n"
         )
@@ -821,13 +954,14 @@ async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         for plan in earnings['summary']:
             plan_name = PLANS.get(plan['plan'], {}).get('name', plan['plan'])
-            msg += f"• {plan_name}: {plan['count']} ventas - ${plan['total']}\n"
-        msg += f"\n💵 *TOTAL*: ${earnings['total']}\n👥 *Nuevos*: {earnings['new_users']}"
+            msg += f"• {plan_name}: {plan['count']} ventas - {fmt_price(plan['total'])}\n"
+        msg += f"\n💵 *TOTAL*: {fmt_price(earnings['total'])}\n👥 *Nuevos*: {earnings['new_users']}"
     if earnings.get('recent'):
         msg += "\n\n📋 *Últimos pagos:*\n"
         for p in earnings['recent']:
-            name = p['first_name'] or p['username'] or f"ID:{p['user_id']}"
-            msg += f"• {name} - {p['plan']} - ${p['amount']}\n"
+            name     = p['first_name'] or p['username'] or f"ID:{p['user_id']}"
+            dur_str  = f" ({fmt_minutes(p['duration_minutes'])})" if p.get('duration_minutes') else ""
+            msg += f"• {name} - {p['plan']}{dur_str} - {fmt_price(p['amount'])}\n"
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -844,15 +978,17 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Fecha', 'User ID', 'Username', 'Nombre', 'Plan', 'Monto', 'Link de contacto'])
+    writer.writerow(['Fecha', 'User ID', 'Username', 'Nombre', 'Plan', 'Duración', 'Monto USD', 'Link de contacto'])
     for t in transactions:
+        dur = fmt_minutes(t['duration_minutes']) if t.get('duration_minutes') else ""
         writer.writerow([
             t['payment_date'].strftime('%Y-%m-%d %H:%M:%S'),
             t['user_id'],
             t['username'] or 'Sin username',
             t['first_name'] or 'Sin nombre',
             t['plan'].upper(),
-            f"${t['amount']}",
+            dur,
+            f"{float(t['amount']):.2f}",
             f"tg://user?id={t['user_id']}"
         ])
     output.seek(0)
@@ -1156,14 +1292,16 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/searchgrupo nombre` - Buscar grupo\n\n"
         "*Admin de Grupo:*\n"
         "• `/start` - Panel de control\n"
-        "• `/add @user plan` - Agregar usuario\n\n"
+        "• `/add @user plan [precio] [días]` - Agregar usuario\n\n"
         "*Planes disponibles:*\n"
-        "• `trial` - 1 día ($0)\n"
-        "• `semanal` - 7 días ($10)\n"
-        "• `mensual` - 30 días ($20)\n\n"
+        "• `trial`   - duración configurada por grupo\n"
+        "• `semanal` - precio y días configurables\n"
+        "• `mensual` - precio y días configurables\n\n"
         "*Ejemplos:*\n"
-        "• `/add @juan semanal`\n"
-        "• `/add @maria mensual`"
+        "• `/add @juan semanal`          → precio del grupo\n"
+        "• `/add @juan semanal 5.99`     → precio custom\n"
+        "• `/add @juan semanal 5.99 10`  → precio y días custom\n"
+        "• `/add @maria mensual 19.99`"
     )
     keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data="back_to_admin")]]
     await query.edit_message_text(
@@ -1477,57 +1615,89 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     cfg_semanal = get_group_plan_config(group_id, "semanal")
     cfg_mensual = get_group_plan_config(group_id, "mensual")
 
+    trial_str   = fmt_minutes(cfg_trial.get('minutes', 1440))
     keyboard = [
-        [InlineKeyboardButton(f"⏱ Trial: {cfg_trial['days']} día(s)",      callback_data=f"cfg_trial_{group_id}")],
-        [InlineKeyboardButton(f"💲 Semanal: ${cfg_semanal['price']}",       callback_data=f"cfg_price_semanal_{group_id}")],
-        [InlineKeyboardButton(f"💲 Mensual: ${cfg_mensual['price']}",       callback_data=f"cfg_price_mensual_{group_id}")],
-        [InlineKeyboardButton("🔙 Volver",                                   callback_data=f"select_group_{group_id}")]
+        [InlineKeyboardButton(f"⏱ Trial: {trial_str}",                    callback_data=f"cfg_trial_{group_id}")],
+        [InlineKeyboardButton(f"📅 Días semanal: {cfg_semanal['days']}d",  callback_data=f"cfg_dur_semanal_{group_id}")],
+        [InlineKeyboardButton(f"💲 Precio semanal: {fmt_price(cfg_semanal['price'])}", callback_data=f"cfg_price_semanal_{group_id}")],
+        [InlineKeyboardButton(f"📆 Días mensual: {cfg_mensual['days']}d",  callback_data=f"cfg_dur_mensual_{group_id}")],
+        [InlineKeyboardButton(f"💲 Precio mensual: {fmt_price(cfg_mensual['price'])}", callback_data=f"cfg_price_mensual_{group_id}")],
+        [InlineKeyboardButton("🔙 Volver",                                  callback_data=f"select_group_{group_id}")]
     ]
     await query.edit_message_text(
         f"⚙️ *Configuración - {group['group_name']}*\n\n"
-        f"Ajusta los precios y duración del trial para este grupo.\n"
-        f"Los cambios aplican inmediatamente a nuevas suscripciones.\n\n"
-        f"• ⏱ *Trial:* {cfg_trial['days']} día(s)\n"
-        f"• 📅 *Semanal:* ${cfg_semanal['price']}\n"
-        f"• 📆 *Mensual:* ${cfg_mensual['price']}",
+        f"Estos son los *valores por defecto* del grupo.\n"
+        f"Con `/add` puedes sobreescribir precio y días por transacción.\n\n"
+        f"• ⏱ *Trial:* {trial_str}\n"
+        f"• 📅 *Semanal:* {cfg_semanal['days']} días | {fmt_price(cfg_semanal['price'])} base\n"
+        f"• 📆 *Mensual:* {cfg_mensual['days']} días | {fmt_price(cfg_mensual['price'])} base",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
 async def cfg_trial_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    """Solicita nueva duración del trial."""
+    """Solicita nueva duración del trial en MINUTOS."""
     query = update.callback_query
     await query.answer()
-    context.user_data['cfg_field']    = 'trial_days'
+    context.user_data['cfg_field']    = 'trial_minutes'
     context.user_data['cfg_group_id'] = group_id
-    cfg = get_group_plan_config(group_id, "trial")
+    cfg         = get_group_plan_config(group_id, "trial")
+    current_str = fmt_minutes(cfg.get('minutes', 1440))
     await query.edit_message_text(
         f"⏱ *Cambiar duración del Trial*\n\n"
-        f"Valor actual: *{cfg['days']} día(s)*\n\n"
-        f"Envía el nuevo número de días (ej: `3`)\n"
+        f"Valor actual: *{current_str}*\n\n"
+        f"Envía el número de *minutos* (ej: `20`, `60`, `1440`)\n\n"
+        f"Referencia rápida:\n"
+        f"• 20 min = 20\n"
+        f"• 1 hora = 60\n"
+        f"• 1 día  = 1440\n"
+        f"• 7 días = 10080\n\n"
         f"*Escribe 'cancelar' para cancelar.*",
         parse_mode="Markdown"
     )
 
 async def cfg_price_request(update: Update, context: ContextTypes.DEFAULT_TYPE,
                              group_id: int, plan: str):
-    """Solicita nuevo precio para semanal o mensual."""
+    """Solicita nuevo precio base para semanal o mensual (acepta centavos)."""
     query = update.callback_query
     await query.answer()
     context.user_data['cfg_field']    = f'price_{plan}'
     context.user_data['cfg_group_id'] = group_id
     cfg       = get_group_plan_config(group_id, plan)
-    plan_name = "Semanal (7 días)" if plan == "semanal" else "Mensual (30 días)"
+    days      = cfg.get('days', 7 if plan == "semanal" else 30)
+    plan_name = f"Semanal ({days} días)" if plan == "semanal" else f"Mensual ({days} días)"
     await query.edit_message_text(
-        f"💲 *Cambiar precio {plan_name}*\n\n"
-        f"Valor actual: *${cfg['price']}*\n\n"
-        f"Envía el nuevo precio en dólares (ej: `15`)\n"
+        f"💲 *Precio base - {plan_name}*\n\n"
+        f"Valor actual: *{fmt_price(cfg['price'])}*\n\n"
+        f"Envía el precio en dólares (acepta centavos):\n"
+        f"Ej: `10`, `5.99`, `3.50`\n\n"
+        f"_Este es el precio por defecto. Con /add puedes_\n"
+        f"_definir un precio diferente por cada usuario._\n\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def cfg_duration_request(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                group_id: int, plan: str):
+    """Solicita nueva duración en días para semanal o mensual."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['cfg_field']    = f'duration_{plan}'
+    context.user_data['cfg_group_id'] = group_id
+    cfg       = get_group_plan_config(group_id, plan)
+    plan_name = "Semanal" if plan == "semanal" else "Mensual"
+    await query.edit_message_text(
+        f"📅 *Días de duración - {plan_name}*\n\n"
+        f"Valor actual: *{cfg.get('days', 7 if plan == 'semanal' else 30)} días*\n\n"
+        f"Envía el nuevo número de días (ej: `7`, `14`, `30`)\n\n"
+        f"_Este es el valor por defecto. Con /add puedes_\n"
+        f"_definir días diferentes por cada usuario._\n\n"
         f"*Escribe 'cancelar' para cancelar.*",
         parse_mode="Markdown"
     )
 
 async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Procesa el valor ingresado para trial_days o price_plan."""
+    """Procesa valores de configuración: minutos (trial), float (precio), int (días)."""
     if update.effective_chat.type != "private":
         return
     field    = context.user_data.get('cfg_field')
@@ -1537,47 +1707,65 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_manage_group(update.effective_user.id, group_id):
         return
 
-    text = update.message.text.strip()
+    text = update.message.text.strip().replace(",", ".")
     if text.lower() == 'cancelar':
         context.user_data.pop('cfg_field', None)
         context.user_data.pop('cfg_group_id', None)
         await update.message.reply_text("❌ Configuración cancelada")
         return
 
+    # Validar y convertir según tipo de campo
+    is_price    = field.startswith("price_")
+    is_minutes  = field == "trial_minutes"
+    is_duration = field.startswith("duration_")
+
     try:
-        value = int(text)
-        if value <= 0:
-            raise ValueError("debe ser positivo")
+        if is_price:
+            value = round(float(text), 2)
+            if value < 0:
+                raise ValueError
+        else:
+            value = int(float(text))
+            if value <= 0:
+                raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Ingresa un número entero positivo (ej: `5`)", parse_mode="Markdown")
+        if is_price:
+            await update.message.reply_text("❌ Precio inválido. Ej: `5.99` o `10`", parse_mode="Markdown")
+        elif is_minutes:
+            await update.message.reply_text("❌ Ingresa los minutos como número entero. Ej: `20`, `1440`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Ingresa los días como número entero positivo. Ej: `7`", parse_mode="Markdown")
         return
 
-    # Actualizar settings en memoria
+    # Actualizar settings en memoria y BD
     group    = get_group_by_id(group_id)
     settings = dict(group.get("settings", {}))
     settings[field] = value
     group["settings"] = settings
-
-    # Persistir en BD
     await db.update_group_fields(group_id, {'settings': settings})
 
     context.user_data.pop('cfg_field', None)
     context.user_data.pop('cfg_group_id', None)
 
-    # Mensaje de confirmación
-    if field == "trial_days":
-        label = f"Trial: *{value} día(s)*"
+    # Etiqueta de confirmación
+    if is_minutes:
+        label = f"Trial: *{fmt_minutes(value)}*"
     elif field == "price_semanal":
-        label = f"Semanal: *${value}*"
+        label = f"Precio semanal base: *{fmt_price(value)}*"
     elif field == "price_mensual":
-        label = f"Mensual: *${value}*"
+        label = f"Precio mensual base: *{fmt_price(value)}*"
+    elif field == "duration_semanal":
+        label = f"Duración semanal: *{value} días*"
+    elif field == "duration_mensual":
+        label = f"Duración mensual: *{value} días*"
     else:
         label = f"{field}: *{value}*"
 
     await update.message.reply_text(
         f"✅ *Configuración actualizada*\n\n"
         f"• {label}\n\n"
-        f"El cambio aplica a todas las nuevas suscripciones del grupo *{group['group_name']}*.",
+        f"Aplica como valor por defecto en *{group['group_name']}*.\n"
+        f"Recuerda que con `/add` puedes definir precio y días por usuario.",
         parse_mode="Markdown"
     )
 
@@ -1816,6 +2004,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("cfg_price_mensual_"):
             group_id = int(data.replace("cfg_price_mensual_", ""))
             await cfg_price_request(update, context, group_id, "mensual")
+        elif data.startswith("cfg_dur_semanal_"):
+            group_id = int(data.replace("cfg_dur_semanal_", ""))
+            await cfg_duration_request(update, context, group_id, "semanal")
+        elif data.startswith("cfg_dur_mensual_"):
+            group_id = int(data.replace("cfg_dur_mensual_", ""))
+            await cfg_duration_request(update, context, group_id, "mensual")
         else:
             logger.warning(f"Callback desconocido: {data}")
 
