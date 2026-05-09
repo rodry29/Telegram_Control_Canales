@@ -9,10 +9,10 @@ from typing import Optional, Dict, List
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, Chat, ChatMember
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, Defaults, MessageHandler, filters
+    ContextTypes, Defaults, MessageHandler, filters, ChatMemberHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -1594,6 +1594,126 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
 
+async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
+                                   first_name: str, group: dict):
+    """
+    Lógica central de registro de nuevo miembro VIP.
+    Llamada desde ChatMemberHandler y desde el fallback de mensaje de sistema.
+    Retorna True si fue un trial nuevo (evita doble notificación).
+    """
+    display   = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
+    chat_link = f"tg://user?id={user_id}"
+
+    registered, result, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
+    logger.info(f"register_user_auto → registered={registered}, result={result}, user={display}")
+
+    if registered and result == "trial_nuevo":
+        cfg_t      = get_group_plan_config(chat_id, "trial")
+        trial_str  = fmt_minutes(cfg_t.get('minutes', 1440))
+        expiry_str = end_date.strftime('%d/%m/%Y %H:%M') if end_date else "N/A"
+
+        # Notificar al usuario
+        await _safe_send(
+            user_id,
+            f"🎉 *¡Bienvenido al grupo VIP!*\n\n"
+            f"✨ Tu período de prueba de *{trial_str}* ha comenzado.\n"
+            f"📅 Tu acceso expira el: *{expiry_str}*\n\n"
+            f"Para continuar después del trial, contacta al administrador.",
+            parse_mode="Markdown"
+        )
+
+        # Notificar al admin
+        await _safe_send(
+            group["admin_id"],
+            f"🆕 *Nuevo usuario en TRIAL*\n\n"
+            f"👤 *Nombre:* [{display}]({chat_link})\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 *Grupo:* {group['group_name']}\n"
+            f"⏱ *Duración:* {trial_str}\n"
+            f"📅 *Expira:* {expiry_str}\n\n"
+            f"_Se registró automáticamente al entrar al grupo._",
+            parse_mode="Markdown"
+        )
+        logger.info(f"🆕 Trial nuevo: {display} en {group['group_name']} hasta {expiry_str}")
+        return True
+
+    return False
+
+
+async def _process_new_free_member(chat_id: int, user_id: int, username: str,
+                                    first_name: str, group: dict):
+    """Lógica central de registro de nuevo miembro FREE."""
+    display   = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
+    chat_link = f"tg://user?id={user_id}"
+
+    is_new = await db.register_free_user(chat_id, user_id, username, first_name)
+    if is_new:
+        await _safe_send(
+            group["admin_id"],
+            f"📋 *Nuevo cliente potencial*\n\n"
+            f"👤 *Nombre:* {display}\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 *Grupo:* {group['group_name']}\n"
+            f"🔗 [Abrir chat]({chat_link})",
+            parse_mode="Markdown"
+        )
+    return is_new
+
+
+# ── MÉTODO PRINCIPAL (PTB v20+): ChatMemberHandler ──────────────────────────
+# Captura cambios de estado de miembros en el grupo (join, leave, ban, etc.)
+# Requiere: allowed_updates=["chat_member"] en start_polling (configurado abajo)
+# El bot NO necesita ser admin para recibir estos eventos si está en el grupo.
+async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler principal para detectar nuevos miembros via ChatMember API (v20+).
+    Se dispara cuando cualquier miembro entra, sale o cambia de estado.
+    """
+    result = update.chat_member
+    if not result:
+        return
+
+    chat_id    = result.chat.id
+    new_status = result.new_chat_member.status
+    old_status = result.old_chat_member.status
+    new_member = result.new_chat_member.user
+
+    logger.info(
+        f"👥 ChatMember update: chat={chat_id}, user={new_member.id} "
+        f"({new_member.first_name}), {old_status} → {new_status}"
+    )
+
+    # Solo nos interesa cuando alguien se une (no era miembro y ahora sí lo es)
+    joined = (
+        old_status in ("left", "kicked", "restricted", "banned") and
+        new_status in ("member", "administrator", "creator")
+    )
+    if not joined:
+        return
+
+    if new_member.is_bot:
+        return
+
+    group = get_group_by_id(chat_id)
+    if not group:
+        logger.info(f"Chat {chat_id} no está en GROUPS configurados — ignorado")
+        return
+
+    user_id    = new_member.id
+    username   = new_member.username or f"user_{user_id}"
+    first_name = new_member.first_name or ""
+
+    if group["type"] == "VIP":
+        await _process_new_vip_member(chat_id, user_id, username, first_name, group)
+    else:
+        await _process_new_free_member(chat_id, user_id, username, first_name, group)
+
+
+# ── MÉTODO FALLBACK: mensaje de sistema new_chat_members ────────────────────
+# Algunos bots/grupos siguen emitiendo este evento. Lo mantenemos como
+# respaldo por si ChatMemberHandler no se dispara (ej: grupos legacy).
+# La lógica en BD usa ON CONFLICT / verificación previa, por lo que si ambos
+# handlers se disparan para el mismo usuario, solo se registra una vez.
 async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
         return
@@ -1602,59 +1722,19 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group:
         return
 
+    logger.info(f"📨 new_chat_members evento en chat {chat_id} ({group['group_name']})")
+
     for new_member in update.message.new_chat_members:
         if new_member.id == context.bot.id:
             continue
         user_id    = new_member.id
         username   = new_member.username or f"user_{user_id}"
         first_name = new_member.first_name or ""
-        display    = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
-        chat_link  = f"tg://user?id={user_id}"
 
         if group["type"] == "VIP":
-            registered, result, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
-
-            if registered and result == "trial_nuevo":
-                cfg_t       = get_group_plan_config(chat_id, "trial")
-                trial_str   = fmt_minutes(cfg_t.get('minutes', 1440))
-                expiry_str  = end_date.strftime('%d/%m/%Y %H:%M') if end_date else "N/A"
-
-                # Notificar al usuario
-                await _safe_send(
-                    user_id,
-                    f"🎉 *¡Bienvenido al grupo VIP!*\n\n"
-                    f"✨ Tu período de prueba de *{trial_str}* ha comenzado.\n"
-                    f"📅 Tu acceso expira el: *{expiry_str}*\n\n"
-                    f"Para continuar después del trial, contacta al administrador.",
-                    parse_mode="Markdown"
-                )
-
-                # NUEVO: Notificar al admin del nuevo trial
-                await _safe_send(
-                    group["admin_id"],
-                    f"🆕 *Nuevo usuario en TRIAL*\n\n"
-                    f"👤 *Nombre:* {display}\n"
-                    f"🔗 [Abrir chat]({chat_link})\n"
-                    f"📌 *Grupo:* {group['group_name']}\n"
-                    f"⏱ *Duración:* {trial_str}\n"
-                    f"📅 *Expira:* {expiry_str}\n\n"
-                    f"_Se registró automáticamente al entrar._",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"🆕 Trial nuevo: {display} en {group['group_name']} hasta {expiry_str}")
-
-        else:  # FREE
-            is_new = await db.register_free_user(chat_id, user_id, username, first_name)
-            if is_new:
-                await _safe_send(
-                    group["admin_id"],
-                    f"📋 *Nuevo cliente potencial*\n\n"
-                    f"👤 *Nombre:* {display}\n"
-                    f"🆔 *ID:* `{user_id}`\n"
-                    f"📌 *Grupo:* {group['group_name']}\n"
-                    f"🔗 [Abrir chat]({chat_link})",
-                    parse_mode="Markdown"
-                )
+            await _process_new_vip_member(chat_id, user_id, username, first_name, group)
+        else:
+            await _process_new_free_member(chat_id, user_id, username, first_name, group)
 
 
 async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2170,6 +2250,74 @@ async def check_expired_subscriptions():
             )
 
             logger.info(f"🚫 {display} ({plan}) expirado y expulsado de {group['group_name']}")
+
+
+# ==================== DIAGNÓSTICO ====================
+
+async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diaggrupo — Diagnostica si el bot puede recibir eventos de nuevos miembros.
+    Funciona dentro del grupo o en privado (si ya seleccionaste un grupo con /start).
+    """
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if update.effective_chat.type in ("group", "supergroup"):
+        target_chat = chat_id
+    else:
+        target_chat = context.user_data.get('current_group')
+        if not target_chat:
+            await update.message.reply_text(
+                "❌ Usa este comando dentro del grupo, o selecciona uno con /start primero."
+            )
+            return
+
+    if not can_manage_group(user_id, target_chat) and user_id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ No autorizado")
+        return
+
+    group = get_group_by_id(target_chat)
+    if not group:
+        await update.message.reply_text(
+            f"❌ El grupo `{target_chat}` no está registrado en el bot.", parse_mode="Markdown"
+        )
+        return
+
+    lines = [f"🔍 *Diagnóstico — {group['group_name']}*\n"]
+    lines.append(f"🆔 ID: `{target_chat}`")
+    lines.append(f"📋 Tipo: {group.get('type', 'VIP')}")
+    lines.append(f"👑 Admin registrado: `{group['admin_id']}`\n")
+
+    try:
+        bot_member = await context.bot.get_chat_member(target_chat, context.bot.id)
+        status = bot_member.status
+        lines.append(f"🤖 *Estado del bot:* `{status}`")
+        if status == "administrator":
+            lines.append("✅ Bot es administrador — detección y expulsión completas")
+            if hasattr(bot_member, 'can_restrict_members'):
+                can_ban = getattr(bot_member, 'can_restrict_members', False)
+                lines.append(f"   • Puede banear/expulsar: {'✅' if can_ban else '❌ (necesario para expulsión automática)'}")
+        elif status == "member":
+            lines.append("⚠️ Bot es miembro normal")
+            lines.append("   → Detección de nuevos miembros: ✅ funciona")
+            lines.append("   → Expulsión automática: ❌ no funcionará")
+            lines.append("   → Solución: promover el bot a admin con permiso 'Banear usuarios'")
+        else:
+            lines.append(f"❌ Estado inesperado: {status}")
+    except Exception as e:
+        lines.append(f"❌ Error al verificar permisos: `{e}`")
+
+    lines.append("")
+    lines.append("📡 *Handlers activos:*")
+    lines.append("• `ChatMemberHandler` (método principal v20+) ✅")
+    lines.append("• `NEW_CHAT_MEMBERS` (fallback legacy) ✅")
+    lines.append("")
+    lines.append("💡 *Si los miembros no se detectan:*")
+    lines.append("1. Verifica que el bot esté dentro del grupo")
+    lines.append("2. Entra al grupo con una cuenta de prueba y revisa los logs")
+    lines.append("3. Usa `/add @usuario trial` para registrar manualmente")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ==================== MAIN ====================
