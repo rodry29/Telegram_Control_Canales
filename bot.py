@@ -4,7 +4,7 @@ import asyncio
 import logging
 from io import StringIO
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 
 import psycopg2
 from psycopg2 import pool
