@@ -1604,6 +1604,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
     display   = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
 
+    logger.info(f"🔴 _process_new_vip_member: user={user_id}, group={group['group_name']}")
+
     registered, result, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
     logger.info(f"register_user_auto → registered={registered}, result={result}, user={display}")
 
@@ -1636,7 +1638,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
         )
         logger.info(f"🆕 Trial nuevo: {display} en {group['group_name']} hasta {expiry_str}")
         return True
-
+        
+    logger.info(f"⚠️ No se registró trial: registered={registered}, result={result}")
     return False
 
 
@@ -2341,7 +2344,11 @@ async def main():
     bot_app.add_handler(CommandHandler("syncall",     sync_all_groups))
     bot_app.add_handler(CommandHandler("searchgrupo", search_group))
     bot_app.add_handler(CommandHandler("test",        test))
+    bot_app.add_handler(CommandHandler("diaggrupo", diagnose_group))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
+    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
+    bot_app.add_handler(CallbackQueryHandler(handle_callback))
+    bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
     bot_app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
