@@ -142,7 +142,14 @@ class Database:
     en lugar de abrir/cerrar una nueva por cada operación.
     Con 10k usuarios y plan gratuito de Railway esto es crítico.
     """
+    def __init__(self, db_url: str):
+        self.db_url = db_url
 
+    def get_connection(self):
+        conn = psycopg2.connect(self.db_url)
+        conn.autocommit = True
+        return conn
+        
     def __init__(self, db_url: str):
         self.db_url = db_url
         # min=2 conexiones siempre listas, max=8 para no saturar Railway Free
