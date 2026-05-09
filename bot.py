@@ -1591,6 +1591,16 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
     await asyncio.sleep(2)
     await menu_edit_group_select(update, context)
 
+async def test_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler de prueba para ver si el bot recibe cualquier update"""
+    print("🔴🔴🔴 ALGÚN UPDATE RECIBIDO 🔴🔴🔴")
+    logger.info(f"🔴 Update recibido: {update}")
+    if update.message:
+        print(f"🔴 Mensaje de: {update.message.from_user.username}")
+
+# En main():
+bot_app.add_handler(MessageHandler(filters.ALL, test_update), group=999)
+
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
 
@@ -1672,6 +1682,19 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Handler principal para detectar nuevos miembros via ChatMember API (v20+).
     Se dispara cuando cualquier miembro entra, sale o cambia de estado.
     """
+      # LOG DE DIAGNÓSTICO - Esto debería aparecer cuando alguien entra
+    
+    print("🔴🔴🔴 track_chat_member EJECUTÁNDOSE 🔴🔴🔴")
+    logger.info("🔴🔴🔴 track_chat_member EJECUTÁNDOSE 🔴🔴🔴")
+    
+    result = update.chat_member
+    if not result:
+        print("❌ No hay update.chat_member")
+        return
+    
+    print(f"✅ update.chat_member recibido: {result}")
+    logger.info(f"✅ update.chat_member recibido: {result}")
+    
     result = update.chat_member
     if not result:
         return
@@ -2363,7 +2386,10 @@ async def main():
     logger.info("🤖 Bot iniciado")
     await bot_app.initialize()
     await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=True)
+    await bot_app.updater.start_polling(
+    drop_pending_updates=True,
+    allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+    )
     await asyncio.Event().wait()
 
 
