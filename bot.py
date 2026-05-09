@@ -1598,8 +1598,7 @@ async def test_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         print(f"🔴 Mensaje de: {update.message.from_user.username}")
 
-# En main():
-bot_app.add_handler(MessageHandler(filters.ALL, test_update), group=999)
+
 
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
@@ -2372,6 +2371,7 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
     bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    bot_app.add_handler(MessageHandler(filters.ALL, test_update), group=999)
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
     bot_app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
