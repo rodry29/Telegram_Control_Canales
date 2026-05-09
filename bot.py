@@ -633,6 +633,54 @@ class Database:
                 return cur.fetchone()[0]
         return await self._run(_get)
 
+    async def get_trial_stats(self, group_id: int) -> Dict:
+        """Obtiene estadísticas de usuarios en plan trial"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Total de usuarios que han usado trial
+                cur.execute("""
+                SELECT COUNT(*) as total_trial_users
+                FROM users 
+                WHERE group_id=%s AND (plan='trial' OR trial_used=True)
+                """, (group_id,))
+                total_trial_users = cur.fetchone()['total_trial_users']
+                
+                # Usuarios actualmente en trial activo con tiempo restante
+                cur.execute("""
+                SELECT user_id, username, first_name, end_date,
+                       EXTRACT(DAY FROM (end_date - NOW())) as days_left,
+                       EXTRACT(HOUR FROM (end_date - NOW())) as hours_left
+                FROM users 
+                WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW()
+                ORDER BY end_date ASC
+                """, (group_id,))
+                active_trials = cur.fetchall()
+                
+                # Usuarios que expiraron después del trial
+                cur.execute("""
+                SELECT COUNT(*) as expired_from_trial
+                FROM users 
+                WHERE group_id=%s AND plan='trial' AND status='expired' AND end_date < NOW()
+                """, (group_id,))
+                expired_from_trial = cur.fetchone()['expired_from_trial']
+                
+                # Usuarios que convirtieron de trial a pago
+                cur.execute("""
+                SELECT COUNT(DISTINCT u.user_id) as converted_users
+                FROM users u
+                JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id
+                WHERE u.group_id=%s AND u.trial_used=True AND p.amount > 0
+                """, (group_id,))
+                converted_users = cur.fetchone()['converted_users']
+                
+                return {
+                    "total_trial_users": total_trial_users,
+                    "active_trials": active_trials,
+                    "active_count": len(active_trials),
+                    "expired_from_trial": expired_from_trial,
+                    "converted_users": converted_users
+                }
+
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
@@ -778,7 +826,8 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
             [InlineKeyboardButton("💰 Ganancias",        callback_data="earnings")],
             [InlineKeyboardButton("📥 Exportar mes",     callback_data="export_month")],
-            [InlineKeyboardButton("⚙️ Precios y Trial",  callback_data=f"cfg_group_{group_id}")]
+            [InlineKeyboardButton("⚙️ Precios y Trial",  callback_data=f"cfg_group_{group_id}")],
+            [InlineKeyboardButton("📊 Estadísticas Trial", callback_data="trial_stats")],
         ]
         cfg_s = get_group_plan_config(group_id, "semanal")
         cfg_m = get_group_plan_config(group_id, "mensual")
@@ -1364,6 +1413,58 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="📋 Clientes potenciales"
     )
     output.close()
+
+async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra estadísticas de usuarios en trial"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    group_id = context.user_data.get('current_group')
+    if not group_id:
+        await message.reply_text("❌ Selecciona un grupo con /start")
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group or group.get("type") != "VIP":
+        await message.reply_text("❌ Solo disponible en grupos VIP")
+        return
+    
+    stats = await db.get_trial_stats(group_id)
+    
+    msg = f"📊 *ESTADÍSTICAS DE TRIAL - {group['group_name']}*\n\n"
+    msg += f"• 🆓 *Usaron trial:* {stats['total_trial_users']} personas\n"
+    msg += f"• 🟢 *Trial activos:* {stats['active_count']} personas\n"
+    msg += f"• 🔴 *Expulsados por vencimiento:* {stats['expired_from_trial']} personas\n"
+    msg += f"• 💰 *Convertidos a pago:* {stats['converted_users']} personas\n"
+    
+    if stats['active_trials']:
+        msg += f"\n📋 *TIEMPO RESTANTE EN TRIAL:*\n"
+        for trial in stats['active_trials']:
+            days = int(trial['days_left']) if trial['days_left'] else 0
+            hours = int(trial['hours_left']) % 24 if trial['hours_left'] else 0
+            name = trial['first_name'] or trial['username'] or f"ID:{trial['user_id']}"
+            
+            if days > 0:
+                time_left = f"{days} día(s) y {hours} hora(s)"
+            else:
+                time_left = f"{hours} hora(s)"
+            
+            msg += f"   👤 {name}\n"
+            msg += f"   ⏳ {time_left}\n"
+            msg += f"   📅 Expira: {trial['end_date'].strftime('%d/%m/%Y %H:%M')}\n\n"
+    
+    if stats['total_trial_users'] > 0:
+        conversion = (stats['converted_users'] / stats['total_trial_users']) * 100
+        msg += f"\n📈 *Tasa de conversión:* {conversion:.1f}%"
+    
+    if query:
+        await query.edit_message_text(msg, parse_mode="Markdown")
+    else:
+        await message.reply_text(msg, parse_mode="Markdown")
 
 async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
@@ -2010,6 +2111,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("cfg_dur_mensual_"):
             group_id = int(data.replace("cfg_dur_mensual_", ""))
             await cfg_duration_request(update, context, group_id, "mensual")
+        elif data == "trial_stats":
+            await trial_stats(update, context)
         else:
             logger.warning(f"Callback desconocido: {data}")
 
