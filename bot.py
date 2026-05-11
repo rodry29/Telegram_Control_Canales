@@ -4,12 +4,13 @@ import asyncio
 import logging
 from io import StringIO
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional
 
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, Chat, ChatMember
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, Defaults, MessageHandler, filters, ChatMemberHandler
@@ -77,13 +78,9 @@ def can_manage_group(user_id: int, group_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID:
         return True
     group = get_group_by_id(group_id)
-    return group and group["admin_id"] == user_id
+    return group is not None and group["admin_id"] == user_id
 
 def get_group_plan_config(group_id: int, plan: str) -> dict:
-    """
-    Devuelve la configuración efectiva de un plan para un grupo.
-    Prioridad: settings del grupo > PLANS global.
-    """
     base     = dict(PLANS.get(plan, {}))
     group    = get_group_by_id(group_id)
     if not group or not base:
@@ -125,13 +122,6 @@ def fmt_minutes(mins: int) -> str:
 
 # ==================== BASE DE DATOS ====================
 class Database:
-    """
-    Pool de conexiones para reutilizar conexiones en lugar de abrir/cerrar
-    una nueva por cada operación.
-    """
-
-    # BUG FIX: Se eliminó el __init__ duplicado que invalidaba el pool.
-    # Ahora hay un único __init__ correcto.
     def __init__(self, db_url: str):
         self.db_url = db_url
         self._pool: pool.ThreadedConnectionPool = None
@@ -140,17 +130,13 @@ class Database:
         if self._pool is None or self._pool.closed:
             self._pool = pool.ThreadedConnectionPool(
                 minconn=2,
-                maxconn=8,
+                maxconn=10,
                 dsn=self.db_url
             )
-            logger.info("✅ Connection pool creado (min=2, max=8)")
+            logger.info("✅ Connection pool creado (min=2, max=10)")
         return self._pool
 
     def _execute(self, func):
-        """
-        Wrapper síncrono: obtiene conexión del pool, ejecuta func(conn) y la devuelve.
-        Usado con asyncio.to_thread() para no bloquear el event loop.
-        """
         p = self._get_pool()
         conn = p.getconn()
         try:
@@ -165,7 +151,6 @@ class Database:
             p.putconn(conn)
 
     async def _run(self, func):
-        """Ejecuta operación de BD en thread separado para no bloquear asyncio."""
         return await asyncio.to_thread(self._execute, func)
 
     def _insert_free_user_sync(self, conn, user_id: int, chat_id: int,
@@ -244,10 +229,28 @@ class Database:
                         END IF;
                     END $$;
                 """)
+                # ── FIX: columna kicked para evitar re-procesar usuarios ya expulsados ──
+                cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='users' AND column_name='kicked_at'
+                        ) THEN
+                            ALTER TABLE users ADD COLUMN kicked_at TIMESTAMP DEFAULT NULL;
+                        END IF;
+                    END $$;
+                """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group    ON users(group_id, status)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid_gid  ON users(user_id, group_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)")
+                # ── FIX: índice para acelerar la búsqueda de expirados ──
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_users_expired
+                    ON users(group_id, status, end_date)
+                    WHERE status = 'active'
+                """)
         await self._run(_init)
         logger.info("✅ Base de datos inicializada")
 
@@ -311,7 +314,7 @@ class Database:
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT user_id FROM users WHERE user_id=%s AND group_id=%s LIMIT 1",
+                    "SELECT user_id, status FROM users WHERE user_id=%s AND group_id=%s LIMIT 1",
                     (user_id, group_id)
                 )
                 return cur.fetchone()
@@ -319,14 +322,20 @@ class Database:
 
     async def register_user_auto(self, group_id: int, user_id: int,
                                   username: str, first_name: str):
+        """
+        Registra al usuario con trial. Usa FOR UPDATE para evitar race conditions.
+        Retorna (registered, result, end_date).
+        """
         now = datetime.now()
         trial_cfg = get_group_plan_config(group_id, "trial")
         trial_minutes = trial_cfg.get("minutes", 1440)
 
         def _register(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # FOR UPDATE evita inserciones duplicadas concurrentes
                 cur.execute(
-                    "SELECT user_id, trial_used, status, end_date FROM users WHERE user_id=%s AND group_id=%s",
+                    "SELECT user_id, trial_used, status, end_date FROM users "
+                    "WHERE user_id=%s AND group_id=%s FOR UPDATE",
                     (user_id, group_id)
                 )
                 existing = cur.fetchone()
@@ -348,7 +357,8 @@ class Database:
                     return True, "trial_nuevo", end_date
                 elif existing['status'] == 'active' and existing['end_date'] > now:
                     cur.execute(
-                        "UPDATE users SET username=%s, first_name=%s WHERE user_id=%s AND group_id=%s",
+                        "UPDATE users SET username=%s, first_name=%s, updated_at=NOW() "
+                        "WHERE user_id=%s AND group_id=%s",
                         (username, first_name, user_id, group_id)
                     )
                     return True, "activo", existing['end_date']
@@ -386,7 +396,8 @@ class Database:
         def _add(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT user_id, trial_used, status, first_name FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s",
+                    "SELECT user_id, trial_used, status, first_name FROM users "
+                    "WHERE LOWER(username)=LOWER(%s) AND group_id=%s FOR UPDATE",
                     (username, group_id)
                 )
                 existing = cur.fetchone()
@@ -406,7 +417,8 @@ class Database:
                         UPDATE users SET
                             plan=%s, start_date=%s, end_date=%s, status='active',
                             updated_at=NOW(), username=%s, first_name=%s,
-                            trial_used = trial_used OR %s
+                            trial_used = trial_used OR %s,
+                            kicked_at = NULL
                         WHERE user_id=%s AND group_id=%s
                     """, (plan, now, end_date, username, fn,
                           plan == "trial", existing['user_id'], group_id))
@@ -488,24 +500,38 @@ class Database:
         return await self._run(_get)
 
     async def get_expired_users(self, group_id: int):
+        """
+        FIX CRÍTICO: Solo retorna usuarios que NO han sido expulsados aún (kicked_at IS NULL).
+        Esto evita que usuarios ya procesados sean re-procesados en cada ciclo.
+        """
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT user_id, username, first_name, plan, end_date
                     FROM users
-                    WHERE group_id=%s AND status='active' AND end_date < NOW()
+                    WHERE group_id=%s
+                      AND status='active'
+                      AND end_date < NOW()
+                      AND kicked_at IS NULL
                 """, (group_id,))
                 return cur.fetchall()
         return await self._run(_get)
 
     async def expire_user(self, user_id: int, group_id: int):
+        """
+        FIX: Marca al usuario como expirado Y registra la marca de tiempo de expulsión
+        en una sola operación atómica. Esto evita el doble-procesamiento.
+        """
         def _expire(conn):
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE users SET status='expired' WHERE user_id=%s AND group_id=%s",
-                    (user_id, group_id)
-                )
-        await self._run(_expire)
+                cur.execute("""
+                    UPDATE users
+                    SET status='expired', kicked_at=NOW(), updated_at=NOW()
+                    WHERE user_id=%s AND group_id=%s AND status='active'
+                    RETURNING user_id
+                """, (user_id, group_id))
+                return cur.fetchone() is not None  # True si realmente se actualizó
+        return await self._run(_expire)
 
     async def get_potential_clients_stats(self, group_id: int):
         now = datetime.now()
@@ -605,10 +631,7 @@ class Database:
                 return cur.fetchone()[0]
         return await self._run(_get)
 
-    # BUG FIX: get_trial_stats usaba self.get_connection() como context manager,
-    # lo cual es inválido. Ahora usa self._run() correctamente con el pool.
     async def get_trial_stats(self, group_id: int) -> dict:
-        """Obtiene estadísticas de usuarios en plan trial."""
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
@@ -662,23 +685,92 @@ bot_app = None
 
 # ==================== HELPERS INTERNOS ====================
 async def _safe_send(chat_id: int, text: str, **kwargs):
-    """Envía mensaje capturando errores para no interrumpir flujos críticos."""
     try:
         await bot_app.bot.send_message(chat_id, text, **kwargs)
     except Exception as e:
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
 
 
+# ==================== EXPULSIÓN CON REINTENTOS ====================
+async def _kick_user_with_retry(group_id: int, user_id: int, retries: int = 3) -> bool:
+    """
+    FIX CRÍTICO: Expulsa al usuario con reintentos y verificación previa.
+
+    El flujo correcto en Telegram para un "kick sin ban permanente" es:
+    1. ban_chat_member  → expulsa y prohíbe re-entrada
+    2. Esperar brevemente para que Telegram procese el ban
+    3. unban_chat_member → levanta el ban para que pueda volver a entrar si el admin quiere
+
+    Incluye reintentos con backoff exponencial para manejar errores de red o rate-limit.
+    También verifica si el usuario sigue en el grupo antes de intentar expulsarlo.
+    """
+    for attempt in range(retries):
+        try:
+            # Verificar si el usuario sigue siendo miembro antes de expulsar
+            try:
+                member = await bot_app.bot.get_chat_member(group_id, user_id)
+                if member.status in ("left", "kicked", "banned"):
+                    logger.info(f"Usuario {user_id} ya no está en el grupo {group_id} (status: {member.status})")
+                    return True  # Considerar éxito: ya no está en el grupo
+            except BadRequest as e:
+                if "user not found" in str(e).lower() or "member_id_invalid" in str(e).lower():
+                    logger.info(f"Usuario {user_id} no encontrado en grupo {group_id}: {e}")
+                    return True  # Ya no está en el grupo
+                raise
+
+            # Ejecutar el ban
+            await bot_app.bot.ban_chat_member(group_id, user_id)
+
+            # FIX: Esperar a que Telegram procese el ban antes del unban
+            # Sin esta pausa, el unban puede llegar antes que el ban en los servidores de Telegram
+            await asyncio.sleep(1)
+
+            # Levantar el ban para que el usuario pueda volver a entrar si el admin lo reactiva
+            await bot_app.bot.unban_chat_member(group_id, user_id)
+
+            logger.info(f"✅ Usuario {user_id} expulsado exitosamente del grupo {group_id}")
+            return True
+
+        except TelegramError as e:
+            error_str = str(e).lower()
+
+            # Errores no recuperables — no tiene sentido reintentar
+            if any(phrase in error_str for phrase in [
+                "not enough rights",
+                "bot is not a member",
+                "chat not found",
+                "user not found",
+                "participant_id_invalid",
+                "member_id_invalid"
+            ]):
+                logger.error(f"❌ Error no recuperable expulsando {user_id} de {group_id}: {e}")
+                return False
+
+            # Error recuperable — reintentar con backoff
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            logger.warning(
+                f"⚠️ Intento {attempt+1}/{retries} fallido para expulsar {user_id} "
+                f"de {group_id}: {e}. Reintentando en {wait}s..."
+            )
+            await asyncio.sleep(wait)
+
+    logger.error(f"❌ No se pudo expulsar al usuario {user_id} del grupo {group_id} tras {retries} intentos")
+    return False
+
+
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # BUG FIX: Se unificó la lógica de envío para manejar tanto
-    # mensajes directos como callbacks sin conflictos.
+    # FIX: Unificación robusta del método de envío.
+    # Si viene de callback_query, usar reply_text del mensaje del callback.
+    # Si viene de mensaje directo, usar reply_text del mensaje.
     if update.callback_query:
         send = update.callback_query.message.reply_text
-    else:
+    elif update.message:
         send = update.message.reply_text
+    else:
+        return
 
     if user_id == SUPER_ADMIN_ID:
         vip_count      = len([g for g in GROUPS if g.get("type", "VIP") == "VIP"])
@@ -1151,7 +1243,8 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     GROUPS.append({
                         "group_id": group_id, "group_name": group_name,
-                        "type": group_type,   "admin_id": admin_id
+                        "type": group_type,   "admin_id": admin_id,
+                        "settings": {}
                     })
                     await db.save_group(group_id, group_name, admin_id, group_type)
                 restored_count += 1
@@ -1409,10 +1502,7 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output.close()
 
 
-# BUG FIX: trial_stats ahora usa db.get_trial_stats() que opera con el pool
-# correctamente. Además, horas restantes se calculan correctamente con módulo 24.
 async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra estadísticas de usuarios en trial con tiempo restante exacto."""
     query = update.callback_query
     if query:
         await query.answer()
@@ -1591,25 +1681,11 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
     await asyncio.sleep(2)
     await menu_edit_group_select(update, context)
 
-async def test_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler de prueba para ver si el bot recibe cualquier update"""
-    print("🔴🔴🔴 ALGÚN UPDATE RECIBIDO 🔴🔴🔴")
-    logger.info(f"🔴 Update recibido: {update}")
-    if update.message:
-        print(f"🔴 Mensaje de: {update.message.from_user.username}")
-
-
-
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
 
 async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
                                    first_name: str, group: dict):
-    """
-    Lógica central de registro de nuevo miembro VIP.
-    Llamada desde ChatMemberHandler y desde el fallback de mensaje de sistema.
-    Retorna True si fue un trial nuevo (evita doble notificación).
-    """
     display   = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
 
@@ -1623,7 +1699,6 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
         trial_str  = fmt_minutes(cfg_t.get('minutes', 1440))
         expiry_str = end_date.strftime('%d/%m/%Y %H:%M') if end_date else "N/A"
 
-        # Notificar al usuario
         await _safe_send(
             user_id,
             f"🎉 *¡Bienvenido al grupo VIP!*\n\n"
@@ -1633,7 +1708,6 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
             parse_mode="Markdown"
         )
 
-        # Notificar al admin
         await _safe_send(
             group["admin_id"],
             f"🆕 *Nuevo usuario en TRIAL*\n\n"
@@ -1647,14 +1721,13 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
         )
         logger.info(f"🆕 Trial nuevo: {display} en {group['group_name']} hasta {expiry_str}")
         return True
-        
+
     logger.info(f"⚠️ No se registró trial: registered={registered}, result={result}")
     return False
 
 
 async def _process_new_free_member(chat_id: int, user_id: int, username: str,
                                     first_name: str, group: dict):
-    """Lógica central de registro de nuevo miembro FREE."""
     display   = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
 
@@ -1672,28 +1745,7 @@ async def _process_new_free_member(chat_id: int, user_id: int, username: str,
     return is_new
 
 
-# ── MÉTODO PRINCIPAL (PTB v20+): ChatMemberHandler ──────────────────────────
-# Captura cambios de estado de miembros en el grupo (join, leave, ban, etc.)
-# Requiere: allowed_updates=["chat_member"] en start_polling (configurado abajo)
-# El bot NO necesita ser admin para recibir estos eventos si está en el grupo.
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler principal para detectar nuevos miembros via ChatMember API (v20+).
-    Se dispara cuando cualquier miembro entra, sale o cambia de estado.
-    """
-      # LOG DE DIAGNÓSTICO - Esto debería aparecer cuando alguien entra
-    
-    print("🔴🔴🔴 track_chat_member EJECUTÁNDOSE 🔴🔴🔴")
-    logger.info("🔴🔴🔴 track_chat_member EJECUTÁNDOSE 🔴🔴🔴")
-    
-    result = update.chat_member
-    if not result:
-        print("❌ No hay update.chat_member")
-        return
-    
-    print(f"✅ update.chat_member recibido: {result}")
-    logger.info(f"✅ update.chat_member recibido: {result}")
-    
     result = update.chat_member
     if not result:
         return
@@ -1708,7 +1760,6 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"({new_member.first_name}), {old_status} → {new_status}"
     )
 
-    # Solo nos interesa cuando alguien se une (no era miembro y ahora sí lo es)
     joined = (
         old_status in ("left", "kicked", "restricted", "banned") and
         new_status in ("member", "administrator", "creator")
@@ -1734,12 +1785,8 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _process_new_free_member(chat_id, user_id, username, first_name, group)
 
 
-# ── MÉTODO FALLBACK: mensaje de sistema new_chat_members ────────────────────
-# Algunos bots/grupos siguen emitiendo este evento. Lo mantenemos como
-# respaldo por si ChatMemberHandler no se dispara (ej: grupos legacy).
-# La lógica en BD usa ON CONFLICT / verificación previa, por lo que si ambos
-# handlers se disparan para el mismo usuario, solo se registra una vez.
 async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback para grupos legacy que emiten new_chat_members."""
     if not update.message or not update.message.new_chat_members:
         return
     chat_id = update.message.chat_id
@@ -1764,8 +1811,8 @@ async def detect_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Registra usuarios que escriben sin haber pasado por NEW_CHAT_MEMBERS
-    (entraron antes que el bot, o mientras estaba caído).
+    Registra usuarios que escriben sin haber pasado por NEW_CHAT_MEMBERS.
+    FIX: Usa caché en user_data para evitar consultar la BD en cada mensaje.
     """
     if not update.message or update.effective_chat.type not in ("group", "supergroup"):
         return
@@ -1780,8 +1827,14 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
     username   = user.username or f"user_{user_id}"
     first_name = user.first_name or ""
 
+    # FIX: Caché en memoria para no consultar BD en cada mensaje del grupo
+    cache_key = f"known_{chat_id}_{user_id}"
+    if context.bot_data.get(cache_key):
+        return
+
     existing = await db.get_user_by_id(user_id, chat_id)
     if existing:
+        context.bot_data[cache_key] = True  # Guardar en caché
         return
 
     display   = first_name if first_name else (username if not username.startswith("user_") else f"Usuario {user_id}")
@@ -1801,6 +1854,7 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"_Detectado al escribir en el grupo._",
                 parse_mode="Markdown"
             )
+        context.bot_data[cache_key] = True
     else:  # VIP sin registro
         logger.info(f"⚠️ Sin registro en VIP {group['group_name']}: {display}")
         await _safe_send(
@@ -1814,6 +1868,7 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Para expulsarlo: hazlo desde Telegram directamente.",
             parse_mode="Markdown"
         )
+        context.bot_data[cache_key] = True
 
 
 # ==================== CONFIGURACIÓN DE PRECIOS Y TRIAL ====================
@@ -1990,10 +2045,15 @@ async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIX: Solo procesar en chat privado
+    if update.effective_chat.type != "private":
+        return
+
     # Prioridad: input de configuración de precios/trial
     if context.user_data.get('cfg_field') and context.user_data.get('cfg_group_id'):
         await handle_cfg_input(update, context)
         return
+
     if update.effective_user.id != SUPER_ADMIN_ID:
         return
     text = update.message.text.strip()
@@ -2089,10 +2149,6 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== CALLBACK HANDLER ====================
-# BUG FIX: Se eliminó el query.answer() duplicado al inicio del handler,
-# ya que cada sub-handler llama su propio query.answer().
-# BUG FIX: "back_to_admin" ahora usa edit_message_text en lugar de reply_text + start()
-# para evitar el conflicto de mensajes dobles.
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data  = query.data
@@ -2136,11 +2192,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_id = int(data.replace("select_group_", ""))
             await select_group(update, context, group_id)
         elif data == "back_to_admin":
-            # BUG FIX: Se usa edit_message_text para no generar un mensaje nuevo
-            # y luego se llama start() que enviará su propio reply. Se limpia el mensaje
-            # de transición primero con answer().
+            # FIX: Eliminar el mensaje actual y enviar el panel desde cero.
+            # start() usa reply_text del mensaje del callback, que es válido.
             await query.answer()
-            await query.message.delete()
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             await start(update, context)
         elif data == "menu_groups":
             await menu_groups(update, context)
@@ -2220,40 +2278,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_expired_subscriptions():
     """
-    Revisa suscripciones expiradas, expulsa usuarios del grupo y notifica
-    al admin con detalle (nombre, plan, tiempo de expiración).
-    También notifica al propio usuario si es posible.
+    FIX CRÍTICO — Cambios principales:
+    1. expire_user() ahora usa RETURNING para garantizar que solo un proceso
+       por ciclo maneje a cada usuario (operación atómica en BD).
+    2. Se usa _kick_user_with_retry() con verificación previa y reintentos.
+    3. Las notificaciones se envían DESPUÉS de confirmar que el kick fue exitoso.
+    4. Se procesan los grupos en paralelo para mayor velocidad.
     """
     logger.info("🔍 Verificando suscripciones expiradas...")
-    for group in GROUPS:
-        if group.get("type", "VIP") != "VIP":
-            continue
-        expired_users = await db.get_expired_users(group["group_id"])
-        if expired_users:
-            logger.info(f"Usuarios expirados en {group['group_name']}: {len(expired_users)}")
+
+    async def _process_group(group: dict):
+        group_id = group["group_id"]
+        expired_users = await db.get_expired_users(group_id)
+        if not expired_users:
+            return
+
+        logger.info(f"Usuarios expirados en {group['group_name']}: {len(expired_users)}")
 
         for user in expired_users:
-            await db.expire_user(user['user_id'], group["group_id"])
-
+            user_id    = user['user_id']
             username   = user.get('username') or ''
             first_name = user.get('first_name') or ''
-            display    = first_name or (f"@{username}" if username and not username.startswith('user_') else f"ID:{user['user_id']}")
+            display    = first_name or (f"@{username}" if username and not username.startswith('user_') else f"ID:{user_id}")
             plan       = user.get('plan', 'desconocido')
             end_date   = user.get('end_date')
             expiry_str = end_date.strftime('%d/%m/%Y %H:%M') if end_date else "N/A"
-            chat_link  = f"tg://user?id={user['user_id']}"
+            chat_link  = f"tg://user?id={user_id}"
 
-            ban_success = False
-            try:
-                await bot_app.bot.ban_chat_member(group["group_id"], user['user_id'])
-                await bot_app.bot.unban_chat_member(group["group_id"], user['user_id'])  # kick sin ban permanente
-                ban_success = True
-            except Exception as e:
-                logger.error(f"Error expulsando a {display}: {e}")
+            # FIX: expire_user() retorna True solo si actualizó la fila.
+            # Esto evita que dos ciclos concurrentes procesen al mismo usuario.
+            was_updated = await db.expire_user(user_id, group_id)
+            if not was_updated:
+                logger.info(f"Usuario {user_id} ya fue procesado por otro ciclo — saltando")
+                continue
 
-            # NUEVO: Notificación completa al admin
-            status_emoji = "🚫" if ban_success else "⚠️"
-            action_text  = "expulsado del grupo" if ban_success else "marcado como expirado (no se pudo expulsar)"
+            # FIX: Intentar expulsión con reintentos y verificación de membresía
+            kick_success = await _kick_user_with_retry(group_id, user_id)
+
+            status_emoji = "🚫" if kick_success else "⚠️"
+            action_text  = "expulsado del grupo" if kick_success else "marcado como expirado (no se pudo expulsar automáticamente)"
+
+            # Notificar al admin con resultado real de la expulsión
             await _safe_send(
                 group["admin_id"],
                 f"{status_emoji} *Suscripción expirada*\n\n"
@@ -2267,23 +2332,26 @@ async def check_expired_subscriptions():
 
             # Notificar al usuario expulsado
             await _safe_send(
-                user['user_id'],
+                user_id,
                 f"⏰ *Tu acceso ha expirado*\n\n"
                 f"Tu plan *{plan}* en el grupo *{group['group_name']}* ha vencido.\n\n"
                 f"Para renovar, contacta al administrador.",
                 parse_mode="Markdown"
             )
 
-            logger.info(f"🚫 {display} ({plan}) expirado y expulsado de {group['group_name']}")
+            logger.info(
+                f"{'✅' if kick_success else '⚠️'} {display} ({plan}) "
+                f"procesado en {group['group_name']} — kick_success={kick_success}"
+            )
+
+    # Procesar todos los grupos en paralelo
+    vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
+    await asyncio.gather(*[_process_group(g) for g in vip_groups], return_exceptions=True)
 
 
 # ==================== DIAGNÓSTICO ====================
 
 async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /diaggrupo — Diagnostica si el bot puede recibir eventos de nuevos miembros.
-    Funciona dentro del grupo o en privado (si ya seleccionaste un grupo con /start).
-    """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -2336,6 +2404,7 @@ async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("📡 *Handlers activos:*")
     lines.append("• `ChatMemberHandler` (método principal v20+) ✅")
     lines.append("• `NEW_CHAT_MEMBERS` (fallback legacy) ✅")
+    lines.append(f"• Verificación de expirados: cada 5 minutos ✅")
     lines.append("")
     lines.append("💡 *Si los miembros no se detectan:*")
     lines.append("1. Verifica que el bot esté dentro del grupo")
@@ -2355,6 +2424,7 @@ async def main():
     defaults = Defaults(parse_mode="HTML")
     bot_app  = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
 
+    # ── Comandos ──────────────────────────────────────────────────────────────
     bot_app.add_handler(CommandHandler("start",       start))
     bot_app.add_handler(CommandHandler("add",         add_user_command))
     bot_app.add_handler(CommandHandler("groups",      list_groups))
@@ -2366,29 +2436,61 @@ async def main():
     bot_app.add_handler(CommandHandler("syncall",     sync_all_groups))
     bot_app.add_handler(CommandHandler("searchgrupo", search_group))
     bot_app.add_handler(CommandHandler("test",        test))
-    bot_app.add_handler(CommandHandler("diaggrupo", diagnose_group))
+    bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # FIX: Un solo CallbackQueryHandler (estaba duplicado en el original)
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
-    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
-    bot_app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # ── Detección de miembros ─────────────────────────────────────────────────
+    # FIX: ChatMemberHandler registrado una sola vez (estaba duplicado)
     bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    bot_app.add_handler(MessageHandler(filters.ALL, test_update), group=999)
-    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
+
+    # FIX: NEW_CHAT_MEMBERS registrado una sola vez (estaba duplicado)
+    bot_app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS,
+        detect_new_member
+    ))
+
+    # Detectar mensajes de grupo de usuarios no registrados
     bot_app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
         detect_active_member
     ))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input))
 
-    scheduler.add_job(check_expired_subscriptions, 'interval', hours=6)
-    scheduler.add_job(auto_backup,                 'interval', hours=24)
+    # Input de texto en privado (edición de grupos, configuración de precios)
+    # FIX: Agregado filtro ChatType.PRIVATE para no capturar mensajes de grupo
+    bot_app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_edit_input
+    ))
+
+    # ── Scheduler ────────────────────────────────────────────────────────────
+    # FIX CRÍTICO: Intervalo reducido de 6 horas a 5 minutos para detectar
+    # expiraciones a tiempo (trials cortos de 20-60 minutos no se procesaban
+    # hasta horas después con el intervalo anterior).
+    scheduler.add_job(
+        check_expired_subscriptions,
+        'interval',
+        minutes=5,
+        id='check_expired',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        auto_backup,
+        'interval',
+        hours=24,
+        id='auto_backup',
+        replace_existing=True
+    )
     scheduler.start()
 
     logger.info("🤖 Bot iniciado")
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling(
-    drop_pending_updates=True,
-    allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
     )
     await asyncio.Event().wait()
 
