@@ -1686,7 +1686,7 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
                                    first_name: str, group: dict):
-    display   = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
+    display = first_name if first_name else (username if not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
 
     logger.info(f"🔴 _process_new_vip_member: user={user_id}, group={group['group_name']}")
@@ -1695,8 +1695,9 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
     logger.info(f"register_user_auto → registered={registered}, result={result}, user={display}")
 
     if registered and result == "trial_nuevo":
-        cfg_t      = get_group_plan_config(chat_id, "trial")
-        trial_str  = fmt_minutes(cfg_t.get('minutes', 1440))
+        # ✅ Caso normal: nuevo trial
+        cfg_t = get_group_plan_config(chat_id, "trial")
+        trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
         expiry_str = end_date.strftime('%d/%m/%Y %H:%M') if end_date else "N/A"
 
         await _safe_send(
@@ -1722,7 +1723,49 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
         logger.info(f"🆕 Trial nuevo: {display} en {group['group_name']} hasta {expiry_str}")
         return True
 
-    logger.info(f"⚠️ No se registró trial: registered={registered}, result={result}")
+    # 🔥 NUEVO: Usuario expirado o sin trial válido - EXPULSAR INMEDIATAMENTE
+    logger.info(f"⚠️ Usuario expirado/sin permiso intentando entrar: {display}")
+    
+    # Expulsar inmediatamente
+    kick_success = await _kick_user_with_retry(chat_id, user_id)
+    
+    if kick_success:
+        logger.info(f"🚫 Usuario expirado EXPULSADO: {display}")
+        
+        # Notificar al admin
+        await _safe_send(
+            group["admin_id"],
+            f"🚫 *Intento de reingreso denegado*\n\n"
+            f"👤 *Usuario:* [{display}]({chat_link})\n"
+            f"📌 *Grupo:* {group['group_name']}\n"
+            f"⏰ *Motivo:* Trial expirado o cuenta sin suscripción activa\n\n"
+            f"_El usuario ha sido expulsado automáticamente._",
+            parse_mode="Markdown"
+        )
+        
+        # Notificar al usuario (si el bot puede, aunque ya no esté en el grupo)
+        await _safe_send(
+            user_id,
+            f"🚫 *Acceso denegado*\n\n"
+            f"No puedes ingresar a *{group['group_name']}* porque:\n"
+            f"• Tu período de prueba ha expirado\n"
+            f"• No tienes una suscripción activa\n\n"
+            f"Para acceder, contacta al administrador y adquiere un plan:\n"
+            f"• Semanal: ${get_group_plan_config(chat_id, 'semanal')['price']}\n"
+            f"• Mensual: ${get_group_plan_config(chat_id, 'mensual')['price']}",
+            parse_mode="Markdown"
+        )
+    else:
+        logger.error(f"❌ No se pudo expulsar a {display} - ¿El bot tiene permisos?")
+        await _safe_send(
+            group["admin_id"],
+            f"⚠️ *No se pudo expulsar automáticamente*\n\n"
+            f"👤 Usuario: [{display}]({chat_link})\n"
+            f"📌 Grupo: {group['group_name']}\n"
+            f"🔧 *Acción manual requerida:* Expulsa a este usuario desde Telegram",
+            parse_mode="Markdown"
+        )
+    
     return False
 
 
@@ -1750,20 +1793,56 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not result:
         return
 
-    chat_id    = result.chat.id
+    chat_id = result.chat.id
     new_status = result.new_chat_member.status
     old_status = result.old_chat_member.status
     new_member = result.new_chat_member.user
 
-    logger.info(
-        f"👥 ChatMember update: chat={chat_id}, user={new_member.id} "
-        f"({new_member.first_name}), {old_status} → {new_status}"
-    )
+    # 🔥 VERIFICACIÓN TEMPRANA - ANTES de que el usuario vea el grupo
+    if new_member.is_bot:
+        return
 
+    group = get_group_by_id(chat_id)
+    if not group:
+        return
+
+    # Si el usuario está intentando entrar (left → member)
+    if old_status in ("left", "kicked") and new_status == "member":
+        if group["type"] == "VIP":
+            # Verificar si tiene suscripción activa ANTES de dejarlo entrar
+            user_data = await db.get_user_by_id(new_member.id, chat_id)
+            
+            if user_data:
+                # Obtener estado actual
+                status = user_data.get('status')
+                end_date = user_data.get('end_date')
+                
+                # Si está expirado o no tiene suscripción activa
+                if status != 'active' or (end_date and end_date < datetime.now()):
+                    logger.info(f"🚫 Bloqueando entrada a usuario expirado: {new_member.id}")
+                    
+                    # Expulsar inmediatamente (ni siquiera lo deja ver el grupo)
+                    await _kick_user_with_retry(chat_id, new_member.id)
+                    
+                    # Notificar al admin
+                    await _safe_send(
+                        group["admin_id"],
+                        f"🚫 *Acceso denegado automáticamente*\n\n"
+                        f"👤 Usuario: {new_member.first_name}\n"
+                        f"🆔 ID: `{new_member.id}`\n"
+                        f"📌 Grupo: {group['group_name']}\n"
+                        f"⏰ Motivo: Suscripción expirada",
+                        parse_mode="Markdown"
+                    )
+                    return  # No continuar con el registro
+    
+    # Continuar con el flujo normal...
     joined = (
         old_status in ("left", "kicked", "restricted", "banned") and
         new_status in ("member", "administrator", "creator")
     )
+
+
     if not joined:
         return
 
