@@ -313,32 +313,32 @@ class Database:
     async def get_user_by_id(self, user_id: int, group_id: int):
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # ✅ Seleccionar todos los campos necesarios
                 cur.execute(
-                    "SELECT user_id, status FROM users WHERE user_id=%s AND group_id=%s LIMIT 1",
+                    "SELECT user_id, status, end_date, plan, trial_used FROM users "
+                    "WHERE user_id=%s AND group_id=%s LIMIT 1",
                     (user_id, group_id)
                 )
                 return cur.fetchone()
         return await self._run(_get)
 
     async def register_user_auto(self, group_id: int, user_id: int,
-                                  username: str, first_name: str):
-        """
-        Registra al usuario con trial. Usa FOR UPDATE para evitar race conditions.
-        Retorna (registered, result, end_date).
-        """
+                              username: str, first_name: str):
         now = datetime.now()
         trial_cfg = get_group_plan_config(group_id, "trial")
         trial_minutes = trial_cfg.get("minutes", 1440)
-
+    
         def _register(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # FOR UPDATE evita inserciones duplicadas concurrentes
+                # ✅ Bloquear la fila para evitar condiciones de carrera
                 cur.execute(
                     "SELECT user_id, trial_used, status, end_date FROM users "
                     "WHERE user_id=%s AND group_id=%s FOR UPDATE",
                     (user_id, group_id)
                 )
                 existing = cur.fetchone()
+                
+                # ✅ CASO 1: Usuario NUEVO
                 if not existing:
                     end_date = now + timedelta(minutes=trial_minutes)
                     cur.execute("""
@@ -346,7 +346,9 @@ class Database:
                             (user_id, group_id, username, first_name, plan,
                              start_date, end_date, trial_used, status)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active')
-                    """, (user_id, group_id, username, first_name, "trial", now, end_date, True))
+                    """, (user_id, group_id, username, first_name, "trial", 
+                          now, end_date, True))
+                    
                     cur.execute("""
                         INSERT INTO payments
                             (user_id, group_id, username, first_name, plan,
@@ -354,18 +356,29 @@ class Database:
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                     """, (user_id, group_id, username, first_name, "trial",
                           0, trial_minutes, now))
+                    
                     return True, "trial_nuevo", end_date
+                
+                # ✅ CASO 2: Usuario ACTIVO (con suscripción vigente)
                 elif existing['status'] == 'active' and existing['end_date'] > now:
-                    cur.execute(
-                        "UPDATE users SET username=%s, first_name=%s, updated_at=NOW() "
-                        "WHERE user_id=%s AND group_id=%s",
-                        (username, first_name, user_id, group_id)
-                    )
+                    cur.execute("""
+                        UPDATE users SET username=%s, first_name=%s, updated_at=NOW()
+                        WHERE user_id=%s AND group_id=%s
+                    """, (username, first_name, user_id, group_id))
+                    
                     return True, "activo", existing['end_date']
-                return False, "expirado", None
-
+                
+                # ✅ CASO 3: Usuario EXPIRADO
+                else:
+                    cur.execute("""
+                        UPDATE users SET username=%s, first_name=%s, updated_at=NOW()
+                        WHERE user_id=%s AND group_id=%s
+                    """, (username, first_name, user_id, group_id))
+                    
+                    return False, "expirado", None
+    
         return await self._run(_register)
-
+    
     async def register_free_user(self, chat_id: int, user_id: int,
                                   username: str, first_name: str) -> bool:
         def _reg(conn):
@@ -1806,38 +1819,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group:
         return
 
-    # Si el usuario está intentando entrar (left → member)
-    if old_status in ("left", "kicked") and new_status == "member":
-        if group["type"] == "VIP":
-            # Verificar si tiene suscripción activa ANTES de dejarlo entrar
-            user_data = await db.get_user_by_id(new_member.id, chat_id)
-            
-            if user_data:
-                # Obtener estado actual
-                status = user_data.get('status')
-                end_date = user_data.get('end_date')
-                
-                # Si está expirado o no tiene suscripción activa
-                if status != 'active' or (end_date and end_date < datetime.now()):
-                    logger.info(f"🚫 Bloqueando entrada a usuario expirado: {new_member.id}")
-                    
-                    # Expulsar inmediatamente (ni siquiera lo deja ver el grupo)
-                    await _kick_user_with_retry(chat_id, new_member.id)
-                    
-                    # Notificar al admin
-                    await _safe_send(
-                        group["admin_id"],
-                        f"🚫 *Acceso denegado automáticamente*\n\n"
-                        f"👤 Usuario: {new_member.first_name}\n"
-                        f"🆔 ID: `{new_member.id}`\n"
-                        f"📌 Grupo: {group['group_name']}\n"
-                        f"⏰ Motivo: Suscripción expirada",
-                        parse_mode="Markdown"
-                    )
-                    return  # No continuar con el registro
-    
-    # Continuar con el flujo normal...
-    joined = (
+      joined = (
         old_status in ("left", "kicked", "restricted", "banned") and
         new_status in ("member", "administrator", "creator")
     )
