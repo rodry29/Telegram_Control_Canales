@@ -2,6 +2,7 @@ import os
 import csv
 import asyncio
 import logging
+import re
 from io import StringIO
 from datetime import datetime, timedelta
 from typing import Optional
@@ -109,7 +110,6 @@ def get_group_plan_config(group_id: int, plan: str) -> dict:
 
 def fmt_price(amount) -> str:
     f = float(amount)
-    # FIX: usar round para evitar imprecisión de punto flotante
     return f"${f:.2f}" if round(f, 2) != round(f) else f"${int(round(f))}"
 
 def fmt_minutes(mins: int) -> str:
@@ -321,6 +321,17 @@ class Database:
                 return cur.fetchone()
         return await self._run(_get)
 
+    async def get_user_by_id_full(self, user_id: int, group_id: int):
+        """Obtiene todos los datos del usuario por ID (para uso en comandos)"""
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM users WHERE user_id=%s AND group_id=%s LIMIT 1",
+                    (user_id, group_id)
+                )
+                return cur.fetchone()
+        return await self._run(_get)
+
     async def register_user_auto(self, group_id: int, user_id: int,
                                  username: str, first_name: str):
         """
@@ -485,6 +496,67 @@ class Database:
                         f"📅 Expira: {expiry_str}"
                     )
                 return False, f"❌ No tengo registro de @{username}. Pídele que envíe un mensaje al bot."
+
+        return await self._run(_add)
+
+    async def add_or_update_user_by_id(self, group_id: int, user_id: int,
+                                       plan: str, first_name: str = "",
+                                       custom_price: float = None,
+                                       custom_days: int = None):
+        """Versión de add_or_update_user que trabaja directamente con user_id numérico"""
+        now = datetime.now()
+        if plan not in PLANS:
+            return False, "❌ Plan inválido"
+        config = get_group_plan_config(group_id, plan)
+
+        effective_price = custom_price if custom_price is not None else config.get('price', 0)
+        effective_days  = custom_days  if custom_days  is not None else config.get('days', 7)
+        effective_mins  = config.get('minutes', effective_days * 1440)
+
+        def _add(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT user_id, trial_used, status, first_name, username FROM users "
+                    "WHERE user_id=%s AND group_id=%s FOR UPDATE",
+                    (user_id, group_id)
+                )
+                existing = cur.fetchone()
+                if existing:
+                    if plan == "trial" and existing['trial_used']:
+                        return False, "❌ Este usuario ya usó su prueba gratuita"
+                    if plan == "trial":
+                        end_date    = now + timedelta(minutes=effective_mins)
+                        dur_minutes = effective_mins
+                        expiry_str  = end_date.strftime('%d/%m/%Y %H:%M')
+                    else:
+                        end_date    = now + timedelta(days=effective_days)
+                        dur_minutes = effective_days * 1440
+                        expiry_str  = end_date.strftime('%d/%m/%Y')
+                    fn = first_name or existing.get('first_name', '')
+                    username = existing.get('username', f"user_{user_id}")
+                    cur.execute("""
+                        UPDATE users SET
+                            plan=%s, start_date=%s, end_date=%s, status='active',
+                            updated_at=NOW(), first_name=%s,
+                            trial_used = trial_used OR %s,
+                            kicked_at  = NULL
+                        WHERE user_id=%s AND group_id=%s
+                    """, (plan, now, end_date, fn, plan == "trial", user_id, group_id))
+                    cur.execute("""
+                        INSERT INTO payments
+                            (user_id, group_id, username, first_name, plan,
+                             amount, duration_minutes, payment_date)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (user_id, group_id, username, fn,
+                          plan, effective_price, dur_minutes, now))
+                    price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
+                    display_name = fn if fn else username
+                    return True, (
+                        f"✅ *{display_name}* activado\n"
+                        f"📋 Plan: {plan} | 💰 {price_str}\n"
+                        f"📅 Expira: {expiry_str}"
+                    )
+                return False, f"❌ No tengo registro del usuario con ID {user_id}. Pídele que envíe un mensaje al bot."
 
         return await self._run(_add)
 
@@ -868,6 +940,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• 📆 Mensual: ${cfg_m['price']}\n\n"
                 f"Comandos disponibles:\n"
                 f"• `/add @usuario plan` - Agregar suscripción\n"
+                f"• También puedes RESPONDER al mensaje de registro con `/add plan`\n"
+                f"• O usar `/add ID plan` (ej: `/add 123456789 mensual`)\n"
                 f"• Los usuarios expiran automáticamente",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
@@ -997,7 +1071,163 @@ async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(msg, parse_mode="Markdown")
 
 
+# ==================== NUEVA FUNCIÓN: HANDLER PARA REPLY CON /add ====================
+async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Maneja respuestas con /add a mensajes de registro de trial.
+    Extrae automáticamente el ID del usuario del mensaje al que se responde.
+    """
+    if not update.message or not update.message.reply_to_message:
+        return
+    
+    # Verificar que el comando sea /add
+    if not update.message.text or not update.message.text.startswith('/add'):
+        return
+    
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Obtener el mensaje al que se está respondiendo
+    replied_msg = update.message.reply_to_message
+    
+    # Intentar extraer el user_id del mensaje de registro
+    target_user_id = None
+    target_username = None
+    target_first_name = None
+    
+    # Patrones comunes en los mensajes de registro
+    text = replied_msg.text or replied_msg.caption or ""
+    
+    logger.info(f"📝 Procesando reply a mensaje: {text[:100]}")
+    
+    # Buscar el ID en el mensaje (formato: 🆔 ID: 123456789)
+    id_match = re.search(r'🆔 ID:\s*`?(\d+)`?', text)
+    if id_match:
+        target_user_id = int(id_match.group(1))
+        logger.info(f"✅ ID encontrado en mensaje: {target_user_id}")
+    
+    # Buscar el nombre (formato: 👤 Nombre: E)
+    name_match = re.search(r'👤 Nombre:\s*(.+?)(?:\n|$)', text)
+    if name_match:
+        target_first_name = name_match.group(1).strip()
+        logger.info(f"✅ Nombre encontrado: {target_first_name}")
+    
+    # Buscar username si existe
+    username_match = re.search(r'@(\w+)', text)
+    if username_match:
+        target_username = username_match.group(1)
+        logger.info(f"✅ Username encontrado: @{target_username}")
+    
+    if not target_user_id:
+        await update.message.reply_text(
+            "❌ No pude encontrar el ID del usuario en el mensaje.\n"
+            "Asegúrate de responder al mensaje de registro del trial.\n\n"
+            "También puedes usar:\n"
+            "• `/add 123456789 mensual` (por ID)\n"
+            "• `/add @usuario mensual` (por username)",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Obtener el grupo actual
+    current_group = context.user_data.get('current_group')
+    if not current_group:
+        # Intentar obtener del chat actual si es un grupo
+        if update.effective_chat.type in ("group", "supergroup"):
+            current_group = chat_id
+        else:
+            await update.message.reply_text("❌ Usa /start primero para seleccionar un grupo")
+            return
+    
+    # Verificar permisos
+    if not can_manage_group(user_id, current_group) and user_id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ No autorizado para gestionar este grupo")
+        return
+    
+    # Parsear el comando: /add [plan] [precio] [días]
+    args = update.message.text.split()
+    
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ *Uso respondiendo al mensaje:*\n"
+            "`/add plan [precio] [días]`\n\n"
+            "*Ejemplos:*\n"
+            "• `/add mensual`\n"
+            "• `/add semanal 5.99`\n"
+            "• `/add mensual 15.99 45`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    plan = args[1].lower()
+    if plan not in PLANS:
+        await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal, mensual")
+        return
+    
+    custom_price = None
+    custom_days = None
+    
+    if len(args) >= 3:
+        try:
+            custom_price = float(args[2].replace(",", "."))
+            if custom_price < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Precio inválido", parse_mode="Markdown")
+            return
+    
+    if len(args) >= 4:
+        try:
+            custom_days = int(args[3])
+            if custom_days <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Días inválidos", parse_mode="Markdown")
+            return
+    
+    # Obtener información completa del usuario
+    username = target_username or f"user_{target_user_id}"
+    first_name = target_first_name or ""
+    
+    # Verificar si existe en BD, si no, crearlo
+    existing = await db.get_user_by_id(target_user_id, current_group)
+    if not existing:
+        logger.info(f"Usuario {target_user_id} no existe en BD, registrando...")
+        await db.register_free_user(current_group, target_user_id, username, first_name)
+    
+    # Activar la suscripción usando el método por ID
+    logger.info(f"🎯 Activando {plan} para usuario {target_user_id} via reply")
+    
+    success, msg = await db.add_or_update_user_by_id(
+        current_group, target_user_id, plan, first_name, custom_price, custom_days
+    )
+    
+    # Enviar confirmación
+    await update.message.reply_text(
+        f"✅ *Activación por respuesta*\n\n{msg}",
+        parse_mode="Markdown"
+    )
+    
+    # Notificar al usuario activado
+    try:
+        await context.bot.send_message(
+            target_user_id,
+            f"🎉 *¡Suscripción activada!*\n\n"
+            f"Tu plan *{plan}* en *{get_group_by_id(current_group)['group_name']}* ha sido activado.\n"
+            f"¡Gracias por tu compra!",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.warning(f"No se pudo notificar al usuario {target_user_id}: {e}")
+
+
+# ==================== FUNCIÓN MODIFICADA: add_user_command con soporte para ID numérico ====================
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🔥 NUEVO: Verificar si es una respuesta a un mensaje
+    if update.message and update.message.reply_to_message:
+        await handle_reply_add(update, context)
+        return
+    
     user_id       = update.effective_user.id
     chat_id       = update.effective_chat.id
     current_group = context.user_data.get('current_group')
@@ -1016,20 +1246,23 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg_s = get_group_plan_config(current_group, "semanal")
         cfg_m = get_group_plan_config(current_group, "mensual")
         await update.message.reply_text(
-            "❌ *Uso:* `/add @username plan [precio] [días]`\n\n"
+            "❌ *Uso:* `/add @username|ID plan [precio] [días]`\n\n"
             "*Planes disponibles:*\n"
             f"• `trial`   — {cfg_t['name']}\n"
             f"• `semanal` — {cfg_s['name']}\n"
             f"• `mensual` — {cfg_m['name']}\n\n"
             "*Ejemplos:*\n"
-            "`/add @juan semanal`          → precio del grupo\n"
-            "`/add @juan semanal 5.99`     → precio custom\n"
-            "`/add @juan semanal 5.99 10`  → precio y días custom",
+            "`/add @juan semanal`           → por username\n"
+            "`/add 123456789 mensual`       → por ID numérico\n"
+            "`/add @juan semanal 5.99`      → precio custom\n"
+            "`/add @juan semanal 5.99 10`   → precio y días custom\n\n"
+            "*También puedes RESPONDER al mensaje de registro con:*\n"
+            "`/add mensual`",
             parse_mode="Markdown"
         )
         return
 
-    username = context.args[0].replace("@", "")
+    identifier = context.args[0].replace("@", "")
     plan     = context.args[1].lower()
     if plan not in PLANS:
         await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal, mensual")
@@ -1060,6 +1293,37 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+    # 🔥 NUEVO: Detectar si es ID numérico o username
+    if identifier.isdigit():
+        # Es un ID numérico - usar el método especial
+        target_user_id = int(identifier)
+        first_name = ""
+        username = f"user_{target_user_id}"
+        
+        # Intentar obtener información del usuario desde el grupo
+        try:
+            member = await context.bot.get_chat_member(current_group, target_user_id)
+            if member and member.user:
+                first_name = member.user.first_name or ""
+                username = member.user.username or f"user_{target_user_id}"
+        except Exception as e:
+            logger.warning(f"No se pudo obtener info del usuario {target_user_id}: {e}")
+        
+        # Verificar si existe en BD, si no, crearlo
+        existing = await db.get_user_by_id(target_user_id, current_group)
+        if not existing:
+            logger.info(f"Usuario {target_user_id} no existe en BD, registrando...")
+            await db.register_free_user(current_group, target_user_id, username, first_name)
+        
+        # Activar usando el método por ID
+        success, msg = await db.add_or_update_user_by_id(
+            current_group, target_user_id, plan, first_name, custom_price, custom_days
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+    
+    # Si no es ID numérico, continuar con el flujo normal (por username)
+    username = identifier
     first_name = ""
     try:
         member = await context.bot.get_chat_member(current_group, username)
@@ -1477,16 +1741,18 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/searchgrupo nombre` - Buscar grupo\n\n"
         "*Admin de Grupo:*\n"
         "• `/start` - Panel de control\n"
-        "• `/add @user plan [precio] [días]` - Agregar usuario\n\n"
+        "• `/add @usuario|ID plan [precio] [días]` - Agregar usuario\n"
+        "• También puedes RESPONDER al mensaje de registro con `/add plan`\n\n"
         "*Planes disponibles:*\n"
         "• `trial`   - duración configurada por grupo\n"
         "• `semanal` - precio y días configurables\n"
         "• `mensual` - precio y días configurables\n\n"
         "*Ejemplos:*\n"
         "• `/add @juan semanal`\n"
+        "• `/add 123456789 mensual`\n"
         "• `/add @juan semanal 5.99`\n"
         "• `/add @juan semanal 5.99 10`\n"
-        "• `/add @maria mensual 19.99`"
+        "• Responder a mensaje de registro: `/add mensual`"
     )
     keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data="back_to_admin")]]
     await query.edit_message_text(
@@ -1788,7 +2054,11 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
                 f"📌 *Grupo:* {group['group_name']}\n"
                 f"⏱ *Duración:* {trial_str}\n"
                 f"📅 *Expira:* {expiry_str}\n\n"
-                f"_Se registró automáticamente al entrar._",
+                f"_Se registró automáticamente al entrar._\n\n"
+                f"💡 *Para activar suscripción:* RESPONDE a este mensaje con:\n"
+                f"• `/add mensual`\n"
+                f"• `/add semanal 5.99`\n"
+                f"• O usa: `/add {user_id} mensual`",
                 parse_mode="Markdown"
             )
             logger.info(f"🆕 Trial activado: {display} en {group['group_name']} hasta {expiry_str}")
@@ -2012,7 +2282,7 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"🆔 *ID:* `{user_id}`\n"
                 f"📌 *Grupo:* {group['group_name']}\n"
                 f"🔗 [Abrir chat]({chat_link})\n\n"
-                f"Para activarlo: `/add @{username} semanal`\n"
+                f"Para activarlo: `/add {user_id} semanal`\n"
                 f"Para expulsarlo: hazlo desde Telegram directamente.",
                 parse_mode="Markdown"
             )
@@ -2285,7 +2555,7 @@ async def sync_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ *Sincronización manual no disponible*\n\n"
         "La API de Telegram no permite a los bots listar miembros de un grupo.\n\n"
         "Los usuarios se registran automáticamente al *entrar al grupo*.\n"
-        "Para registrar uno manualmente: `/add @username plan`",
+        "Para registrar uno manualmente: `/add @usuario plan` o `/add ID plan`",
         parse_mode="Markdown"
     )
 
@@ -2311,7 +2581,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "add_user":
             await query.answer()
-            await query.edit_message_text("📝 Usa el comando: `/add @username plan`", parse_mode="Markdown")
+            await query.edit_message_text("📝 Usa el comando: `/add @username plan` o `/add ID plan`", parse_mode="Markdown")
         elif data == "list_active":
             await query.answer()
             await list_active_users(update, context)
