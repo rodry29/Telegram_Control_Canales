@@ -121,6 +121,100 @@ def fmt_minutes(mins: int) -> str:
         return f"{h}h {m}m" if m else f"{h}h"
     return f"{m} min"
 
+# ==================== HELPERS DE PAGO ====================
+def get_payment_keyboard(group_id: int, user_id: int) -> InlineKeyboardMarkup:
+    """Genera el teclado con botón de pago para un grupo específico."""
+    keyboard = [
+        [InlineKeyboardButton("💳 Pagar Acceso", callback_data="pay_{}_{}".format(group_id, user_id))]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_payment_info_text(group_id: int) -> str:
+    """Genera el mensaje completo de información de pago para un grupo."""
+    group = get_group_by_id(group_id)
+    if not group:
+        return "Grupo no encontrado"
+
+    settings = group.get("settings", {})
+    cfg_s = get_group_plan_config(group_id, "semanal")
+    cfg_m = get_group_plan_config(group_id, "mensual")
+
+    bank_data = settings.get("bank_data", "").strip()
+    payment_contact = settings.get("payment_contact", "ZonaEcFuego").strip()
+    paypal_data = settings.get("paypal_data", "").strip()
+
+    group_name = group.get("group_name", "VIP")
+    semanal_price = fmt_price(cfg_s.get("price", 10))
+    mensual_price = fmt_price(cfg_m.get("price", 20))
+    semanal_days = cfg_s.get("days", 7)
+    mensual_days = cfg_m.get("days", 30)
+
+    lines = []
+    lines.append("💰 *INFORMACIÓN DE PAGO — " + group_name + "*")
+    lines.append("")
+    lines.append("📋 *Planes disponibles:*")
+    lines.append("• 📅 Semanal (" + str(semanal_days) + " días): *" + semanal_price + "*")
+    lines.append("• 📆 Mensual (" + str(mensual_days) + " días): *" + mensual_price + "*")
+    lines.append("")
+
+    if bank_data:
+        lines.append("🏦 *Transferencia Bancaria:*")
+        lines.append(bank_data)
+        lines.append("")
+
+    if paypal_data:
+        lines.append("🅿️ *PayPal:*")
+        lines.append(paypal_data)
+        lines.append("")
+
+    if not bank_data and not paypal_data:
+        lines.append("⚠️ *Métodos de pago no configurados aún.*")
+        lines.append("Contacta al administrador para más información.")
+        lines.append("")
+
+    lines.append("📤 *Después de pagar:*")
+    lines.append("Envía el comprobante a @" + payment_contact)
+    lines.append("")
+    lines.append("⏱ *Tiempo de activación:*")
+    lines.append("Tu acceso se activará cuando un administrador valide la transferencia.")
+    lines.append("")
+    lines.append("🔄 ¿No recibiste los datos? Presiona el botón de nuevo.")
+
+    return chr(10).join(lines)
+
+async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str = "comando"):
+    """Envía la información de pago por privado al usuario."""
+    group = get_group_by_id(group_id)
+    if not group:
+        return False
+
+    try:
+        await bot.send_message(
+            user_id,
+            get_payment_info_text(group_id),
+            parse_mode="Markdown",
+            reply_markup=get_payment_keyboard(group_id, user_id)
+        )
+
+        display = "Usuario " + str(user_id)
+        chat_link = "tg://user?id=" + str(user_id)
+        group_name = group.get("group_name", "VIP")
+        await _safe_send(
+            group["admin_id"],
+            "💳 *Nuevo lead de pago*" + chr(10) + chr(10) +
+            "👤 Usuario: [" + display + "](" + chat_link + ")" + chr(10) +
+            "🆔 ID: `" + str(user_id) + "`" + chr(10) +
+            "📌 Grupo: " + group_name + chr(10) +
+            "🔔 Acción: *" + triggered_by + "*" + chr(10) + chr(10) +
+            "_Esperando comprobante en el contacto configurado._",
+            parse_mode="Markdown"
+        )
+        return True
+    except Exception as e:
+        logger.warning("No se pudo enviar info de pago a " + str(user_id) + ": " + str(e))
+        return False
+
+
 # ==================== BASE DE DATOS ====================
 class Database:
     def __init__(self, db_url: str):
@@ -1742,7 +1836,11 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Admin de Grupo:*\n"
         "• `/start` - Panel de control\n"
         "• `/add @usuario|ID plan [precio] [días]` - Agregar usuario\n"
-        "• También puedes RESPONDER al mensaje de registro con `/add plan`\n\n"
+        "• También puedes RESPONDER al mensaje de registro con `/add plan`\n"
+        "• `/configpago group_id` - Configurar datos de pago\n\n"
+        "*Usuarios (VIP):*\n"
+        "• `/pagar` - Ver datos de pago para renovar acceso\n"
+        "• Presiona 💳 Pagar Acceso en los mensajes del bot\n\n"
         "*Planes disponibles:*\n"
         "• `trial`   - duración configurada por grupo\n"
         "• `semanal` - precio y días configurables\n"
@@ -2043,7 +2141,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
                 f"🎉 *¡Bienvenido al grupo VIP!*\n\n"
                 f"✨ Tu período de prueba de *{trial_str}* ha comenzado.\n"
                 f"📅 Tu acceso expira el: *{expiry_str}*\n\n"
-                f"Para continuar después del trial, contacta al administrador.",
+                f"💳 ¿Quieres continuar después del trial? Presiona el botón para ver los datos de pago:",
+                reply_markup=get_payment_keyboard(chat_id, user_id),
                 parse_mode="Markdown"
             )
             await _safe_send(
@@ -2093,9 +2192,9 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
             user_id,
             f"🚫 *Acceso denegado — {group['group_name']}*\n\n"
             f"{motivo_usuario}\n\n"
-            f"Para acceder, contacta al administrador y adquiere un plan:\n"
-            f"• 📅 Semanal: {fmt_price(cfg_s['price'])}\n"
-            f"• 📆 Mensual: {fmt_price(cfg_m['price'])}",
+            f"💳 ¿Quieres renovar tu acceso? Presiona el botón para ver los datos de pago:",
+            reply_markup=get_payment_keyboard(chat_id, user_id),
+            
             parse_mode="Markdown"
         )
         await _safe_send(
@@ -2311,6 +2410,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton(f"💲 Precio semanal: {fmt_price(cfg_semanal['price'])}", callback_data=f"cfg_price_semanal_{group_id}")],
         [InlineKeyboardButton(f"📆 Días mensual: {cfg_mensual['days']}d",            callback_data=f"cfg_dur_mensual_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio mensual: {fmt_price(cfg_mensual['price'])}", callback_data=f"cfg_price_mensual_{group_id}")],
+        [InlineKeyboardButton("💳 Configurar Pago",                                 callback_data=f"cfg_payment_{group_id}")],
         [InlineKeyboardButton("🔙 Volver",                                            callback_data=f"select_group_{group_id}")]
     ]
     await query.edit_message_text(
@@ -2470,6 +2570,10 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Prioridad: input de configuración de precios/trial
+    if context.user_data.get('config_payment_step') and context.user_data.get('config_payment_group_id'):
+        await handle_payment_config_input(update, context)
+        return
+
     if context.user_data.get('cfg_field') and context.user_data.get('cfg_group_id'):
         await handle_cfg_input(update, context)
         return
@@ -2574,6 +2678,250 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== CALLBACK HANDLER ====================
+
+async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /pagar - Envía información de pago al usuario por privado.
+    """
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    target_group = None
+
+    if update.effective_chat.type in ("group", "supergroup"):
+        group = get_group_by_id(chat_id)
+        if group and group.get("type") == "VIP":
+            target_group = chat_id
+        else:
+            await update.message.reply_text(
+                "❌ Este grupo no está configurado como VIP.",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        current_group = context.user_data.get('current_group')
+        if context.args and context.args[0].isdigit():
+            target_group = int(context.args[0])
+        elif current_group:
+            target_group = current_group
+        else:
+            await update.message.reply_text(
+                "❌ *Uso del comando /pagar*" + chr(10) + chr(10) +
+                "• En un grupo VIP: simplemente escribe `/pagar`" + chr(10) +
+                "• En privado: `/pagar ID_DEL_GRUPO`" + chr(10) +
+                "• O selecciona un grupo primero con /start",
+                parse_mode="Markdown"
+            )
+            return
+
+    group = get_group_by_id(target_group)
+    if not group:
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
+
+    if group.get("type") != "VIP":
+        await update.message.reply_text("❌ Este comando solo está disponible para grupos VIP")
+        return
+
+    success = await send_payment_info(context.bot, user_id, target_group, triggered_by="comando /pagar")
+
+    if success:
+        if update.effective_chat.type in ("group", "supergroup"):
+            await update.message.reply_text(
+                "💳 *Te he enviado los datos de pago por privado.*" + chr(10) +
+                "Revisa tu chat conmigo para ver la información.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "💳 *Datos de pago enviados.*" + chr(10) +
+                "Revisa el mensaje anterior para ver la información de pago.",
+                parse_mode="Markdown"
+            )
+    else:
+        await update.message.reply_text(
+            "❌ No se pudieron enviar los datos de pago. "
+            "Asegúrate de haber iniciado una conversación privada conmigo primero (/start).",
+            parse_mode="Markdown"
+        )
+
+
+async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /configpago - Configura los datos de pago para un grupo VIP.
+    """
+    user_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Uso: `/configpago group_id`*" + chr(10) + chr(10) +
+            "Ejemplo: `/configpago -1001234567890`" + chr(10) + chr(10) +
+            "Después te pediré los datos bancarios y el contacto para comprobantes.",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID del grupo debe ser un número")
+        return
+
+    if not can_manage_group(user_id, group_id) and user_id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ No autorizado para gestionar este grupo")
+        return
+
+    group = get_group_by_id(group_id)
+    if not group:
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
+
+    if group.get("type") != "VIP":
+        await update.message.reply_text("❌ Este comando solo es para grupos VIP")
+        return
+
+    context.user_data['config_payment_group_id'] = group_id
+    context.user_data['config_payment_step'] = 'bank_data'
+
+    settings = group.get("settings", {})
+    current_bank = settings.get("bank_data", "")
+
+    await update.message.reply_text(
+        "⚙️ *Configuración de Pago — " + group['group_name'] + "*" + chr(10) + chr(10) +
+        "Paso 1/3: *Datos bancarios*" + chr(10) +
+        "Envía los datos de transferencia bancaria (texto libre)." + chr(10) +
+        "Puedes incluir: banco, tipo de cuenta, número de cuenta, nombre del titular, cédula, etc." + chr(10) + chr(10) +
+        "📋 *Actual:*" + chr(10) + "`" + (current_bank or "No configurado") + "`" + chr(10) + chr(10) +
+        "*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_payment_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler para recibir los pasos de configuración de pago."""
+    if update.effective_chat.type != "private":
+        return
+
+    step = context.user_data.get('config_payment_step')
+    group_id = context.user_data.get('config_payment_group_id')
+
+    if not step or not group_id:
+        return
+
+    if not can_manage_group(update.effective_user.id, group_id) and update.effective_user.id != SUPER_ADMIN_ID:
+        return
+
+    text = update.message.text.strip()
+    group = get_group_by_id(group_id)
+    if not group:
+        await update.message.reply_text("❌ Grupo no encontrado")
+        context.user_data.pop('config_payment_step', None)
+        context.user_data.pop('config_payment_group_id', None)
+        return
+
+    settings = dict(group.get("settings", {}))
+
+    if step == 'bank_data':
+        if text.lower() == 'saltar':
+            pass
+        elif text.lower() == 'eliminar':
+            settings.pop('bank_data', None)
+        else:
+            settings['bank_data'] = text
+
+        context.user_data['config_payment_step'] = 'payment_contact'
+        current_contact = settings.get("payment_contact", "")
+        await update.message.reply_text(
+            "✅ *Datos bancarios guardados.*" + chr(10) + chr(10) +
+            "Paso 2/3: *Contacto para comprobantes*" + chr(10) +
+            "Envía el username de Telegram donde se enviarán los comprobantes." + chr(10) +
+            "Ejemplo: `@ZonaEcFuego` o `ZonaEcFuego`" + chr(10) + chr(10) +
+            "📋 *Actual:* `" + (current_contact or "No configurado") + "`" + chr(10) + chr(10) +
+            "*Escribe 'saltar' para dejar el valor actual.*",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif step == 'payment_contact':
+        if text.lower() == 'saltar':
+            pass
+        else:
+            contact = text.lstrip('@').strip()
+            settings['payment_contact'] = contact
+
+        context.user_data['config_payment_step'] = 'paypal_data'
+        current_paypal = settings.get("paypal_data", "")
+        await update.message.reply_text(
+            "✅ *Contacto guardado.*" + chr(10) + chr(10) +
+            "Paso 3/3: *PayPal (opcional)*" + chr(10) +
+            "Envía los datos de PayPal si deseas ofrecerlo como método de pago." + chr(10) +
+            "Ejemplo: email de PayPal o link de pago." + chr(10) + chr(10) +
+            "📋 *Actual:* `" + (current_paypal or "No configurado") + "`" + chr(10) + chr(10) +
+            "*Escribe 'saltar' para omitir, o 'eliminar' para borrar.*",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif step == 'paypal_data':
+        if text.lower() == 'saltar':
+            pass
+        elif text.lower() == 'eliminar':
+            settings.pop('paypal_data', None)
+        else:
+            settings['paypal_data'] = text
+
+        group["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
+
+        context.user_data.pop('config_payment_step', None)
+        context.user_data.pop('config_payment_group_id', None)
+
+        bank = settings.get('bank_data', 'No configurado')
+        contact = settings.get('payment_contact', 'No configurado')
+        paypal = settings.get('paypal_data', 'No configurado')
+
+        await update.message.reply_text(
+            "✅ *Configuración de pago completada*" + chr(10) + chr(10) +
+            "📌 *Grupo:* " + group['group_name'] + chr(10) + chr(10) +
+            "🏦 *Bancaria:*" + chr(10) + "`" + bank + "`" + chr(10) + chr(10) +
+            "📤 *Contacto:* @" + contact + chr(10) + chr(10) +
+            "🅿️ *PayPal:* `" + paypal + "`" + chr(10) + chr(10) +
+            "Los usuarios ahora podrán usar `/pagar` o el botón 💳 para ver esta información.",
+            parse_mode="Markdown"
+        )
+        return
+
+
+async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Callback para iniciar configuración de pago desde el menú de ajustes."""
+    query = update.callback_query
+    await query.answer()
+
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.edit_message_text("❌ No autorizado")
+        return
+
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+
+    context.user_data['config_payment_group_id'] = group_id
+    context.user_data['config_payment_step'] = 'bank_data'
+
+    settings = group.get("settings", {})
+    current_bank = settings.get("bank_data", "")
+
+    await query.edit_message_text(
+        "⚙️ *Configuración de Pago — " + group['group_name'] + "*" + chr(10) + chr(10) +
+        "Paso 1/3: *Datos bancarios*" + chr(10) +
+        "Envía los datos de transferencia bancaria (texto libre)." + chr(10) +
+        "Puedes incluir: banco, tipo de cuenta, número de cuenta, nombre del titular, cédula, etc." + chr(10) + chr(10) +
+        "📋 *Actual:*" + chr(10) + "`" + (current_bank or "No configurado") + "`" + chr(10) + chr(10) +
+        "*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
+        parse_mode="Markdown"
+    )
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data  = query.data
@@ -2685,6 +3033,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cfg_duration_request(update, context, group_id, "mensual")
         elif data == "trial_stats":
             await trial_stats(update, context)
+        elif data.startswith("pay_"):
+            await query.answer("💳 Enviando datos de pago...")
+            parts = data.split("_")
+            if len(parts) >= 3:
+                pay_group_id = int(parts[1])
+                pay_user_id = int(parts[2])
+                if query.from_user.id == pay_user_id:
+                    await send_payment_info(context.bot, pay_user_id, pay_group_id, triggered_by="botón Pagar")
+                else:
+                    await query.answer("❌ Este botón no es para ti", show_alert=True)
+            else:
+                await query.answer("❌ Error en datos de pago", show_alert=True)
+        elif data.startswith("cfg_payment_"):
+            group_id = int(data.replace("cfg_payment_", ""))
+            await config_payment_callback(update, context, group_id)
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -2762,7 +3125,8 @@ async def check_expired_subscriptions():
                 user_id,
                 f"⏰ *Tu acceso ha expirado*\n\n"
                 f"Tu plan *{plan}* en el grupo *{group['group_name']}* ha vencido.\n\n"
-                f"Para renovar, contacta al administrador.",
+                f"💳 ¿Quieres renovar? Presiona el botón para ver los datos de pago:",
+                reply_markup=get_payment_keyboard(group_id, user_id),
                 parse_mode="Markdown"
             )
 
@@ -2873,6 +3237,8 @@ async def main():
     bot_app.add_handler(CommandHandler("syncgroup",   sync_group))
     bot_app.add_handler(CommandHandler("syncall",     sync_all_groups))
     bot_app.add_handler(CommandHandler("searchgrupo", search_group))
+    bot_app.add_handler(CommandHandler("pagar",       pay_command))
+    bot_app.add_handler(CommandHandler("configpago",  config_payment_command))
     bot_app.add_handler(CommandHandler("test",        test))
     bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
 
