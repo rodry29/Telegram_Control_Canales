@@ -2829,6 +2829,10 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         else:
             settings['bank_data'] = text
 
+        # GUARDAR EN BD INMEDIATAMENTE
+        group["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
+
         context.user_data['config_payment_step'] = 'payment_contact'
         current_contact = settings.get("payment_contact", "")
         await update.message.reply_text(
@@ -2848,6 +2852,10 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         else:
             contact = text.lstrip('@').strip()
             settings['payment_contact'] = contact
+
+        # GUARDAR EN BD INMEDIATAMENTE
+        group["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
 
         context.user_data['config_payment_step'] = 'paypal_data'
         current_paypal = settings.get("paypal_data", "")
