@@ -5,7 +5,8 @@ import logging
 import re
 from io import StringIO
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict, Any
+import json
 
 import psycopg2
 from psycopg2 import pool
@@ -304,7 +305,27 @@ class Database:
                         duration_minutes INTEGER,
                         payment_date     TIMESTAMP DEFAULT NOW()
                     )
-                """)
+                """);
+                # NUEVA TABLA: warning_logs (registro de avisos enviados)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS warning_logs (
+                        id           SERIAL PRIMARY KEY,
+                        user_id      BIGINT NOT NULL,
+                        group_id     BIGINT NOT NULL,
+                        warning_type TEXT NOT NULL,
+                        sent_at      TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(user_id, group_id, warning_type)
+                    )
+                """);
+                # Índices para warning_logs
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_warning_logs_lookup
+                    ON warning_logs(user_id, group_id, warning_type)
+                """);
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_warning_logs_group
+                    ON warning_logs(group_id, sent_at)
+                """);
                 # Migraciones seguras
                 cur.execute("""
                     DO $$
@@ -698,7 +719,7 @@ class Database:
                 return {"summary": summary, "total": total,
                         "new_users": new_users, "recent": recent}
 
-        return await self._run(_get)
+        
 
     async def get_total_monthly_earnings(self):
         now = datetime.now()
@@ -847,7 +868,7 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM users")
                 return cur.fetchone()[0]
-        return await self._run(_get)
+        
 
     async def get_trial_stats(self, group_id: int) -> dict:
         def _get(conn):
@@ -893,6 +914,133 @@ class Database:
                 }
 
         return await self._run(_get)
+
+    # ============================================================
+    # NUEVOS MÉTODOS PARA SISTEMA DE AVISOS DE EXPIRACIÓN
+    # ============================================================
+
+    async def get_warning_config(self, group_id: int) -> dict:
+        """
+        Obtiene la configuración de avisos para un grupo.
+        Si no existe, retorna valores por defecto.
+        """
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT settings 
+                    FROM groups 
+                    WHERE group_id = %s
+                """, (group_id,))
+                row = cur.fetchone()
+                if row and row['settings']:
+                    settings = row['settings'] if isinstance(row['settings'], dict) else {}
+                    wc = settings.get('warning_config')
+                    if wc:
+                        return wc
+                return None
+        result = await self._run(_get)
+        
+        if result:
+            return result
+        
+        # Configuración por defecto
+        return {
+            "enabled": False,
+            "warnings": [
+                {"minutes_before": 15, "message": "⏳ *Tu trial expira en {minutes_left} minutos*\n\n📅 Expira: {expiry_time}\n\n💳 ¿Quieres seguir disfrutando del contenido?\nPresiona el botón para ver los datos de pago:"}
+            ]
+        }
+
+    async def save_warning_config(self, group_id: int, config: dict):
+        """Guarda la configuración de avisos para un grupo."""
+        def _save(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT settings FROM groups WHERE group_id = %s
+                """, (group_id,))
+                row = cur.fetchone()
+                settings = row[0] if row and row[0] else {}
+                if isinstance(settings, str):
+                    import json
+                    settings = json.loads(settings)
+                settings['warning_config'] = config
+                cur.execute("""
+                    UPDATE groups 
+                    SET settings = %s
+                    WHERE group_id = %s
+                """, (json.dumps(settings), group_id))
+        await self._run(_save)
+        
+        # Actualizar en memoria también
+        group = get_group_by_id(group_id)
+        if group:
+            if 'settings' not in group:
+                group['settings'] = {}
+            group['settings']['warning_config'] = config
+
+    async def get_users_for_warning(self, group_id: int, minutes_before: int) -> list:
+        """
+        Obtiene usuarios que necesitan recibir un aviso específico.
+        Busca usuarios cuyo trial expire dentro de 'minutes_before' minutos
+        y que no hayan recibido ya este tipo de aviso.
+        """
+        warning_threshold = datetime.now() + timedelta(minutes=minutes_before)
+        warning_type = f"warning_{minutes_before}min"
+        
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT u.user_id, u.username, u.first_name, u.end_date, u.plan
+                    FROM users u
+                    LEFT JOIN warning_logs w 
+                        ON u.user_id = w.user_id 
+                        AND u.group_id = w.group_id 
+                        AND w.warning_type = %s
+                    WHERE u.group_id = %s
+                      AND u.status = 'active'
+                      AND u.plan = 'trial'
+                      AND u.end_date <= %s
+                      AND u.end_date > NOW()
+                      AND w.id IS NULL
+                    ORDER BY u.end_date ASC
+                """, (warning_type, group_id, warning_threshold))
+                return cur.fetchall()
+        return await self._run(_get)
+
+    async def log_warning_sent(self, user_id: int, group_id: int, warning_type: str):
+        """Registra que un aviso fue enviado para evitar duplicados."""
+        def _log(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO warning_logs (user_id, group_id, warning_type, sent_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (user_id, group_id, warning_type) DO UPDATE
+                    SET sent_at = NOW()
+                """, (user_id, group_id, warning_type))
+        await self._run(_log)
+
+    async def get_warning_stats(self, group_id: int) -> list:
+        """Estadísticas de avisos enviados para un grupo."""
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT warning_type, COUNT(*) as count
+                    FROM warning_logs
+                    WHERE group_id = %s
+                    GROUP BY warning_type
+                """, (group_id,))
+                return cur.fetchall()
+        return await self._run(_get)
+
+    async def clear_warning_logs(self, group_id: int = None):
+        """Limpia registros de avisos (útil para testing o reset)."""
+        def _clear(conn):
+            with conn.cursor() as cur:
+                if group_id:
+                    cur.execute("DELETE FROM warning_logs WHERE group_id = %s", (group_id,))
+                else:
+                    cur.execute("DELETE FROM warning_logs")
+        await self._run(_clear)
 
 
 # ==================== INSTANCIAS GLOBALES ====================
@@ -2411,6 +2559,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton(f"📆 Días mensual: {cfg_mensual['days']}d",            callback_data=f"cfg_dur_mensual_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio mensual: {fmt_price(cfg_mensual['price'])}", callback_data=f"cfg_price_mensual_{group_id}")],
         [InlineKeyboardButton("💳 Configurar Pago",                                 callback_data=f"cfg_payment_{group_id}")],
+        [InlineKeyboardButton("🔔 Configurar Avisos",                               callback_data=f"cfg_warnings_{group_id}")],
         [InlineKeyboardButton("🔙 Volver",                                            callback_data=f"select_group_{group_id}")]
     ]
     await query.edit_message_text(
@@ -2567,6 +2716,11 @@ async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
+        return
+
+    # Prioridad: input de configuración de avisos
+    if context.user_data.get('warning_step') and context.user_data.get('warning_group_id'):
+        await handle_warning_input(update, context)
         return
 
     # Prioridad: input de configuración de precios/trial
@@ -3056,6 +3210,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("cfg_payment_"):
             group_id = int(data.replace("cfg_payment_", ""))
             await config_payment_callback(update, context, group_id)
+        elif data == "cfg_warnings":
+            group_id = context.user_data.get('current_group')
+            if group_id:
+                await menu_warning_settings(update, context, group_id)
+            else:
+                await query.answer("❌ Selecciona un grupo primero", show_alert=True)
+        elif data.startswith("cfg_warnings_"):
+            group_id = int(data.replace("cfg_warnings_", ""))
+            await menu_warning_settings(update, context, group_id)
+        elif data.startswith("warn_toggle_"):
+            group_id = int(data.replace("warn_toggle_", ""))
+            await toggle_warnings(update, context, group_id)
+        elif data.startswith("warn_add_"):
+            group_id = int(data.replace("warn_add_", ""))
+            await add_warning_step1(update, context, group_id)
+        elif data.startswith("warn_edit_"):
+            parts = data.split("_")
+            group_id = int(parts[2])
+            warning_index = int(parts[3])
+            await edit_warning_step1(update, context, group_id, warning_index)
+        elif data.startswith("warn_delete_"):
+            parts = data.split("_")
+            group_id = int(parts[2])
+            warning_index = int(parts[3])
+            await delete_warning(update, context, group_id, warning_index)
+        elif data.startswith("warn_test_"):
+            group_id = int(data.replace("warn_test_", ""))
+            await test_warning(update, context, group_id)
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -3066,6 +3248,93 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Ocurrió un error, intenta de nuevo", show_alert=True)
         except Exception:
             pass
+
+
+# ==================== SISTEMA DE AVISOS DE EXPIRACIÓN ====================
+
+async def send_trial_warnings():
+    """
+    Envía avisos de expiración a usuarios con trial por vencer.
+    Revisa cada grupo VIP configurado y envía avisos según la configuración
+    personalizada de cada grupo.
+    """
+    logger.info("⏰ Enviando avisos de expiración de trial...")
+    
+    for group in GROUPS:
+        if group.get("type", "VIP") != "VIP":
+            continue
+        
+        group_id = group["group_id"]
+        
+        # Obtener configuración de avisos para este grupo
+        try:
+            warning_config = await db.get_warning_config(group_id)
+        except Exception as e:
+            logger.error(f"❌ Error obteniendo warning_config para grupo {group_id}: {e}")
+            continue
+        
+        if not warning_config or not warning_config.get("enabled", False):
+            logger.debug(f"⏭️ Avisos deshabilitados para grupo {group_id}")
+            continue
+        
+        warnings = warning_config.get("warnings", [])
+        if not warnings:
+            continue
+        
+        for warning in warnings:
+            minutes_before = warning.get("minutes_before", 15)
+            message_template = warning.get("message", "⏳ Tu trial expira pronto")
+            
+            # Obtener usuarios que necesitan este aviso
+            try:
+                users = await db.get_users_for_warning(group_id, minutes_before)
+            except Exception as e:
+                logger.error(f"❌ Error obteniendo usuarios para aviso en grupo {group_id}: {e}")
+                continue
+            
+            if not users:
+                continue
+            
+            warning_type = f"warning_{minutes_before}min"
+            
+            for user in users:
+                user_id = user['user_id']
+                end_date = user['end_date']
+                remaining = end_date - datetime.now()
+                mins_left = max(0, int(remaining.total_seconds() / 60))
+                
+                if mins_left <= 0:
+                    continue
+                
+                # Formatear el mensaje
+                expiry_time = end_date.strftime('%H:%M')
+                expiry_datetime = end_date.strftime('%d/%m/%Y %H:%M')
+                
+                # Reemplazar variables en el mensaje
+                message = message_template.replace(
+                    "{minutes_left}", str(mins_left)
+                ).replace(
+                    "{expiry_time}", expiry_time
+                ).replace(
+                    "{expiry_datetime}", expiry_datetime
+                ).replace(
+                    "{group_name}", group.get("group_name", "VIP")
+                ).replace(
+                    "{user_name}", user.get("first_name", "Usuario") or "Usuario"
+                )
+                
+                # Enviar aviso
+                try:
+                    await bot_app.bot.send_message(
+                        user_id,
+                        message,
+                        reply_markup=get_payment_keyboard(group_id, user_id),
+                        parse_mode="Markdown"
+                    )
+                    await db.log_warning_sent(user_id, group_id, warning_type)
+                    logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes (grupo {group_id})")
+                except Exception as e:
+                    logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
 
 
 # ==================== TAREAS PROGRAMADAS ====================
@@ -3287,6 +3556,14 @@ async def main():
         id='auto_backup',
         replace_existing=True
     )
+    # NUEVO: Scheduler para avisos de expiración
+    scheduler.add_job(
+        send_trial_warnings,
+        'interval',
+        minutes=1,
+        id='trial_warnings',
+        replace_existing=True
+    )
     scheduler.start()
 
     logger.info("🤖 Bot iniciado")
@@ -3297,6 +3574,396 @@ async def main():
         allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
     )
     await asyncio.Event().wait()
+
+
+# ==================== CONFIGURACIÓN DE AVISOS (HANDLERS) ====================
+
+async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Muestra el menú de configuración de avisos para un grupo."""
+    query = update.callback_query
+    await query.answer()
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.edit_message_text("❌ No autorizado")
+        return
+    
+    warning_config = await db.get_warning_config(group_id)
+    enabled = warning_config.get("enabled", False)
+    warnings = warning_config.get("warnings", [])
+    
+    status_emoji = "🟢" if enabled else "🔴"
+    status_text = "ACTIVADOS" if enabled else "DESACTIVADOS"
+    
+    msg = (
+        f"🔔 *Configuración de Avisos — {group['group_name']}*\n\n"
+        f"Estado: {status_emoji} *{status_text}*\n\n"
+        f"*Avisos configurados ({len(warnings)}):*\n"
+    )
+    
+    for i, w in enumerate(warnings, 1):
+        mins = w.get("minutes_before", 15)
+        msg += f"\n{i}. ⏰ {mins} minutos antes de expirar"
+    
+    if not warnings:
+        msg += "\n_Ninguno configurado_"
+    
+    msg += (
+        f"\n\n*Variables disponibles en mensajes:*\n"
+        f"• `{{minutes_left}}` — minutos restantes\n"
+        f"• `{{expiry_time}}` — hora de expiración (HH:MM)\n"
+        f"• `{{expiry_datetime}}` — fecha y hora (DD/MM/YYYY HH:MM)\n"
+        f"• `{{group_name}}` — nombre del grupo\n"
+        f"• `{{user_name}}` — nombre del usuario"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton(f"{status_emoji} {'Desactivar' if enabled else 'Activar'} avisos", 
+                              callback_data=f"warn_toggle_{group_id}")],
+        [InlineKeyboardButton("➕ Añadir aviso", callback_data=f"warn_add_{group_id}")],
+    ]
+    
+    # Botones para editar/eliminar cada aviso
+    for i, w in enumerate(warnings):
+        mins = w.get("minutes_before", 15)
+        keyboard.append([
+            InlineKeyboardButton(f"✏️ Editar {mins}min", callback_data=f"warn_edit_{group_id}_{i}"),
+            InlineKeyboardButton("🗑️ Eliminar", callback_data=f"warn_delete_{group_id}_{i}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🧪 Probar aviso", callback_data=f"warn_test_{group_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data=f"cfg_group_{group_id}")])
+    
+    await query.edit_message_text(
+        msg,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def toggle_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Activa o desactiva los avisos para un grupo."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.answer("❌ No autorizado", show_alert=True)
+        return
+    
+    warning_config = await db.get_warning_config(group_id)
+    warning_config["enabled"] = not warning_config.get("enabled", False)
+    
+    await db.save_warning_config(group_id, warning_config)
+    
+    await menu_warning_settings(update, context, group_id)
+
+
+async def add_warning_step1(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Paso 1: Pedir minutos antes para el nuevo aviso."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.answer("❌ No autorizado", show_alert=True)
+        return
+    
+    context.user_data['warning_group_id'] = group_id
+    context.user_data['warning_step'] = 'minutes'
+    context.user_data['warning_index'] = None  # Nuevo aviso
+    
+    await query.edit_message_text(
+        "➕ *Nuevo aviso de expiración*\n\n"
+        "Envía cuántos minutos antes de expirar debe enviarse el aviso.\n\n"
+        "*Ejemplos:*\n"
+        "• `15` — 15 minutos antes\n"
+        "• `60` — 1 hora antes\n"
+        "• `5` — 5 minutos antes (último aviso)\n\n"
+        "*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+
+async def edit_warning_step1(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, warning_index: int):
+    """Paso 1 de edición: Pedir nuevos minutos o saltar."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.answer("❌ No autorizado", show_alert=True)
+        return
+    
+    warning_config = await db.get_warning_config(group_id)
+    warnings = warning_config.get("warnings", [])
+    
+    if warning_index >= len(warnings):
+        await query.edit_message_text("❌ Aviso no encontrado")
+        return
+    
+    existing = warnings[warning_index]
+    
+    context.user_data['warning_group_id'] = group_id
+    context.user_data['warning_step'] = 'edit_minutes'
+    context.user_data['warning_index'] = warning_index
+    
+    await query.edit_message_text(
+        f"✏️ *Editar aviso*\n\n"
+        f"Actual: {existing.get('minutes_before', 15)} minutos antes\n\n"
+        f"Envía los nuevos minutos, o escribe 'saltar' para mantener el actual.\n\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+
+async def delete_warning(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, warning_index: int):
+    """Elimina un aviso de la configuración."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.answer("❌ No autorizado", show_alert=True)
+        return
+    
+    warning_config = await db.get_warning_config(group_id)
+    warnings = warning_config.get("warnings", [])
+    
+    if warning_index < len(warnings):
+        removed = warnings.pop(warning_index)
+        warning_config["warnings"] = warnings
+        await db.save_warning_config(group_id, warning_config)
+        await query.edit_message_text(
+            f"✅ Aviso eliminado ({removed.get('minutes_before', 15)} min)",
+            parse_mode="Markdown"
+        )
+        await asyncio.sleep(1)
+    
+    await menu_warning_settings(update, context, group_id)
+
+
+async def test_warning(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Envía un aviso de prueba al admin."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not can_manage_group(query.from_user.id, group_id) and query.from_user.id != SUPER_ADMIN_ID:
+        await query.answer("❌ No autorizado", show_alert=True)
+        return
+    
+    warning_config = await db.get_warning_config(group_id)
+    warnings = warning_config.get("warnings", [])
+    
+    if not warnings:
+        await query.answer("❌ No hay avisos configurados", show_alert=True)
+        return
+    
+    # Usar el primer aviso como prueba
+    test_warning = warnings[0]
+    message_template = test_warning.get("message", "⏳ Tu trial expira pronto")
+    
+    # Simular valores
+    message = message_template.replace(
+        "{minutes_left}", "15"
+    ).replace(
+        "{expiry_time}", "22:45"
+    ).replace(
+        "{expiry_datetime}", "15/06/2026 22:45"
+    ).replace(
+        "{group_name}", get_group_by_id(group_id).get("group_name", "VIP")
+    ).replace(
+        "{user_name}", query.from_user.first_name or "Usuario"
+    )
+    
+    try:
+        await context.bot.send_message(
+            query.from_user.id,
+            f"🧪 *AVISO DE PRUEBA*\n\n"
+            f"Este es cómo se vería el aviso para un usuario:\n\n"
+            f"---\n{message}\n---\n\n"
+            f"Si te gusta, los avisos están listos para enviarse.",
+            reply_markup=get_payment_keyboard(group_id, query.from_user.id),
+            parse_mode="Markdown"
+        )
+        await query.edit_message_text(
+            "✅ *Aviso de prueba enviado a tu chat privado*\n\n"
+            "Revisa cómo se ve y decide si quieres ajustar el mensaje.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.warning(f"Error enviando prueba: {e}")
+        await query.edit_message_text(
+            "❌ Error enviando prueba. Asegúrate de haber iniciado chat privado con el bot.",
+            parse_mode="Markdown"
+        )
+    
+    await asyncio.sleep(2)
+    await menu_warning_settings(update, context, group_id)
+
+
+async def handle_warning_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa input de texto para configuración de avisos."""
+    if update.effective_chat.type != "private":
+        return
+    
+    step = context.user_data.get('warning_step')
+    group_id = context.user_data.get('warning_group_id')
+    
+    if not step or not group_id:
+        return
+    
+    if not can_manage_group(update.effective_user.id, group_id) and update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    text = update.message.text.strip().lower()
+    
+    if text == 'cancelar':
+        context.user_data.pop('warning_step', None)
+        context.user_data.pop('warning_group_id', None)
+        context.user_data.pop('warning_index', None)
+        context.user_data.pop('warning_minutes', None)
+        await update.message.reply_text("❌ Configuración de aviso cancelada")
+        return
+    
+    warning_config = await db.get_warning_config(group_id)
+    warnings = warning_config.get("warnings", [])
+    warning_index = context.user_data.get('warning_index')
+    
+    if step == 'minutes' or step == 'edit_minutes':
+        # Validar minutos
+        if text == 'saltar' and step == 'edit_minutes':
+            # Mantener minutos actuales, pasar al mensaje
+            context.user_data['warning_step'] = 'edit_message'
+            existing = warnings[warning_index] if warning_index is not None and warning_index < len(warnings) else {}
+            current_msg = existing.get("message", "⏳ Tu trial expira en {minutes_left} minutos")
+            await update.message.reply_text(
+                f"✏️ *Editar mensaje del aviso*\n\n"
+                f"Mensaje actual:\n`{current_msg}`\n\n"
+                f"Envía el nuevo mensaje, o escribe 'saltar' para mantenerlo.\n\n"
+                f"*Variables disponibles:*\n"
+                f"• `{{minutes_left}}` — minutos restantes\n"
+                f"• `{{expiry_time}}` — hora de expiración\n"
+                f"• `{{expiry_datetime}}` — fecha y hora\n"
+                f"• `{{group_name}}` — nombre del grupo\n"
+                f"• `{{user_name}}` — nombre del usuario\n\n"
+                f"*Escribe 'cancelar' para cancelar.*",
+                parse_mode="Markdown"
+            )
+            return
+        
+        try:
+            minutes = int(text)
+            if minutes <= 0 or minutes > 1440:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Debe ser un número entre 1 y 1440 (24 horas).\n"
+                "Ejemplos: 5, 15, 60, 120",
+                parse_mode="Markdown"
+            )
+            return
+        
+        context.user_data['warning_minutes'] = minutes
+        
+        if step == 'edit_minutes':
+            # Guardar minutos y pasar a editar mensaje
+            if warning_index is not None and warning_index < len(warnings):
+                warnings[warning_index]["minutes_before"] = minutes
+                warning_config["warnings"] = warnings
+                await db.save_warning_config(group_id, warning_config)
+            
+            context.user_data['warning_step'] = 'edit_message'
+            existing = warnings[warning_index] if warning_index is not None and warning_index < len(warnings) else {}
+            current_msg = existing.get("message", "⏳ Tu trial expira en {minutes_left} minutos")
+            await update.message.reply_text(
+                f"✏️ *Editar mensaje del aviso*\n\n"
+                f"Mensaje actual:\n`{current_msg}`\n\n"
+                f"Envía el nuevo mensaje, o escribe 'saltar' para mantenerlo.\n\n"
+                f"*Variables disponibles:*\n"
+                f"• `{{minutes_left}}` — minutos restantes\n"
+                f"• `{{expiry_time}}` — hora de expiración\n"
+                f"• `{{expiry_datetime}}` — fecha y hora\n"
+                f"• `{{group_name}}` — nombre del grupo\n"
+                f"• `{{user_name}}` — nombre del usuario\n\n"
+                f"*Escribe 'cancelar' para cancelar.*",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Nuevo aviso: paso 2 (mensaje)
+        context.user_data['warning_step'] = 'message'
+        await update.message.reply_text(
+            f"✅ *Aviso a los {minutes} minutos* configurado.\n\n"
+            f"Ahora envía el mensaje que recibirá el usuario.\n\n"
+            f"*Variables disponibles:*\n"
+            f"• `{{minutes_left}}` — minutos restantes\n"
+            f"• `{{expiry_time}}` — hora de expiración (HH:MM)\n"
+            f"• `{{expiry_datetime}}` — fecha y hora (DD/MM/YYYY HH:MM)\n"
+            f"• `{{group_name}}` — nombre del grupo\n"
+            f"• `{{user_name}}` — nombre del usuario\n\n"
+            f"*Ejemplo:*\n"
+            f"`⏳ Tu trial expira en {{minutes_left}} minutos!\n\n"
+            f"📅 Expira: {{expiry_time}}\n\n"
+            f"💳 ¿Quieres seguir? Presiona el botón:`\n\n"
+            f"*Escribe 'cancelar' para cancelar.*",
+            parse_mode="Markdown"
+        )
+        return
+    
+    elif step == 'message' or step == 'edit_message':
+        if text == 'saltar' and step == 'edit_message':
+            # Mantener mensaje actual
+            context.user_data.pop('warning_step', None)
+            context.user_data.pop('warning_group_id', None)
+            context.user_data.pop('warning_index', None)
+            context.user_data.pop('warning_minutes', None)
+            await update.message.reply_text("✅ Aviso actualizado correctamente")
+            # Botón para volver
+            keyboard = [[InlineKeyboardButton("🔙 Volver a configuración de avisos", 
+                                              callback_data=f"cfg_warnings_{group_id}")]]
+            await update.message.reply_text(
+                "🔔 Configuración guardada.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        # Guardar mensaje
+        message_text = update.message.text.strip()
+        
+        if step == 'edit_message' and warning_index is not None:
+            # Editar existente
+            if warning_index < len(warnings):
+                warnings[warning_index]["message"] = message_text
+                warning_config["warnings"] = warnings
+                await db.save_warning_config(group_id, warning_config)
+        else:
+            # Nuevo aviso
+            minutes = context.user_data.get('warning_minutes', 15)
+            warnings.append({
+                "minutes_before": minutes,
+                "message": message_text
+            })
+            # Ordenar por minutos (mayor a menor para que el más lejano vaya primero)
+            warnings.sort(key=lambda w: w.get("minutes_before", 0), reverse=True)
+            warning_config["warnings"] = warnings
+            await db.save_warning_config(group_id, warning_config)
+        
+        # Limpiar estado
+        context.user_data.pop('warning_step', None)
+        context.user_data.pop('warning_group_id', None)
+        context.user_data.pop('warning_index', None)
+        context.user_data.pop('warning_minutes', None)
+        
+        await update.message.reply_text("✅ *Aviso guardado correctamente*")
+        # Botón para volver
+        keyboard = [[InlineKeyboardButton("🔙 Volver a configuración de avisos", 
+                                          callback_data=f"cfg_warnings_{group_id}")]]
+        await update.message.reply_text(
+            "🔔 Configuración completada.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 if __name__ == "__main__":
