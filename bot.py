@@ -2330,6 +2330,19 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
 
     logger.info(f"🚫 Acceso denegado ({result_code}): expulsando a {display}")
 
+    # ===== ANTI-DUPLICADO: Verificar si usuario ya está fuera =====
+    # Si ya fue expulsado por otro handler/proceso, no enviar notificaciones duplicadas
+    try:
+        member_check = await bot_app.bot.get_chat_member(chat_id, user_id)
+        if member_check.status in ("left", "kicked", "banned"):
+            logger.info(f"⏭️ Usuario {display} ya está fuera del grupo {group['group_name']} "
+                       f"(status: {member_check.status}) — omitiendo notificaciones duplicadas")
+            return False
+    except Exception as e:
+        # Si falla la verificación, continuar normalmente
+        logger.debug(f"No se pudo verificar estado previo de {user_id}: {e}")
+    # ================================================================
+
     kick_success = await _kick_user_with_retry(chat_id, user_id)
 
     cfg_s = get_group_plan_config(chat_id, "semanal")
