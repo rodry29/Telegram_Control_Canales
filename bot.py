@@ -3048,7 +3048,6 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
     if data.startswith("bc|"):
         parts = data.split("|")
         # parts[0] = "bc", parts[1] = acción, parts[2] = group_id, parts[3+] = resto
-        
         if len(parts) < 3:
             await query.answer("❌ Error en datos", show_alert=True)
             return
@@ -3126,15 +3125,15 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
         # ---------- HISTORIAL ----------
         elif action == "history":
             await broadcast_history_callback(update, context, group_id)
-            
-        else:
-            await query.answer("❌ Acción desconocida", show_alert=True)
-    
+
+        # ---------- VOLVER AL MENÚ ----------
         elif action == "menu":
-            # Volver al menú de broadcast
             context.user_data['current_group'] = group_id
             await broadcast_menu_callback(update, context)
             
+        else:
+            await query.answer("❌ Acción desconocida", show_alert=True)
+                
     # Callbacks antiguos (compatibilidad) - puedes eliminar esto después
     elif data.startswith("bc_filter_") or data.startswith("bc_cancel_") or data.startswith("bc_confirm_"):
         logger.warning(f"Callback antigo detectado: {data}. Ignorando.")
