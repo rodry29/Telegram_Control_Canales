@@ -2709,12 +2709,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await test_warning(update, context, int(data.replace("warn_test_", "")))
         elif data == "broadcast_menu":
             await broadcast_menu_callback(update, context)
-        elif data.startswith("bc|menu|"):
-            parts = data.split("|")
-            if len(parts) >= 3:
-                group_id = int(parts[2])
-                context.user_data['current_group'] = group_id
-                await broadcast_menu_callback(update, context)
+        elif data.startswith("bc|"):
+            await broadcast_callback_handler(update, context)
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -3027,11 +3023,11 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.update({'broadcast_group_id': group_id, 'broadcast_step': 'filter'})
     keyboard = [
-        [InlineKeyboardButton("🆓 Solo trial SIN compra",       callback_data=f"bc_filter_{group_id}_trial_only")],
-        [InlineKeyboardButton("💳 Solo con suscripción activa", callback_data=f"bc_filter_{group_id}_subscribed_only")],
-        [InlineKeyboardButton("⏰ Solo expirados no renovados", callback_data=f"bc_filter_{group_id}_expired_only")],
-        [InlineKeyboardButton("👥 TODOS los que usaron trial",  callback_data=f"bc_filter_{group_id}_all_trial")],
-        [InlineKeyboardButton("❌ Cancelar",                    callback_data=f"bc_cancel_{group_id}")]
+        [InlineKeyboardButton("🆓 Solo trial SIN compra",       callback_data=f"bc|filter|{group_id}|trial_only")],
+        [InlineKeyboardButton("💳 Solo con suscripción activa", callback_data=f"bc|filter|{group_id}|subscribed_only")],
+        [InlineKeyboardButton("⏰ Solo expirados no renovados", callback_data=f"bc|filter|{group_id}|expired_only")],
+        [InlineKeyboardButton("👥 TODOS los que usaron trial",  callback_data=f"bc|filter|{group_id}|all_trial")],
+        [InlineKeyboardButton("❌ Cancelar",                    callback_data=f"bc|cancel|{group_id}")]
     ]
     await update.message.reply_text(
         f"📢 *Broadcast Masivo — {group['group_name']}*\n\nSelecciona a quién enviar el mensaje:",
