@@ -998,7 +998,7 @@ async def _safe_send(chat_id: int, text: str, **kwargs):
         await bot_app.bot.send_message(chat_id, text, **kwargs)
     except Exception as e:
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
-
+        return None
 
 # ==================== EXPULSIÓN CON REINTENTOS ====================
 async def _kick_user_with_retry(group_id: int, user_id: int, retries: int = 3) -> bool:
@@ -3251,6 +3251,7 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
 
 async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: str, sent_by: int):
     targets = await db.get_broadcast_targets(group_id, filter_type)
+    logger.info(f"DEBUG execute_broadcast START: targets={len(targets)}, filter={filter_type}")
     if not targets:
         await _safe_send(sent_by, "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.",
                          parse_mode="Markdown")
