@@ -2707,6 +2707,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await delete_warning(update, context, int(parts[2]), int(parts[3]))
         elif data.startswith("warn_test_"):
             await test_warning(update, context, int(data.replace("warn_test_", "")))
+        elif data == "broadcast_menu":
+            await broadcast_menu_callback(update, context)
         elif data.startswith("bc|menu|"):
             parts = data.split("|")
             if len(parts) >= 3:
@@ -3127,6 +3129,11 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
             
         else:
             await query.answer("❌ Acción desconocida", show_alert=True)
+
+        elif action == "menu":
+            # Volver al menú de broadcast
+            context.user_data['current_group'] = group_id
+            await broadcast_menu_callback(update, context)
             
     # Callbacks antiguos (compatibilidad) - puedes eliminar esto después
     elif data.startswith("bc_filter_") or data.startswith("bc_cancel_") or data.startswith("bc_confirm_"):
