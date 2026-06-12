@@ -357,19 +357,25 @@ class Database:
                     END $$;
                 """)
                 # ============================================================
-                # MIGRACIÓN: Corregir trial_used para usuarios antiguos
-                # Usuarios con plan='trial' pero trial_used=FALSE/NULL
-                # deben tener trial_used=TRUE porque obviamente usaron el trial
+                # MIGRACIÓN: Corregir trial_used para usuarios que usaron trial
+                # Un usuario usó trial si tiene un pago con plan='trial' en la tabla payments.
+                # Esto corrige usuarios que tengan plan='trial', 'semanal', 'mensual'
+                # o cualquier otro plan, siempre que alguna vez tuvieron trial.
                 # ============================================================
                 cur.execute("""
-                    UPDATE users 
+                    UPDATE users u
                     SET trial_used = TRUE, updated_at = NOW()
-                    WHERE plan = 'trial' 
-                      AND (trial_used = FALSE OR trial_used IS NULL)
+                    WHERE (u.trial_used = FALSE OR u.trial_used IS NULL)
+                      AND EXISTS (
+                          SELECT 1 FROM payments p 
+                          WHERE p.user_id = u.user_id 
+                            AND p.group_id = u.group_id
+                            AND p.plan = 'trial'
+                      )
                 """)
                 fixed_count = cur.rowcount
                 if fixed_count > 0:
-                    logger.info(f"🔧 Migración: {fixed_count} usuarios con plan='trial' corregidos a trial_used=TRUE")
+                    logger.info(f"🔧 Migración: {fixed_count} usuarios corregidos a trial_used=TRUE (tenían registro de trial en payments)")
                 # Índices
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group    ON users(group_id, status)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
@@ -4397,6 +4403,112 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
         parse_mode="Markdown"
     )
 # ==================== MAIN ====================
+async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando temporal para diagnosticar y corregir trial_used."""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo Super Admin")
+        return
+    
+    group_id = context.user_data.get('current_group')
+    if not group_id and context.args:
+        try:
+            group_id = int(context.args[0])
+        except ValueError:
+            pass
+    
+    if not group_id:
+        await update.message.reply_text("❌ Usa /fixtrial o /fixtrial GROUP_ID")
+        return
+    
+    # Diagnosticar
+    def _diag(conn):
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Total usuarios en el grupo
+            cur.execute("SELECT COUNT(*) as total FROM users WHERE group_id=%s", (group_id,))
+            total = cur.fetchone()['total']
+            
+            # Con trial_used=TRUE
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND trial_used=TRUE", (group_id,))
+            trial_true = cur.fetchone()['c']
+            
+            # Con trial_used=FALSE
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND trial_used=FALSE", (group_id,))
+            trial_false = cur.fetchone()['c']
+            
+            # Con trial_used IS NULL
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND trial_used IS NULL", (group_id,))
+            trial_null = cur.fetchone()['c']
+            
+            # Con plan='trial'
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND plan='trial'", (group_id,))
+            plan_trial = cur.fetchone()['c']
+            
+            # Con pagos de trial
+            cur.execute("""
+                SELECT COUNT(DISTINCT user_id) as c 
+                FROM payments 
+                WHERE group_id=%s AND plan='trial'
+            """, (group_id,))
+            payments_trial = cur.fetchone()['c']
+            
+            # Usuarios que deberían corregirse (tienen pago trial pero trial_used!=TRUE)
+            cur.execute("""
+                SELECT COUNT(*) as c 
+                FROM users u
+                WHERE u.group_id = %s
+                  AND (u.trial_used = FALSE OR u.trial_used IS NULL)
+                  AND EXISTS (
+                      SELECT 1 FROM payments p 
+                      WHERE p.user_id = u.user_id 
+                        AND p.group_id = u.group_id
+                        AND p.plan = 'trial'
+                  )
+            """, (group_id,))
+            need_fix = cur.fetchone()['c']
+            
+            return {
+                'total': total, 'trial_true': trial_true, 'trial_false': trial_false,
+                'trial_null': trial_null, 'plan_trial': plan_trial,
+                'payments_trial': payments_trial, 'need_fix': need_fix
+            }
+    
+    diag = await db._run(_diag)
+    
+    msg = (
+        f"🔍 *Diagnóstico trial_used — Grupo {group_id}*\n\n"
+        f"• Total usuarios: {diag['total']}\n"
+        f"• trial_used=TRUE: {diag['trial_true']}\n"
+        f"• trial_used=FALSE: {diag['trial_false']}\n"
+        f"• trial_used=NULL: {diag['trial_null']}\n"
+        f"• plan='trial': {diag['plan_trial']}\n"
+        f"• Con pago de trial: {diag['payments_trial']}\n"
+        f"• *Necesitan corrección:* {diag['need_fix']}\n\n"
+    )
+    
+    if diag['need_fix'] > 0:
+        # Aplicar corrección
+        def _fix(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users u
+                    SET trial_used = TRUE, updated_at = NOW()
+                    WHERE u.group_id = %s
+                      AND (u.trial_used = FALSE OR u.trial_used IS NULL)
+                      AND EXISTS (
+                          SELECT 1 FROM payments p 
+                          WHERE p.user_id = u.user_id 
+                            AND p.group_id = u.group_id
+                            AND p.plan = 'trial'
+                      )
+                """, (group_id,))
+                return cur.rowcount
+        
+        fixed = await db._run(_fix)
+        msg += f"✅ *Corregidos: {fixed} usuarios*"
+    else:
+        msg += "✅ No hay usuarios que corregir"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 async def main():
     global bot_app
     await db.init_tables()
@@ -4424,6 +4536,7 @@ async def main():
     bot_app.add_handler(CommandHandler("test",        test))
     bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
     bot_app.add_handler(CommandHandler("broadcast",   broadcast_command))
+    bot_app.add_handler(CommandHandler("fixtrial", fix_trial_command))
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
