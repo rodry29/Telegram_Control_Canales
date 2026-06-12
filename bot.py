@@ -3150,7 +3150,6 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     expired     = await db.get_broadcast_targets(group_id, 'expired_only')
     all_trial   = await db.get_broadcast_targets(group_id, 'all_trial')
     
-    # ✅ CORREGIDO: Usar | como separador en TODOS los callback_data
     keyboard = [
         [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc|filter|{group_id}|trial_only")],
         [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})",   callback_data=f"bc|filter|{group_id}|subscribed_only")],
@@ -3169,26 +3168,6 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
         f"Selecciona el filtro:",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
-    
-    keyboard = [
-        [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc_filter_{group_id}_trial_only")],
-        [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})",   callback_data=f"bc_filter_{group_id}_subscribed_only")],
-        [InlineKeyboardButton(f"⏰ Solo expirados ({len(expired)})",       callback_data=f"bc_filter_{group_id}_expired_only")],
-        [InlineKeyboardButton(f"👥 Todos ({len(all_trial)})",              callback_data=f"bc_filter_{group_id}_all_trial")],
-        [InlineKeyboardButton("📜 Historial",                              callback_data=f"bc_history_{group_id}")],
-        [InlineKeyboardButton("🔙 Volver",                                 callback_data=f"select_group_{group_id}")]
-    ]
-    await query.edit_message_text(
-        f"📢 *Broadcast Masivo — {group['group_name']}*\n\n"
-        f"📊 *Destinatarios disponibles:*\n"
-        f"• 🆓 Trial sin compra: *{len(trial_only)}*\n"
-        f"• 💳 Con suscripción activa: *{len(subscribed)}*\n"
-        f"• ⏰ Expirados no renovados: *{len(expired)}*\n"
-        f"• 👥 Total que usaron trial: *{len(all_trial)}*\n\n"
-        f"Selecciona el filtro:",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
-    )
-
 
 async def broadcast_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int = None):
     query = update.callback_query
