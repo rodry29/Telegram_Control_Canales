@@ -356,6 +356,20 @@ class Database:
                         END IF;
                     END $$;
                 """)
+                # ============================================================
+                # MIGRACIÓN: Corregir trial_used para usuarios antiguos
+                # Usuarios con plan='trial' pero trial_used=FALSE/NULL
+                # deben tener trial_used=TRUE porque obviamente usaron el trial
+                # ============================================================
+                cur.execute("""
+                    UPDATE users 
+                    SET trial_used = TRUE, updated_at = NOW()
+                    WHERE plan = 'trial' 
+                      AND (trial_used = FALSE OR trial_used IS NULL)
+                """)
+                fixed_count = cur.rowcount
+                if fixed_count > 0:
+                    logger.info(f"🔧 Migración: {fixed_count} usuarios con plan='trial' corregidos a trial_used=TRUE")
                 # Índices
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_group    ON users(group_id, status)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)")
@@ -936,13 +950,29 @@ class Database:
         """
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # ============================================================
+                # FIX CRÍTICO: Usar (plan='trial' OR trial_used=TRUE) para identificar
+                # usuarios que usaron trial, ya que muchos usuarios antiguos tienen
+                # plan='trial' pero trial_used=FALSE/NULL por migraciones o registros
+                # manuales anteriores.
+                # ============================================================
+                
+                # Subquery base: usuarios que usaron trial (plan='trial' O trial_used=TRUE)
+                trial_base = """
+                    SELECT user_id, username, first_name, group_id, plan, status, end_date
+                    FROM users
+                    WHERE group_id = %s
+                      AND (plan = 'trial' OR trial_used = TRUE OR trial_used IS NULL)
+                """
+                
                 if filter_type == 'trial_only':
-                    # Usaron trial pero NUNCA hicieron un pago con amount > 0
+                    # Usaron trial (plan='trial' o trial_used=TRUE) pero NUNCA pagaron
+                    # FIX: Incluimos trial_used IS NULL porque usuarios antiguos pueden tener NULL
                     cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
                         FROM users u
                         WHERE u.group_id = %s
-                          AND u.trial_used = TRUE
+                          AND (u.plan = 'trial' OR u.trial_used = TRUE OR u.trial_used IS NULL)
                           AND NOT EXISTS (
                               SELECT 1 FROM payments p 
                               WHERE p.user_id = u.user_id 
@@ -953,12 +983,13 @@ class Database:
                     """, (group_id,))
                     
                 elif filter_type == 'subscribed_only':
-                    # Tienen suscripción activa (plan != 'trial' y status='active')
+                    # Tienen suscripción activa pagada (plan != 'trial' y status='active')
+                    # FIX: Requiere que hayan usado trial (trial_used=TRUE) o tengan plan pago
                     cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
                         FROM users u
                         WHERE u.group_id = %s
-                          AND u.trial_used = TRUE
+                          AND (u.trial_used = TRUE OR u.trial_used IS NULL)
                           AND u.plan != 'trial'
                           AND u.status = 'active'
                           AND u.end_date > NOW()
@@ -971,7 +1002,7 @@ class Database:
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
                         FROM users u
                         WHERE u.group_id = %s
-                          AND u.trial_used = TRUE
+                          AND (u.trial_used = TRUE OR u.trial_used IS NULL)
                           AND u.status = 'expired'
                           AND EXISTS (
                               SELECT 1 FROM payments p 
@@ -983,60 +1014,19 @@ class Database:
                     """, (group_id,))
                     
                 elif filter_type == 'all_trial':
-                    # Todos los que usaron trial (cualquier estado)
+                    # Todos los que usaron trial o tienen plan='trial' (cualquier estado)
+                    # FIX: Incluimos plan='trial' para capturar usuarios antiguos
                     cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
                         FROM users u
                         WHERE u.group_id = %s
-                          AND u.trial_used = TRUE
+                          AND (u.plan = 'trial' OR u.trial_used = TRUE OR u.trial_used IS NULL)
                         ORDER BY u.user_id
                     """, (group_id,))
                     
                 else:
                     return []
                     
-                return cur.fetchall()
-        return await self._run(_get)
-
-    async def log_broadcast_sent(self, group_id: int, filter_type: str, 
-                                  message_preview: str, total_targets: int,
-                                  success_count: int, fail_count: int,
-                                  sent_by: int):
-        """Registra un broadcast enviado para historial."""
-        def _log(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS broadcast_logs (
-                        id            SERIAL PRIMARY KEY,
-                        group_id      BIGINT NOT NULL,
-                        filter_type   TEXT NOT NULL,
-                        message_preview TEXT,
-                        total_targets INTEGER NOT NULL,
-                        success_count INTEGER NOT NULL,
-                        fail_count    INTEGER NOT NULL,
-                        sent_by       BIGINT NOT NULL,
-                        sent_at       TIMESTAMP DEFAULT NOW()
-                    )
-                """)
-                cur.execute("""
-                    INSERT INTO broadcast_logs 
-                        (group_id, filter_type, message_preview, total_targets,
-                         success_count, fail_count, sent_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (group_id, filter_type, message_preview[:200], 
-                      total_targets, success_count, fail_count, sent_by))
-        await self._run(_log)
-
-    async def get_broadcast_history(self, group_id: int, limit: int = 10):
-        """Obtiene historial de broadcasts de un grupo."""
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT * FROM broadcast_logs
-                    WHERE group_id = %s
-                    ORDER BY sent_at DESC
-                    LIMIT %s
-                """, (group_id, limit))
                 return cur.fetchall()
         return await self._run(_get)
     
@@ -4181,27 +4171,28 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     
-    # Estadísticas rápidas
-    trial_stats = await db.get_trial_stats(group_id)
-    total_trial = trial_stats.get('total_trial_users', 0)
-    converted = trial_stats.get('converted_users', 0)
-    not_converted = total_trial - converted
+    # FIX: Obtener conteos reales de cada filtro para mostrar números exactos
+    trial_only = await db.get_broadcast_targets(group_id, 'trial_only')
+    subscribed = await db.get_broadcast_targets(group_id, 'subscribed_only')
+    expired = await db.get_broadcast_targets(group_id, 'expired_only')
+    all_trial = await db.get_broadcast_targets(group_id, 'all_trial')
     
     keyboard = [
-        [InlineKeyboardButton("🆓 Solo sin compra", callback_data=f"bc_filter_{group_id}_trial_only")],
-        [InlineKeyboardButton("💳 Solo suscriptos", callback_data=f"bc_filter_{group_id}_subscribed_only")],
-        [InlineKeyboardButton("⏰ Solo expirados", callback_data=f"bc_filter_{group_id}_expired_only")],
-        [InlineKeyboardButton("👥 Todos", callback_data=f"bc_filter_{group_id}_all_trial")],
+        [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})", callback_data=f"bc_filter_{group_id}_trial_only")],
+        [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})", callback_data=f"bc_filter_{group_id}_subscribed_only")],
+        [InlineKeyboardButton(f"⏰ Solo expirados ({len(expired)})", callback_data=f"bc_filter_{group_id}_expired_only")],
+        [InlineKeyboardButton(f"👥 Todos ({len(all_trial)})", callback_data=f"bc_filter_{group_id}_all_trial")],
         [InlineKeyboardButton("📜 Historial", callback_data=f"bc_history_{group_id}")],
         [InlineKeyboardButton("🔙 Volver", callback_data=f"select_group_{group_id}")]
     ]
     
     await query.edit_message_text(
         f"📢 *Broadcast Masivo — {group['group_name']}*\n\n"
-        f"📊 *Estadísticas de trial:*\n"
-        f"• Total que usaron trial: {total_trial}\n"
-        f"• Convertidos a pago: {converted}\n"
-        f"• Sin comprar: {not_converted}\n\n"
+        f"📊 *Destinatarios disponibles:*\n"
+        f"• 🆓 Trial sin compra: *{len(trial_only)}*\n"
+        f"• 💳 Con suscripción activa: *{len(subscribed)}*\n"
+        f"• ⏰ Expirados no renovados: *{len(expired)}*\n"
+        f"• 👥 Total que usaron trial: *{len(all_trial)}*\n\n"
         f"Selecciona el filtro de destinatarios:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
