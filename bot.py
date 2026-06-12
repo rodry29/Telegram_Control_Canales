@@ -3129,7 +3129,7 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
             
         else:
             await query.answer("❌ Acción desconocida", show_alert=True)
-
+    
         elif action == "menu":
             # Volver al menú de broadcast
             context.user_data['current_group'] = group_id
@@ -3139,7 +3139,6 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
     elif data.startswith("bc_filter_") or data.startswith("bc_cancel_") or data.startswith("bc_confirm_"):
         logger.warning(f"Callback antigo detectado: {data}. Ignorando.")
         await query.answer("❌ Por favor usa el menú actualizado", show_alert=True)
-
 
 async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
