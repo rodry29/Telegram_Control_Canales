@@ -3133,11 +3133,6 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
             
         else:
             await query.answer("❌ Acción desconocida", show_alert=True)
-                
-    # Callbacks antiguos (compatibilidad) - puedes eliminar esto después
-    elif data.startswith("bc_filter_") or data.startswith("bc_cancel_") or data.startswith("bc_confirm_"):
-        logger.warning(f"Callback antigo detectado: {data}. Ignorando.")
-        await query.answer("❌ Por favor usa el menú actualizado", show_alert=True)
 
 async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3154,7 +3149,8 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     subscribed  = await db.get_broadcast_targets(group_id, 'subscribed_only')
     expired     = await db.get_broadcast_targets(group_id, 'expired_only')
     all_trial   = await db.get_broadcast_targets(group_id, 'all_trial')
-    # USAR | COMO SEPARADOR PARA EVITAR CONFLICTO CON GUIONES EN GROUP_ID
+    
+    # ✅ CORREGIDO: Usar | como separador en TODOS los callback_data
     keyboard = [
         [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc|filter|{group_id}|trial_only")],
         [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})",   callback_data=f"bc|filter|{group_id}|subscribed_only")],
@@ -3172,6 +3168,7 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
         f"• 👥 Total que usaron trial: *{len(all_trial)}*\n\n"
         f"Selecciona el filtro:",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
     )
     keyboard = [
         [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc_filter_{group_id}_trial_only")],
