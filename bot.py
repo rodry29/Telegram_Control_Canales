@@ -3169,7 +3169,7 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
         f"Selecciona el filtro:",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
-    )
+    
     keyboard = [
         [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc_filter_{group_id}_trial_only")],
         [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})",   callback_data=f"bc_filter_{group_id}_subscribed_only")],
