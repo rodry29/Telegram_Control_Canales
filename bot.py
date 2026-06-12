@@ -958,6 +958,8 @@ class Database:
 
     async def save_warning_config(self, group_id: int, config: dict):
         """Guarda la configuración de avisos para un grupo."""
+        import json
+        
         def _save(conn):
             with conn.cursor() as cur:
                 cur.execute("""
@@ -966,7 +968,6 @@ class Database:
                 row = cur.fetchone()
                 settings = row[0] if row and row[0] else {}
                 if isinstance(settings, str):
-                    import json
                     settings = json.loads(settings)
                 settings['warning_config'] = config
                 cur.execute("""
