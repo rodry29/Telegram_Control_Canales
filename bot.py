@@ -2707,16 +2707,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await delete_warning(update, context, int(parts[2]), int(parts[3]))
         elif data.startswith("warn_test_"):
             await test_warning(update, context, int(data.replace("warn_test_", "")))
-        elif data.startswith("bc_filter_"):
-            await broadcast_callback_handler(update, context)
-        elif data.startswith("bc_cancel_"):
-            await broadcast_callback_handler(update, context)
-        elif data.startswith("bc_confirm_"):
-            await broadcast_callback_handler(update, context)
-        elif data == "broadcast_menu":
-            await broadcast_menu_callback(update, context)
-        elif data.startswith("bc_history_"):
-            await broadcast_history_callback(update, context)
+        elif data.startswith("bc|menu|"):
+            parts = data.split("|")
+            if len(parts) >= 3:
+                group_id = int(parts[2])
+                context.user_data['current_group'] = group_id
+                await broadcast_menu_callback(update, context)
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -3046,43 +3042,96 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
     data  = query.data
     await query.answer()
 
-    if data.startswith("bc_filter_"):
-        parts       = data.split("_")
-        group_id    = int(parts[2])
-        filter_type = parts[3]
-        context.user_data.update({'broadcast_group_id': group_id, 'broadcast_filter': filter_type,
-                                   'broadcast_step': 'message'})
-        targets = await db.get_broadcast_targets(group_id, filter_type)
-        filter_names = {
-            'trial_only': '🆓 Solo trial sin compra', 'subscribed_only': '💳 Solo con suscripción activa',
-            'expired_only': '⏰ Solo expirados no renovados', 'all_trial': '👥 Todos los que usaron trial'
-        }
-        await query.edit_message_text(
-            f"📢 *Broadcast — Configurar mensaje*\n\n"
-            f"Filtro: {filter_names.get(filter_type, filter_type)}\n"
-            f"Destinatarios estimados: *{len(targets)}* usuarios\n\n"
-            f"Envía el mensaje a enviar.\n\n"
-            f"*Variables:* `{{user_name}}`, `{{group_name}}`, `{{username}}`\n\n"
-            f"*Escribe 'cancelar' para cancelar.*",
-            parse_mode="Markdown"
-        )
-    elif data.startswith("bc_cancel_"):
-        for k in ('broadcast_group_id', 'broadcast_step', 'broadcast_filter', 'broadcast_message'):
-            context.user_data.pop(k, None)
-        await query.edit_message_text("❌ Broadcast cancelado")
-    elif data.startswith("bc_confirm_"):
-        parts       = data.split("_")
-        group_id    = int(parts[2])
-        filter_type = parts[3]
-        message_text = context.user_data.get('broadcast_message', '')
-        if not message_text:
-            await query.edit_message_text("❌ Error: No se encontró el mensaje")
+    # NUEVO PARSING ROBUSTO CON | COMO SEPARADOR
+    if data.startswith("bc|"):
+        parts = data.split("|")
+        # parts[0] = "bc", parts[1] = acción, parts[2] = group_id, parts[3+] = resto
+        
+        if len(parts) < 3:
+            await query.answer("❌ Error en datos", show_alert=True)
             return
-        await query.edit_message_text(
-            "🚀 *Enviando broadcast...*\n\nEsto puede tomar varios minutos.\nTe notificaré cuando termine.",
-            parse_mode="Markdown"
-        )
-        await execute_broadcast(context.bot, group_id, filter_type, message_text, query.from_user.id)
+            
+        action = parts[1]
+        
+        try:
+            group_id = int(parts[2])
+        except ValueError:
+            await query.answer("❌ ID de grupo inválido", show_alert=True)
+            return
+            
+        # ---------- FILTRAR ----------
+        if action == "filter":
+            if len(parts) < 4:
+                await query.answer("❌ Filtro no especificado", show_alert=True)
+                return
+                
+            filter_type = parts[3]
+            valid_filters = ['trial_only', 'subscribed_only', 'expired_only', 'all_trial']
+            
+            if filter_type not in valid_filters:
+                await query.answer(f"❌ Filtro inválido: {filter_type}", show_alert=True)
+                return
+                
+            context.user_data.update({
+                'broadcast_group_id': group_id, 
+                'broadcast_filter': filter_type,
+                'broadcast_step': 'message'
+            })
+            
+            targets = await db.get_broadcast_targets(group_id, filter_type)
+            filter_names = {
+                'trial_only': '🆓 Solo trial sin compra', 
+                'subscribed_only': '💳 Solo con suscripción activa',
+                'expired_only': '⏰ Solo expirados no renovados', 
+                'all_trial': '👥 Todos los que usaron trial'
+            }
+            
+            await query.edit_message_text(
+                f"📢 *Broadcast — Configurar mensaje*\n\n"
+                f"Filtro: {filter_names.get(filter_type, filter_type)}\n"
+                f"Destinatarios estimados: *{len(targets)}* usuarios\n\n"
+                f"Envía el mensaje a enviar.\n\n"
+                f"*Variables:* `{{user_name}}`, `{{group_name}}`, `{{username}}`\n\n"
+                f"*Escribe 'cancelar' para cancelar.*",
+                parse_mode="Markdown"
+            )
+            
+        # ---------- CANCELAR ----------
+        elif action == "cancel":
+            for k in ('broadcast_group_id', 'broadcast_step', 'broadcast_filter', 'broadcast_message'):
+                context.user_data.pop(k, None)
+            await query.edit_message_text("❌ Broadcast cancelado")
+            
+        # ---------- CONFIRMAR ----------
+        elif action == "confirm":
+            if len(parts) < 4:
+                await query.answer("❌ Filtro no especificado", show_alert=True)
+                return
+                
+            filter_type = parts[3]
+            message_text = context.user_data.get('broadcast_message', '')
+            
+            if not message_text:
+                await query.edit_message_text("❌ Error: No se encontró el mensaje")
+                return
+                
+            await query.edit_message_text(
+                "🚀 *Enviando broadcast...*\n\nEsto puede tomar varios minutos.\nTe notificaré cuando termine.",
+                parse_mode="Markdown"
+            )
+            await execute_broadcast(context.bot, group_id, filter_type, message_text, query.from_user.id)
+            
+        # ---------- HISTORIAL ----------
+        elif action == "history":
+            await broadcast_history_callback(update, context, group_id)
+            
+        else:
+            await query.answer("❌ Acción desconocida", show_alert=True)
+            
+    # Callbacks antiguos (compatibilidad) - puedes eliminar esto después
+    elif data.startswith("bc_filter_") or data.startswith("bc_cancel_") or data.startswith("bc_confirm_"):
+        logger.warning(f"Callback antigo detectado: {data}. Ignorando.")
+        await query.answer("❌ Por favor usa el menú actualizado", show_alert=True)
 
 
 async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3100,6 +3149,25 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     subscribed  = await db.get_broadcast_targets(group_id, 'subscribed_only')
     expired     = await db.get_broadcast_targets(group_id, 'expired_only')
     all_trial   = await db.get_broadcast_targets(group_id, 'all_trial')
+    # USAR | COMO SEPARADOR PARA EVITAR CONFLICTO CON GUIONES EN GROUP_ID
+    keyboard = [
+        [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc|filter|{group_id}|trial_only")],
+        [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})",   callback_data=f"bc|filter|{group_id}|subscribed_only")],
+        [InlineKeyboardButton(f"⏰ Solo expirados ({len(expired)})",       callback_data=f"bc|filter|{group_id}|expired_only")],
+        [InlineKeyboardButton(f"👥 Todos ({len(all_trial)})",              callback_data=f"bc|filter|{group_id}|all_trial")],
+        [InlineKeyboardButton("📜 Historial",                              callback_data=f"bc|history|{group_id}")],
+        [InlineKeyboardButton("🔙 Volver",                                 callback_data=f"select_group_{group_id}")]
+    ]
+    await query.edit_message_text(
+        f"📢 *Broadcast Masivo — {group['group_name']}*\n\n"
+        f"📊 *Destinatarios disponibles:*\n"
+        f"• 🆓 Trial sin compra: *{len(trial_only)}*\n"
+        f"• 💳 Con suscripción activa: *{len(subscribed)}*\n"
+        f"• ⏰ Expirados no renovados: *{len(expired)}*\n"
+        f"• 👥 Total que usaron trial: *{len(all_trial)}*\n\n"
+        f"Selecciona el filtro:",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
     keyboard = [
         [InlineKeyboardButton(f"🆓 Solo sin compra ({len(trial_only)})",   callback_data=f"bc_filter_{group_id}_trial_only")],
         [InlineKeyboardButton(f"💳 Solo suscriptos ({len(subscribed)})",   callback_data=f"bc_filter_{group_id}_subscribed_only")],
@@ -3120,16 +3188,34 @@ async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def broadcast_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.callback_query
+async def broadcast_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int = None):
+    query = update.callback_query
     await query.answer()
-    group_id = int(query.data.split("_")[2])
-    history  = await db.get_broadcast_history(group_id, limit=10)
+    
+    # Si viene de callback antiguo, extraer group_id
+    if group_id is None:
+        # Formato antiguo: bc_history_-1003807276197
+        data = query.data
+        if data.startswith("bc_history_"):
+            try:
+                group_id = int(data[len("bc_history_"):])
+            except ValueError:
+                await query.edit_message_text("❌ Error en ID de grupo")
+                return
+        else:
+            await query.edit_message_text("❌ Error en callback")
+            return
+            
+    history = await db.get_broadcast_history(group_id, limit=10)
     if not history:
         msg = "📭 *No hay broadcasts enviados aún*"
     else:
-        filter_names = {'trial_only': '🆓 Sin compra', 'subscribed_only': '💳 Suscriptos',
-                        'expired_only': '⏰ Expirados', 'all_trial': '👥 Todos'}
+        filter_names = {
+            'trial_only': '🆓 Sin compra', 
+            'subscribed_only': '💳 Suscriptos',
+            'expired_only': '⏰ Expirados', 
+            'all_trial': '👥 Todos'
+        }
         msg = "📜 *Historial de Broadcasts*\n\n"
         for i, h in enumerate(history, 1):
             f_name   = filter_names.get(h['filter_type'], h['filter_type'])
@@ -3137,7 +3223,9 @@ async def broadcast_history_callback(update: Update, context: ContextTypes.DEFAU
             msg += (f"{i}. *{f_name}* | {date_str}\n"
                     f"   ✅ {h['success_count']} enviados | ❌ {h['fail_count']} fallidos\n"
                     f"   📝 {h['message_preview'] or 'Sin preview'}...\n\n")
-    keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data=f"broadcast_menu")]]
+    
+    # Volver al menú de broadcast del grupo actual
+    keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data=f"bc|menu|{group_id}")]]
     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
@@ -3161,12 +3249,18 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
     preview_msg = (text.replace("{user_name}", "Juan")
                        .replace("{group_name}", "VIP")
                        .replace("{username}", "@juan"))
-    filter_names = {'trial_only': '🆓 Solo trial sin compra', 'subscribed_only': '💳 Solo con suscripción activa',
-                    'expired_only': '⏰ Solo expirados no renovados', 'all_trial': '👥 Todos los que usaron trial'}
+    filter_names = {
+        'trial_only': '🆓 Solo trial sin compra', 
+        'subscribed_only': '💳 Solo con suscripción activa',
+        'expired_only': '⏰ Solo expirados no renovados', 
+        'all_trial': '👥 Todos los que usaron trial'
+    }
+    
+    # NUEVOS CALLBACKS CON | COMO SEPARADOR
     keyboard = [
-        [InlineKeyboardButton("✅ Sí, enviar ahora", callback_data=f"bc_confirm_{group_id}_{filter_type}")],
-        [InlineKeyboardButton("✏️ Editar mensaje",   callback_data=f"bc_filter_{group_id}_{filter_type}")],
-        [InlineKeyboardButton("❌ Cancelar",          callback_data=f"bc_cancel_{group_id}")]
+        [InlineKeyboardButton("✅ Sí, enviar ahora", callback_data=f"bc|confirm|{group_id}|{filter_type}")],
+        [InlineKeyboardButton("✏️ Editar mensaje",   callback_data=f"bc|filter|{group_id}|{filter_type}")],
+        [InlineKeyboardButton("❌ Cancelar",          callback_data=f"bc|cancel|{group_id}")]
     ]
     await update.message.reply_text(
         f"📢 *Confirmar Broadcast*\n\n"
