@@ -837,11 +837,16 @@ class Database:
         if not changes:
             return
 
+        import json  # ← MOVER AQUÍ
+        
         def _upd(conn):
             with conn.cursor() as cur:
-                if 'name' in changes:
-                    cur.execute("UPDATE groups SET group_name=%s WHERE group_id=%s",
-                                (changes['name'], group_id))
+                ...
+                if 'settings' in changes:
+                    cur.execute(
+                        "UPDATE groups SET settings=%s WHERE group_id=%s",
+                        (json.dumps(changes['settings']), group_id)
+                    )
                 if 'admin' in changes:
                     cur.execute("UPDATE groups SET admin_id=%s WHERE group_id=%s",
                                 (changes['admin'], group_id))
