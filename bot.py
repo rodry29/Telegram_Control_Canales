@@ -3250,12 +3250,18 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: str, sent_by: int):
+    logger.info(f"DEBUG: execute_broadcast START - bot={bot}, group_id={group_id}, filter={filter_type}")
     targets = await db.get_broadcast_targets(group_id, filter_type)
-    logger.info(f"DEBUG execute_broadcast START: targets={len(targets)}, filter={filter_type}")
+    logger.info(f"DEBUG: targets={len(targets)}")
     if not targets:
         await _safe_send(sent_by, "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.",
                          parse_mode="Markdown")
         return
+
+    logger.info(f"DEBUG: starting loop")
+    for i, user in enumerate(targets, 1):
+        user_id = user['user_id']
+        logger.info(f"DEBUG: processing user {i}/{len(targets)}: {user_id}")
     group      = get_group_by_id(group_id)
     group_name = group.get('group_name', 'VIP') if group else 'VIP'
     total      = len(targets)
