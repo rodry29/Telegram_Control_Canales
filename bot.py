@@ -3504,91 +3504,6 @@ async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# ==================== MAIN ====================
-async def main():
-    global bot_app
-    await db.init_tables()
-    await db.load_groups_from_db()
-    logger.info(f"📦 {len(GROUPS)} grupos disponibles")
-
-    # FIX: Eliminar Defaults(parse_mode="HTML") porque todos los mensajes usan
-    # parse_mode="Markdown" explícitamente. El default HTML causaba que los mensajes
-    # sin parse_mode explícito fallaran si contenían <, > o & sin escapar.
-    bot_app = ApplicationBuilder().token(TOKEN).build()
-
-    # ── Comandos ──────────────────────────────────────────────────────────────
-    bot_app.add_handler(CommandHandler("start",       start))
-    bot_app.add_handler(CommandHandler("add",         add_user_command))
-    bot_app.add_handler(CommandHandler("groups",      list_groups))
-    bot_app.add_handler(CommandHandler("addgroup",    add_group_command))
-    bot_app.add_handler(CommandHandler("backup",      manual_backup))
-    bot_app.add_handler(CommandHandler("restore",     restore_backup))
-    bot_app.add_handler(CommandHandler("getlink",     get_link))
-    bot_app.add_handler(CommandHandler("syncgroup",   sync_group))
-    bot_app.add_handler(CommandHandler("syncall",     sync_all_groups))
-    bot_app.add_handler(CommandHandler("searchgrupo", search_group))
-    bot_app.add_handler(CommandHandler("pagar",       pay_command))
-    bot_app.add_handler(CommandHandler("configpago",  config_payment_command))
-    bot_app.add_handler(CommandHandler("test",        test))
-    bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-    bot_app.add_handler(CallbackQueryHandler(handle_callback))
-
-    # ── Detección de miembros ─────────────────────────────────────────────────
-    bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    bot_app.add_handler(MessageHandler(
-        filters.StatusUpdate.NEW_CHAT_MEMBERS,
-        detect_new_member
-    ))
-
-    # Detectar mensajes de usuarios no registrados en grupos
-    bot_app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
-        detect_active_member
-    ))
-
-    # Input de texto en privado (edición de grupos, configuración de precios)
-    bot_app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-        handle_edit_input
-    ))
-
-    # ── Scheduler ────────────────────────────────────────────────────────────
-    scheduler.add_job(
-        check_expired_subscriptions,
-        'interval',
-        minutes=5,
-        id='check_expired',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        auto_backup,
-        'interval',
-        hours=24,
-        id='auto_backup',
-        replace_existing=True
-    )
-    # NUEVO: Scheduler para avisos de expiración
-    scheduler.add_job(
-        send_trial_warnings,
-        'interval',
-        minutes=1,
-        id='trial_warnings',
-        replace_existing=True
-    )
-    scheduler.start()
-
-    logger.info("🤖 Bot iniciado")
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
-    )
-    await asyncio.Event().wait()
-
-
 # ==================== CONFIGURACIÓN DE AVISOS (HANDLERS) ====================
 
 async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
@@ -3977,6 +3892,91 @@ async def handle_warning_input(update: Update, context: ContextTypes.DEFAULT_TYP
             "🔔 Configuración completada.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+
+
+# ==================== MAIN ====================
+async def main():
+    global bot_app
+    await db.init_tables()
+    await db.load_groups_from_db()
+    logger.info(f"📦 {len(GROUPS)} grupos disponibles")
+
+    # FIX: Eliminar Defaults(parse_mode="HTML") porque todos los mensajes usan
+    # parse_mode="Markdown" explícitamente. El default HTML causaba que los mensajes
+    # sin parse_mode explícito fallaran si contenían <, > o & sin escapar.
+    bot_app = ApplicationBuilder().token(TOKEN).build()
+
+    # ── Comandos ──────────────────────────────────────────────────────────────
+    bot_app.add_handler(CommandHandler("start",       start))
+    bot_app.add_handler(CommandHandler("add",         add_user_command))
+    bot_app.add_handler(CommandHandler("groups",      list_groups))
+    bot_app.add_handler(CommandHandler("addgroup",    add_group_command))
+    bot_app.add_handler(CommandHandler("backup",      manual_backup))
+    bot_app.add_handler(CommandHandler("restore",     restore_backup))
+    bot_app.add_handler(CommandHandler("getlink",     get_link))
+    bot_app.add_handler(CommandHandler("syncgroup",   sync_group))
+    bot_app.add_handler(CommandHandler("syncall",     sync_all_groups))
+    bot_app.add_handler(CommandHandler("searchgrupo", search_group))
+    bot_app.add_handler(CommandHandler("pagar",       pay_command))
+    bot_app.add_handler(CommandHandler("configpago",  config_payment_command))
+    bot_app.add_handler(CommandHandler("test",        test))
+    bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    bot_app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # ── Detección de miembros ─────────────────────────────────────────────────
+    bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    bot_app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS,
+        detect_new_member
+    ))
+
+    # Detectar mensajes de usuarios no registrados en grupos
+    bot_app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+        detect_active_member
+    ))
+
+    # Input de texto en privado (edición de grupos, configuración de precios)
+    bot_app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_edit_input
+    ))
+
+    # ── Scheduler ────────────────────────────────────────────────────────────
+    scheduler.add_job(
+        check_expired_subscriptions,
+        'interval',
+        minutes=5,
+        id='check_expired',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        auto_backup,
+        'interval',
+        hours=24,
+        id='auto_backup',
+        replace_existing=True
+    )
+    # NUEVO: Scheduler para avisos de expiración
+    scheduler.add_job(
+        send_trial_warnings,
+        'interval',
+        minutes=1,
+        id='trial_warnings',
+        replace_existing=True
+    )
+    scheduler.start()
+
+    logger.info("🤖 Bot iniciado")
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+    )
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
