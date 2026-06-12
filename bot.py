@@ -920,6 +920,126 @@ class Database:
 
         return await self._run(_get)
 
+        # ============================================================
+    # NUEVOS MÉTODOS PARA BROADCAST MASIVO A USUARIOS TRIAL
+    # ============================================================
+
+    async def get_broadcast_targets(self, group_id: int, filter_type: str) -> list:
+        """
+        Obtiene usuarios según el filtro de broadcast.
+        
+        Filtros:
+        - 'trial_only': Solo usuarios que usaron trial pero NUNCA compraron
+        - 'subscribed_only': Solo usuarios que tienen suscripción activa (pagada)
+        - 'expired_only': Solo usuarios con suscripción expirada no renovada
+        - 'all_trial': Todos los que usaron trial (incluye comprados y no comprados)
+        """
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if filter_type == 'trial_only':
+                    # Usaron trial pero NUNCA hicieron un pago con amount > 0
+                    cur.execute("""
+                        SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
+                        FROM users u
+                        WHERE u.group_id = %s
+                          AND u.trial_used = TRUE
+                          AND NOT EXISTS (
+                              SELECT 1 FROM payments p 
+                              WHERE p.user_id = u.user_id 
+                                AND p.group_id = u.group_id
+                                AND p.amount > 0
+                          )
+                        ORDER BY u.user_id
+                    """, (group_id,))
+                    
+                elif filter_type == 'subscribed_only':
+                    # Tienen suscripción activa (plan != 'trial' y status='active')
+                    cur.execute("""
+                        SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
+                        FROM users u
+                        WHERE u.group_id = %s
+                          AND u.trial_used = TRUE
+                          AND u.plan != 'trial'
+                          AND u.status = 'active'
+                          AND u.end_date > NOW()
+                        ORDER BY u.user_id
+                    """, (group_id,))
+                    
+                elif filter_type == 'expired_only':
+                    # Usaron trial, compraron alguna vez, pero ahora están expirados
+                    cur.execute("""
+                        SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
+                        FROM users u
+                        WHERE u.group_id = %s
+                          AND u.trial_used = TRUE
+                          AND u.status = 'expired'
+                          AND EXISTS (
+                              SELECT 1 FROM payments p 
+                              WHERE p.user_id = u.user_id 
+                                AND p.group_id = u.group_id
+                                AND p.amount > 0
+                          )
+                        ORDER BY u.user_id
+                    """, (group_id,))
+                    
+                elif filter_type == 'all_trial':
+                    # Todos los que usaron trial (cualquier estado)
+                    cur.execute("""
+                        SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id
+                        FROM users u
+                        WHERE u.group_id = %s
+                          AND u.trial_used = TRUE
+                        ORDER BY u.user_id
+                    """, (group_id,))
+                    
+                else:
+                    return []
+                    
+                return cur.fetchall()
+        return await self._run(_get)
+
+    async def log_broadcast_sent(self, group_id: int, filter_type: str, 
+                                  message_preview: str, total_targets: int,
+                                  success_count: int, fail_count: int,
+                                  sent_by: int):
+        """Registra un broadcast enviado para historial."""
+        def _log(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS broadcast_logs (
+                        id            SERIAL PRIMARY KEY,
+                        group_id      BIGINT NOT NULL,
+                        filter_type   TEXT NOT NULL,
+                        message_preview TEXT,
+                        total_targets INTEGER NOT NULL,
+                        success_count INTEGER NOT NULL,
+                        fail_count    INTEGER NOT NULL,
+                        sent_by       BIGINT NOT NULL,
+                        sent_at       TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    INSERT INTO broadcast_logs 
+                        (group_id, filter_type, message_preview, total_targets,
+                         success_count, fail_count, sent_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (group_id, filter_type, message_preview[:200], 
+                      total_targets, success_count, fail_count, sent_by))
+        await self._run(_log)
+
+    async def get_broadcast_history(self, group_id: int, limit: int = 10):
+        """Obtiene historial de broadcasts de un grupo."""
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM broadcast_logs
+                    WHERE group_id = %s
+                    ORDER BY sent_at DESC
+                    LIMIT %s
+                """, (group_id, limit))
+                return cur.fetchall()
+        return await self._run(_get)
+    
     # ============================================================
     # NUEVOS MÉTODOS PARA SISTEMA DE AVISOS DE EXPIRACIÓN
     # ============================================================
@@ -1177,7 +1297,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("💰 Ganancias",          callback_data="earnings")],
                 [InlineKeyboardButton("📥 Exportar mes",       callback_data="export_month")],
                 [InlineKeyboardButton("📊 Estadísticas Trial", callback_data="trial_stats")],
-                [InlineKeyboardButton("⚙️ Precios y Trial",    callback_data=f"cfg_group_{group['group_id']}")]
+                [InlineKeyboardButton("⚙️ Precios y Trial",    callback_data=f"cfg_group_{group['group_id']}")],
+                [InlineKeyboardButton("📢 Broadcast Trial",    callback_data="broadcast_menu")]
             ]
             await send(
                 f"👑 *Panel VIP - {group['group_name']}*\n\n"
@@ -1275,6 +1396,7 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             [InlineKeyboardButton("📥 Exportar mes",        callback_data="export_month")],
             [InlineKeyboardButton("📊 Estadísticas Trial",  callback_data="trial_stats")],
             [InlineKeyboardButton("⚙️ Precios y Trial",     callback_data=f"cfg_group_{group_id}")],
+            [InlineKeyboardButton("📢 Broadcast Trial",     callback_data="broadcast_menu")],
         ]
         await query.edit_message_text(
             f"👑 *Panel VIP - {group['group_name']}*\n\n"
@@ -1991,7 +2113,8 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/start` - Panel de control\n"
         "• `/add @usuario|ID plan [precio] [días]` - Agregar usuario\n"
         "• También puedes RESPONDER al mensaje de registro con `/add plan`\n"
-        "• `/configpago group_id` - Configurar datos de pago\n\n"
+        "• `/configpago group_id` - Configurar datos de pago\n"
+        "• `/broadcast group_id` - Enviar mensaje masivo a usuarios trial\n\n"
         "*Usuarios (VIP):*\n"
         "• `/pagar` - Ver datos de pago para renovar acceso\n"
         "• Presiona 💳 Pagar Acceso en los mensajes del bot\n\n"
@@ -2737,6 +2860,11 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
 
+    # 🔥 PRIORIDAD: input de broadcast (AGREGAR ESTO)
+    if context.user_data.get('broadcast_step') == 'message' and context.user_data.get('broadcast_group_id'):
+        await handle_broadcast_input(update, context)
+        return
+
     # Prioridad: input de configuración de avisos
     if context.user_data.get('warning_step') and context.user_data.get('warning_group_id'):
         await handle_warning_input(update, context)
@@ -3257,6 +3385,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("warn_test_"):
             group_id = int(data.replace("warn_test_", ""))
             await test_warning(update, context, group_id)
+        elif data.startswith("bc_filter_"):
+            await broadcast_callback_handler(update, context)
+        elif data.startswith("bc_cancel_"):
+            await broadcast_callback_handler(update, context)
+        elif data.startswith("bc_confirm_"):
+            await broadcast_callback_handler(update, context)
+        elif data == "broadcast_menu":
+            await broadcast_menu_callback(update, context)
+        elif data.startswith("bc_history_"):
+            await broadcast_history_callback(update, context)
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -3899,7 +4037,374 @@ async def handle_warning_input(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+# ==================== BROADCAST MASIVO A USUARIOS TRIAL ====================
 
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /broadcast - Inicia el flujo de envío masivo a usuarios trial.
+    
+    Uso: /broadcast group_id
+    """
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Uso: `/broadcast ID_DEL_GRUPO`*\n\n"
+            "Ejemplo: `/broadcast -1001234567890`\n\n"
+            "Después te pediré el mensaje y el filtro de destinatarios.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID del grupo debe ser un número")
+        return
+    
+    if not can_manage_group(user_id, group_id) and user_id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ No autorizado para gestionar este grupo")
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
+    
+    # Iniciar flujo de configuración
+    context.user_data['broadcast_group_id'] = group_id
+    context.user_data['broadcast_step'] = 'filter'
+    
+    keyboard = [
+        [InlineKeyboardButton("🆓 Solo trial SIN compra", callback_data=f"bc_filter_{group_id}_trial_only")],
+        [InlineKeyboardButton("💳 Solo con suscripción activa", callback_data=f"bc_filter_{group_id}_subscribed_only")],
+        [InlineKeyboardButton("⏰ Solo expirados no renovados", callback_data=f"bc_filter_{group_id}_expired_only")],
+        [InlineKeyboardButton("👥 TODOS los que usaron trial", callback_data=f"bc_filter_{group_id}_all_trial")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"bc_cancel_{group_id}")]
+    ]
+    
+    await update.message.reply_text(
+        f"📢 *Broadcast Masivo — {group['group_name']}*\n\n"
+        f"Selecciona a quién quieres enviar el mensaje:\n\n"
+        f"• 🆓 *Trial sin compra* — Usaron trial pero nunca pagaron\n"
+        f"• 💳 *Con suscripción* — Usaron trial y tienen plan activo\n"
+        f"• ⏰ *Expirados* — Compraron antes pero ahora están expirados\n"
+        f"• 👥 *Todos* — Cualquiera que haya usado trial\n\n"
+        f"_Puedes personalizar el mensaje en el siguiente paso._",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja callbacks del menú de broadcast."""
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    
+    if data.startswith("bc_filter_"):
+        parts = data.split("_")
+        group_id = int(parts[2])
+        filter_type = parts[3]
+        
+        # Guardar filtro y pedir mensaje
+        context.user_data['broadcast_group_id'] = group_id
+        context.user_data['broadcast_filter'] = filter_type
+        context.user_data['broadcast_step'] = 'message'
+        
+        filter_names = {
+            'trial_only': '🆓 Solo trial sin compra',
+            'subscribed_only': '💳 Solo con suscripción activa',
+            'expired_only': '⏰ Solo expirados no renovados',
+            'all_trial': '👥 Todos los que usaron trial'
+        }
+        
+        # Obtener preview de cuántos usuarios
+        targets = await db.get_broadcast_targets(group_id, filter_type)
+        
+        await query.edit_message_text(
+            f"📢 *Broadcast — Configurar mensaje*\n\n"
+            f"Filtro: {filter_names.get(filter_type, filter_type)}\n"
+            f"Destinatarios estimados: *{len(targets)}* usuarios\n\n"
+            f"Envía el mensaje que quieres enviar.\n\n"
+            f"*Variables disponibles:*\n"
+            f"• `{{user_name}}` — nombre del usuario\n"
+            f"• `{{group_name}}` — nombre del grupo\n"
+            f"• `{{username}}` — @username del usuario\n\n"
+            f"*Puedes usar Markdown:* negritas, emojis, links, etc.\n\n"
+            f"*Escribe 'cancelar' para cancelar.*",
+            parse_mode="Markdown"
+        )
+        
+    elif data.startswith("bc_cancel_"):
+        context.user_data.pop('broadcast_group_id', None)
+        context.user_data.pop('broadcast_step', None)
+        context.user_data.pop('broadcast_filter', None)
+        await query.edit_message_text("❌ Broadcast cancelado")
+        
+    elif data.startswith("bc_confirm_"):
+        parts = data.split("_")
+        group_id = int(parts[2])
+        filter_type = parts[3]
+        message_text = context.user_data.get('broadcast_message', '')
+        
+        if not message_text:
+            await query.edit_message_text("❌ Error: No se encontró el mensaje")
+            return
+        
+        # Iniciar envío
+        await query.edit_message_text(
+            "🚀 *Enviando broadcast...*\n\n"
+            "Esto puede tomar varios minutos dependiendo de la cantidad de usuarios.\n"
+            "Te notificaré cuando termine.",
+            parse_mode="Markdown"
+        )
+        
+        await execute_broadcast(context.bot, group_id, filter_type, message_text, query.from_user.id)
+        
+    elif data == "broadcast_menu":
+        await broadcast_menu_callback(update, context)
+
+
+async def broadcast_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el menú de broadcast desde el panel."""
+    query = update.callback_query
+    await query.answer()
+    
+    group_id = context.user_data.get('current_group')
+    if not group_id:
+        await query.edit_message_text("❌ Selecciona un grupo primero")
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+    
+    # Estadísticas rápidas
+    trial_stats = await db.get_trial_stats(group_id)
+    total_trial = trial_stats.get('total_trial_users', 0)
+    converted = trial_stats.get('converted_users', 0)
+    not_converted = total_trial - converted
+    
+    keyboard = [
+        [InlineKeyboardButton("🆓 Solo sin compra", callback_data=f"bc_filter_{group_id}_trial_only")],
+        [InlineKeyboardButton("💳 Solo suscriptos", callback_data=f"bc_filter_{group_id}_subscribed_only")],
+        [InlineKeyboardButton("⏰ Solo expirados", callback_data=f"bc_filter_{group_id}_expired_only")],
+        [InlineKeyboardButton("👥 Todos", callback_data=f"bc_filter_{group_id}_all_trial")],
+        [InlineKeyboardButton("📜 Historial", callback_data=f"bc_history_{group_id}")],
+        [InlineKeyboardButton("🔙 Volver", callback_data=f"select_group_{group_id}")]
+    ]
+    
+    await query.edit_message_text(
+        f"📢 *Broadcast Masivo — {group['group_name']}*\n\n"
+        f"📊 *Estadísticas de trial:*\n"
+        f"• Total que usaron trial: {total_trial}\n"
+        f"• Convertidos a pago: {converted}\n"
+        f"• Sin comprar: {not_converted}\n\n"
+        f"Selecciona el filtro de destinatarios:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def broadcast_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra historial de broadcasts."""
+    query = update.callback_query
+    await query.answer()
+    
+    parts = query.data.split("_")
+    group_id = int(parts[2])
+    
+    history = await db.get_broadcast_history(group_id, limit=10)
+    
+    if not history:
+        msg = "📭 *No hay broadcasts enviados aún*"
+    else:
+        msg = "📜 *Historial de Broadcasts*\n\n"
+        for i, h in enumerate(history, 1):
+            filter_names = {
+                'trial_only': '🆓 Sin compra',
+                'subscribed_only': '💳 Suscriptos',
+                'expired_only': '⏰ Expirados',
+                'all_trial': '👥 Todos'
+            }
+            f_name = filter_names.get(h['filter_type'], h['filter_type'])
+            date_str = h['sent_at'].strftime('%d/%m/%Y %H:%M')
+            msg += (
+                f"{i}. *{f_name}* | {date_str}\n"
+                f"   ✅ {h['success_count']} enviados | ❌ {h['fail_count']} fallidos\n"
+                f"   📝 {h['message_preview'] or 'Sin preview'}...\n\n"
+            )
+    
+    keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data=f"cfg_warnings_{group_id}")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa el mensaje de broadcast ingresado por el admin."""
+    if update.effective_chat.type != "private":
+        return
+    
+    step = context.user_data.get('broadcast_step')
+    group_id = context.user_data.get('broadcast_group_id')
+    filter_type = context.user_data.get('broadcast_filter')
+    
+    if step != 'message' or not group_id or not filter_type:
+        return
+    
+    text = update.message.text.strip()
+    
+    if text.lower() == 'cancelar':
+        context.user_data.pop('broadcast_group_id', None)
+        context.user_data.pop('broadcast_step', None)
+        context.user_data.pop('broadcast_filter', None)
+        await update.message.reply_text("❌ Broadcast cancelado")
+        return
+    
+    # Guardar mensaje y pedir confirmación
+    context.user_data['broadcast_message'] = text
+    context.user_data['broadcast_step'] = 'confirm'
+    
+    # Preview de destinatarios
+    targets = await db.get_broadcast_targets(group_id, filter_type)
+    preview_msg = text.replace("{user_name}", "Juan").replace("{group_name}", "VIP").replace("{username}", "@juan")
+    
+    filter_names = {
+        'trial_only': '🆓 Solo trial sin compra',
+        'subscribed_only': '💳 Solo con suscripción activa',
+        'expired_only': '⏰ Solo expirados no renovados',
+        'all_trial': '👥 Todos los que usaron trial'
+    }
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Sí, enviar ahora", callback_data=f"bc_confirm_{group_id}_{filter_type}")],
+        [InlineKeyboardButton("✏️ Editar mensaje", callback_data=f"bc_filter_{group_id}_{filter_type}")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"bc_cancel_{group_id}")]
+    ]
+    
+    await update.message.reply_text(
+        f"📢 *Confirmar Broadcast*\n\n"
+        f"Filtro: {filter_names.get(filter_type)}\n"
+        f"Destinatarios: *{len(targets)}* usuarios\n\n"
+        f"*Vista previa del mensaje:*\n"
+        f"---\n{preview_msg}\n---\n\n"
+        f"⚠️ *Este mensaje se enviará a todos los usuarios seleccionados.*\n"
+        f"¿Estás seguro?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: str, sent_by: int):
+    """
+    Ejecuta el envío masivo con rate limiting.
+    Telegram limita a ~30 mensajes/segundo. Usamos un delay conservador.
+    """
+    targets = await db.get_broadcast_targets(group_id, filter_type)
+    
+    if not targets:
+        await _safe_send(
+            sent_by,
+            f"📭 *Broadcast completado*\n\nNo hay usuarios que coincidan con el filtro seleccionado.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    group = get_group_by_id(group_id)
+    group_name = group.get('group_name', 'VIP') if group else 'VIP'
+    
+    success_count = 0
+    fail_count = 0
+    total = len(targets)
+    
+    # Rate limiting: 25 mensajes por segundo máximo (conservador)
+    # Para evitar FloodWait, usamos 1 mensaje cada 0.1s = 10 msg/segundo
+    delay = 0.12  # 120ms entre mensajes = ~8 msg/segundo (muy seguro)
+    
+    # Enviar mensaje de progreso al admin
+    progress_msg = await _safe_send(
+        sent_by,
+        f"🚀 *Broadcast en progreso...*\n\n"
+        f"• Total: {total} usuarios\n"
+        f"• Enviados: 0\n"
+        f"• Fallidos: 0\n"
+        f"• Progreso: 0%",
+        parse_mode="Markdown"
+    )
+    
+    last_progress_update = datetime.now()
+    
+    for i, user in enumerate(targets, 1):
+        user_id = user['user_id']
+        first_name = user.get('first_name', 'Usuario') or 'Usuario'
+        username = user.get('username', '') or ''
+        
+        # Personalizar mensaje
+        personalized = message_text.replace(
+            "{user_name}", first_name
+        ).replace(
+            "{group_name}", group_name
+        ).replace(
+            "{username}", f"@{username}" if username and not username.startswith('user_') else first_name
+        )
+        
+        try:
+            await bot.send_message(
+                user_id,
+                personalized,
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+            success_count += 1
+            logger.info(f"📢 Broadcast enviado a {user_id} ({first_name})")
+            
+        except Exception as e:
+            fail_count += 1
+            logger.warning(f"❌ Fallo broadcast a {user_id}: {e}")
+        
+        # Rate limiting
+        await asyncio.sleep(delay)
+        
+        # Actualizar progreso cada 5 segundos o cada 10 usuarios
+        now = datetime.now()
+        if (now - last_progress_update).seconds >= 5 or i % 10 == 0:
+            progress_pct = int((i / total) * 100)
+            try:
+                if progress_msg and hasattr(progress_msg, 'message_id'):
+                    await bot.edit_message_text(
+                        f"🚀 *Broadcast en progreso...*\n\n"
+                        f"• Total: {total} usuarios\n"
+                        f"• Enviados: {success_count}\n"
+                        f"• Fallidos: {fail_count}\n"
+                        f"• Progreso: {progress_pct}%",
+                        chat_id=sent_by,
+                        message_id=progress_msg.message_id,
+                        parse_mode="Markdown"
+                    )
+            except Exception:
+                pass
+            last_progress_update = now
+    
+    # Guardar en historial
+    await db.log_broadcast_sent(
+        group_id, filter_type, message_text,
+        total, success_count, fail_count, sent_by
+    )
+    
+    # Notificar finalización
+    await _safe_send(
+        sent_by,
+        f"✅ *Broadcast completado*\n\n"
+        f"📊 *Resultados:*\n"
+        f"• Total destinatarios: {total}\n"
+        f"• ✅ Enviados: {success_count}\n"
+        f"• ❌ Fallidos: {fail_count}\n"
+        f"• 📈 Tasa de éxito: {(success_count/total*100):.1f}%\n\n"
+        f"Filtro usado: {filter_type}\n"
+        f"Grupo: {group_name}",
+        parse_mode="Markdown"
+    )
 # ==================== MAIN ====================
 async def main():
     global bot_app
@@ -3927,6 +4432,7 @@ async def main():
     bot_app.add_handler(CommandHandler("configpago",  config_payment_command))
     bot_app.add_handler(CommandHandler("test",        test))
     bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
+    bot_app.add_handler(CommandHandler("broadcast",   broadcast_command))
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
