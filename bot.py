@@ -32,6 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 SUPER_ADMIN_ID = 5054216496
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 EC_TZ = ZoneInfo("America/Guayaquil")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "AyudanteVIP_bot")
 
 if not TOKEN:
     logger.critical("❌ ERROR: No se encontró TELEGRAM_TOKEN")
@@ -143,10 +144,18 @@ def fmt_minutes(mins: int) -> str:
     return f"{m} min"
 
 # ==================== HELPERS DE PAGO ====================
-def get_payment_keyboard(group_id: int, user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")
-    ]])
+def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False) -> InlineKeyboardMarkup:
+    """Genera teclado de pago. Si spin_used=True, oculta botón de ruleta."""
+    keyboard = []
+    
+    if not spin_used:
+        keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data="spin_used")])
+    
+    keyboard.append([InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 def get_payment_info_text(group_id: int) -> str:
     group = get_group_by_id(group_id)
@@ -189,11 +198,15 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     if not group:
         return False
     try:
+        # Consultar estado de ruleta del usuario
+        spin_data = await db.get_spin_data(user_id, group_id)
+        spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+        
         await bot.send_message(
             user_id,
             get_payment_info_text(group_id),
             parse_mode="Markdown",
-            reply_markup=get_payment_keyboard(group_id, user_id)
+            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used)
         )
         chat_link  = f"tg://user?id={user_id}"
         group_name = group.get("group_name", "VIP")
@@ -211,7 +224,6 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     except Exception as e:
         logger.warning(f"No se pudo enviar info de pago a {user_id}: {e}")
         return False
-
 
 # ==================== BASE DE DATOS ====================
 class Database:
@@ -325,6 +337,20 @@ class Database:
                         sent_at         TIMESTAMP DEFAULT NOW()
                     )
                 """)
+                # NUEVA TABLA: spins de descuento (ruleta VIP)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS discount_spins (
+                        user_id         BIGINT NOT NULL,
+                        group_id        BIGINT NOT NULL,
+                        spin_count      INTEGER DEFAULT 1,
+                        last_spin       TIMESTAMP DEFAULT NOW(),
+                        best_discount   INTEGER DEFAULT 0,
+                        used            BOOLEAN DEFAULT FALSE,
+                        applied_to_plan TEXT,
+                        UNIQUE(user_id, group_id)
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)")
                 # Índices
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_warning_logs_lookup ON warning_logs(user_id, group_id, warning_type)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_warning_logs_group  ON warning_logs(group_id, sent_at)")
@@ -984,7 +1010,44 @@ class Database:
                 else:
                     cur.execute("DELETE FROM warning_logs")
         await self._run(_clear)
+        
+    # ── Ruleta VIP (discount_spins) ───────────────────────────────────────────
+    async def get_spin_data(self, user_id: int, group_id: int) -> dict:
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM discount_spins 
+                    WHERE user_id = %s AND group_id = %s
+                """, (user_id, group_id))
+                row = cur.fetchone()
+                if not row:
+                    return {"spin_count": 0, "used": False, "best_discount": 0}
+                return dict(row)
+        return await self._run(_get)
 
+    async def record_spin(self, user_id: int, group_id: int, discount: int):
+        def _save(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO discount_spins (user_id, group_id, spin_count, last_spin, best_discount)
+                    VALUES (%s, %s, 1, NOW(), %s)
+                    ON CONFLICT (user_id, group_id) DO UPDATE SET
+                        spin_count = discount_spins.spin_count + 1,
+                        last_spin = NOW(),
+                        best_discount = GREATEST(discount_spins.best_discount, EXCLUDED.best_discount)
+                """, (user_id, group_id, discount))
+        await self._run(_save)
+
+    async def mark_discount_used(self, user_id: int, group_id: int, plan: str = None):
+        def _upd(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE discount_spins 
+                    SET used = TRUE, applied_to_plan = %s
+                    WHERE user_id = %s AND group_id = %s
+                """, (plan, user_id, group_id))
+        await self._run(_upd)
+        
 
 # ==================== INSTANCIAS GLOBALES ====================
 db        = Database(DATABASE_URL)
@@ -1302,6 +1365,11 @@ async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         group = get_group_by_id(current_group)
         try:
+            # Marcar descuento como usado si tenía uno pendiente
+            spin_data = await db.get_spin_data(target_user_id, current_group)
+            if spin_data and not spin_data.get("used") and spin_data.get("spin_count", 0) > 0:
+                await db.mark_discount_used(target_user_id, current_group, plan)
+            
             await context.bot.send_message(
                 target_user_id,
                 f"🎉 *¡Suscripción activada!*\n\n"
@@ -1390,6 +1458,13 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not existing:
             await db.register_free_user(current_group, target_user_id, username, first_name)
         success, msg = await db.add_or_update_user_by_id(current_group, target_user_id, plan, first_name, custom_price, custom_days)
+        
+        # Marcar descuento como usado si tenía uno pendiente
+        if success:
+            spin_data = await db.get_spin_data(target_user_id, current_group)
+            if spin_data and not spin_data.get("used") and spin_data.get("spin_count", 0) > 0:
+                await db.mark_discount_used(target_user_id, current_group, plan)
+        
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
@@ -1402,6 +1477,17 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     success, msg = await db.add_or_update_user(current_group, username, plan, first_name, custom_price, custom_days)
+    
+    # Marcar descuento como usado si tenía uno pendiente
+    if success:
+        # Buscar el user_id para marcar el descuento
+        user_record = await db.get_user_by_username(username, current_group)
+        if user_record:
+            target_user_id = user_record['user_id']
+            spin_data = await db.get_spin_data(target_user_id, current_group)
+            if spin_data and not spin_data.get("used") and spin_data.get("spin_count", 0) > 0:
+                await db.mark_discount_used(target_user_id, current_group, plan)
+    
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -1993,8 +2079,14 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str,
                 f"🎉 *¡Bienvenido al grupo VIP!*\n\n"
                 f"✨ Tu período de prueba de *{trial_str}* ha comenzado.\n"
                 f"📅 Tu acceso expira el: *{expiry_str}* (hora Ecuador)\n\n"
-                f"💳 ¿Quieres continuar después del trial? Presiona el botón:",
-                reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown"
+                f"🔥 *Oferta por tiempo limitado:* si pagas *antes* de que termine tu prueba, obtienes un *precio especial*. ¡Asegura tu precio preferencial hoy mismo!\n\n"
+                f"🎰 *¿Sabías que puedes ganar hasta 50% de descuento?*\n"
+                f"Gira la ruleta VIP y usa tu descuento cuando quieras:\n\n",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")],
+                    [InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")]
+                ]),
+                parse_mode="Markdown"
             )
             await _safe_send(
                 group["admin_id"],
@@ -2711,6 +2803,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await broadcast_menu_callback(update, context)
         elif data.startswith("bc|"):
             await broadcast_callback_handler(update, context)
+        elif data.startswith("spin_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                await spin_discount(update, context)
+            else:
+                await query.answer("❌ Error en datos", show_alert=True)
+        elif data == "spin_used":
+            await query.answer("🚫 Ya usaste tu ruleta. Si tienes dudas, contacta al admin.", show_alert=True)
+            
+            # Notificar al admin del intento
+            group_id = None
+            # Extraer group_id del mensaje anterior si es posible
+            # O usar current_group del contexto
+            if hasattr(query.message, 'reply_markup') and query.message.reply_markup:
+                for row in query.message.reply_markup.inline_keyboard:
+                    for btn in row:
+                        if btn.callback_data and btn.callback_data.startswith("pay_"):
+                            parts = btn.callback_data.split("_")
+                            if len(parts) >= 2:
+                                group_id = int(parts[1])
+                                break
+                    if group_id:
+                        break
+            
+            if not group_id:
+                group_id = context.user_data.get('current_group')
+            
+            if group_id:
+                group = get_group_by_id(group_id)
+                if group:
+                    user = query.from_user
+                    await _safe_send(
+                        group["admin_id"],
+                        f"⚠️ *Intento de ruleta repetida (botón usado)*\n\n"
+                        f"👤 [{user.first_name or 'Usuario'}](tg://user?id={user.id})\n"
+                        f"🆔 `{user.id}` | 📌 {group['group_name']}\n\n"
+                        f"Este usuario presionó el botón 'Ruleta ya usada'.",
+                        parse_mode="Markdown"
+                    )
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -2721,7 +2852,111 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-
+# ==================== RULETA VIP ====================
+async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    parts = query.data.split("_")
+    if len(parts) < 3:
+        await query.answer("❌ Error en datos", show_alert=True)
+        return
+    
+    group_id = int(parts[2])
+    user_id = query.from_user.id
+    
+    group = get_group_by_id(group_id)
+    if not group or group.get("type", "VIP") != "VIP":
+        await query.answer("❌ Grupo no válido", show_alert=True)
+        return
+    
+    # ===== VERIFICACIÓN: ¿Ya existe registro? =====
+    spin_data = await db.get_spin_data(user_id, group_id)
+    
+    # CASO 1: Ya tiene spin (cualquier estado) → BLOQUEADO
+    if spin_data.get("spin_count", 0) >= 1:
+        best = spin_data.get("best_discount", 0)
+        
+        # NOTIFICAR AL ADMIN del intento
+        chat_link = f"tg://user?id={user_id}"
+        await _safe_send(
+            group["admin_id"],
+            f"⚠️ *Intento de ruleta repetida*\n\n"
+            f"👤 Usuario: [{query.from_user.first_name or 'Usuario'}]({chat_link})\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📌 Grupo: {group['group_name']}\n\n"
+            f"🎰 Este usuario ya giró la ruleta ({best}% OFF).\n"
+            f"{'✅ Descuento ya fue aplicado.' if spin_data.get('used') else '⏳ Descuento aún pendiente.'}\n\n"
+            f"Verifica con: `/checkspin {user_id}`",
+            parse_mode="Markdown"
+        )
+        
+        if spin_data.get("used"):
+            await query.edit_message_text(
+                f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
+                f"Ya usaste tu spin y tu descuento del *{best}%* fue aplicado.\n\n"
+                f"🚫 *La ruleta es 1 vez por usuario.*\n"
+                f"Para renovar, paga al precio normal:\n\n"
+                f"• 📆 Mensual: {fmt_price(get_group_plan_config(group_id, 'mensual')['price'])}\n"
+                f"• 📅 Semanal: {fmt_price(get_group_plan_config(group_id, 'semanal')['price'])}\n\n"
+                f"💳 Presiona el botón para ver datos de pago:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")]
+                ]),
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
+                f"Ya giraste la ruleta. Tu descuento es: *{best}% OFF*\n\n"
+                f"⏳ ¿Aún no lo usaste? Contacta a @{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
+                f"💳 Presiona para pagar con tu descuento:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Pagar con Descuento", callback_data=f"pay_{group_id}_{user_id}")]
+                ]),
+                parse_mode="Markdown"
+            )
+        return
+    
+    # === PRIMER SPIN ===
+    import random
+    discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
+    discount = random.choice(discounts)
+    
+    await db.record_spin(user_id, group_id, discount)
+    
+    cfg_m = get_group_plan_config(group_id, "mensual")
+    cfg_s = get_group_plan_config(group_id, "semanal")
+    price_m = cfg_m['price'] * (1 - discount/100)
+    price_s = cfg_s['price'] * (1 - discount/100)
+    
+    # Animación de la ruleta
+    for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
+        try:
+            await query.edit_message_text(msg)
+            await asyncio.sleep(0.8)
+        except:
+            pass
+    
+    await query.edit_message_text(
+        f"🎰 *¡RULETA VIP — {group['group_name']}*\n\n"
+        f"@{query.from_user.username or query.from_user.first_name} giró la ruleta...\n\n"
+        f"🎉 *¡FELICIDADES!*\n\n"
+        f"🏆 *Descuento: {discount}% OFF*\n\n"
+        f"💰 *Precios con tu descuento:*\n"
+        f"• 📆 Mensual: ~~{fmt_price(cfg_m['price'])}~~ → *{fmt_price(price_m)}*\n"
+        f"• 📅 Semanal: ~~{fmt_price(cfg_s['price'])}~~ → *{fmt_price(price_s)}*\n\n"
+        f"⏳ *Válido por 24 horas*\n"
+        f"📤 Envía el comprobante + captura de este mensaje a:\n"
+        f"@{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
+        f"_Solo puedes usar la ruleta 1 vez. ¡No lo pierdas!_",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Pagar Mensual con Descuento", callback_data=f"pay_{group_id}_{user_id}")],
+            [InlineKeyboardButton("📅 Pagar Semanal con Descuento", callback_data=f"pay_{group_id}_{user_id}")]
+        ]),
+        parse_mode="Markdown"
+    )
+    
 # ==================== SISTEMA DE AVISOS ====================
 async def send_trial_warnings():
     logger.info("⏰ Enviando avisos de expiración de trial...")
@@ -3525,6 +3760,78 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "✅ No hay usuarios que corregir"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+# ==================== CHECKSPIN (Ruleta VIP) ====================
+async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin verifica si un usuario tiene descuento de ruleta."""
+    user_id = update.effective_user.id
+    current_group = context.user_data.get('current_group')
+    
+    if not current_group or not can_manage_group(user_id, current_group):
+        await update.message.reply_text("❌ No autorizado. Selecciona un grupo primero con /start")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Uso: `/checkspin @usuario` o `/checkspin ID`*\n\n"
+            "Verifica si un usuario tiene descuento de ruleta.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    identifier = context.args[0].replace("@", "")
+    
+    if identifier.isdigit():
+        target_id = int(identifier)
+        user = await db.get_user_by_id_full(target_id, current_group)
+    else:
+        user = await db.get_user_by_username(identifier, current_group)
+        target_id = user['user_id'] if user else None
+    
+    if not user:
+        await update.message.reply_text(f"❌ Usuario no encontrado en este grupo")
+        return
+    
+    spin_data = await db.get_spin_data(target_id, current_group)
+    
+    if spin_data.get("spin_count", 0) == 0:
+        await update.message.reply_text(
+            f"👤 *{user.get('first_name', 'Usuario')}*\n\n"
+            f"🎰 *No ha usado la ruleta.*\n"
+            f"Precio normal aplicable.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    best = spin_data.get("best_discount", 0)
+    used = spin_data.get("used", False)
+    
+    cfg_m = get_group_plan_config(current_group, "mensual")
+    cfg_s = get_group_plan_config(current_group, "semanal")
+    
+    msg = (
+        f"👤 *{user.get('first_name', 'Usuario')}* (`{target_id}`)\n\n"
+        f"🎰 *Ruleta:* {'✅ Usado' if used else '⏳ Pendiente'}\n"
+        f"🏆 Descuento: *{best}% OFF*\n\n"
+    )
+    
+    if not used:
+        price_m = cfg_m['price'] * (1 - best/100)
+        price_s = cfg_s['price'] * (1 - best/100)
+        msg += (
+            f"💰 *Precios con descuento:*\n"
+            f"• 📆 Mensual: ~~{fmt_price(cfg_m['price'])}~~ → *{fmt_price(price_m)}*\n"
+            f"• 📅 Semanal: ~~{fmt_price(cfg_s['price'])}~~ → *{fmt_price(price_s)}*\n\n"
+            f"✅ *Puedes aplicar este descuento al activar con:*\n"
+            f"`/add {target_id} mensual {price_m:.2f}`\n"
+            f"`/add {target_id} semanal {price_s:.2f}`"
+        )
+    else:
+        msg += (
+            f"🚫 *Descuento ya fue aplicado a:* {spin_data.get('applied_to_plan', 'N/A')}\n"
+            f"💰 Precio normal para renovación."
+        )
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 # ==================== MAIN ====================
 async def main():
@@ -3552,6 +3859,7 @@ async def main():
     bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
     bot_app.add_handler(CommandHandler("broadcast",   broadcast_command))
     bot_app.add_handler(CommandHandler("fixtrial",    fix_trial_command))
+    bot_app.add_handler(CommandHandler("checkspin", check_spin_command))
 
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
