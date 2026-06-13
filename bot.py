@@ -1099,6 +1099,43 @@ async def _kick_user_with_retry(group_id: int, user_id: int, retries: int = 3) -
     logger.error(f"❌ No se pudo expulsar al usuario {user_id} del grupo {group_id} tras {retries} intentos")
     return False
 
+# ==================== SHOW VIP INFO (helper para start) ====================
+async def _show_vip_info(send_func, user_id: int, vip_group: dict):
+    """Muestra la información del VIP con ruleta."""
+    group_id = vip_group["group_id"]
+    
+    # Registrar como usuario potencial
+    await db.register_free_user(group_id, user_id, f"user_{user_id}", "")
+    
+    # Consultar estado de ruleta
+    spin_data = await db.get_spin_data(user_id, group_id)
+    spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+    
+    cfg_t = get_group_plan_config(group_id, "trial")
+    cfg_s = get_group_plan_config(group_id, "semanal")
+    cfg_m = get_group_plan_config(group_id, "mensual")
+    
+    keyboard = []
+    
+    if not spin_used:
+        keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data="spin_used")])
+    
+    keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
+    
+    await send_func(
+        f"🔥 *Bienvenido a {vip_group['group_name']}*\n\n"
+        f"🎁 *Trial gratuito:* {fmt_minutes(cfg_t.get('minutes', 1440))}\n"
+        f"📅 *Semanal:* {fmt_price(cfg_s['price'])}\n"
+        f"📆 *Mensual:* {fmt_price(cfg_m['price'])}\n\n"
+        f"🎰 *Gira la ruleta y gana hasta 50% de descuento*\n"
+        f"en tu primera suscripción.\n\n"
+        f"⏳ *El descuento es permanente* — úsalo cuando quieras.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1107,6 +1144,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else update.message.reply_text if update.message else None)
     if not send:
         return
+
+    # ===== NUEVO: Detectar si viene de un canal FREE =====
+    if update.message and context.args:
+        start_param = context.args[0]
+        
+        # Formato: FREE_-1001234567890
+        if start_param.startswith("FREE_"):
+            free_group_id = int(start_param.replace("FREE_", ""))
+            free_group = get_group_by_id(free_group_id)
+            
+            if free_group and free_group.get("type") == "FREE":
+                # Buscar el VIP correspondiente (mismo admin o configurado)
+                vip_group = None
+                
+                # Opción A: El VIP tiene el mismo admin que el FREE
+                for g in GROUPS:
+                    if g.get("type", "VIP") == "VIP" and g["admin_id"] == free_group["admin_id"]:
+                        vip_group = g
+                        break
+                
+                # Opción B: Buscar en settings del FREE si tiene un VIP asignado
+                if not vip_group:
+                    vip_id = free_group.get("settings", {}).get("linked_vip_group_id")
+                    if vip_id:
+                        vip_group = get_group_by_id(vip_id)
+                
+                if vip_group:
+                    # Mostrar info del VIP con ruleta
+                    await _show_vip_info(send, user_id, vip_group)
+                    return
+                else:
+                    await send(
+                        f"👋 *¡Bienvenido!*\n\n"
+                        f"Has llegado desde *{free_group['group_name']}*.\n\n"
+                        f"⚠️ No hay un grupo VIP configurado para este canal.\n"
+                        f"Contacta al administrador.",
+                        parse_mode="Markdown"
+                    )
+                    return
+        
+        # Formato anterior: solo ID del grupo VIP
+        elif start_param.isdigit() or start_param.startswith("-100"):
+            group_id = int(start_param)
+            group = get_group_by_id(group_id)
+            if group and group.get("type", "VIP") == "VIP":
+                await _show_vip_info(send, user_id, group)
+                return
 
     if user_id == SUPER_ADMIN_ID:
         vip_count      = sum(1 for g in GROUPS if g.get("type", "VIP") == "VIP")
@@ -3800,6 +3884,54 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "✅ No hay usuarios que corregir"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+# ==================== LINK VIP (vincular FREE con VIP) ====================
+async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vincula un canal FREE con un grupo VIP."""
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Uso: `/linkvip free_group_id vip_group_id`*\n\n"
+            "Ejemplo: `/linkvip -1001234567890 -1009876543210`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        free_id = int(context.args[0])
+        vip_id = int(context.args[1])
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ IDs inválidos. Usa: `/linkvip free_id vip_id`")
+        return
+    
+    # Verificar que el usuario puede gestionar el FREE
+    if not can_manage_group(user_id, free_id):
+        await update.message.reply_text("❌ No autorizado para gestionar este grupo FREE")
+        return
+    
+    free_group = get_group_by_id(free_id)
+    if not free_group or free_group.get("type") != "FREE":
+        await update.message.reply_text("❌ El primer grupo debe ser FREE")
+        return
+    
+    vip_group = get_group_by_id(vip_id)
+    if not vip_group or vip_group.get("type", "VIP") != "VIP":
+        await update.message.reply_text("❌ El segundo grupo debe ser VIP")
+        return
+    
+    # Guardar en settings del FREE
+    settings = dict(free_group.get("settings", {}))
+    settings['linked_vip_group_id'] = vip_id
+    free_group["settings"] = settings
+    await db.update_group_fields(free_id, {'settings': settings})
+    
+    await update.message.reply_text(
+        f"✅ *Vinculación creada*\n\n"
+        f"📋 FREE: {free_group['group_name']}\n"
+        f"👑 VIP: {vip_group['group_name']}\n\n"
+        f"Los usuarios que lleguen desde el FREE verán la info del VIP.",
+        parse_mode="Markdown"
+    )
+
 # ==================== CHECKSPIN (Ruleta VIP) ====================
 async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin verifica si un usuario tiene descuento de ruleta."""
@@ -3899,8 +4031,9 @@ async def main():
     bot_app.add_handler(CommandHandler("diaggrupo",   diagnose_group))
     bot_app.add_handler(CommandHandler("broadcast",   broadcast_command))
     bot_app.add_handler(CommandHandler("fixtrial",    fix_trial_command))
+    bot_app.add_handler(CommandHandler("linkvip", link_vip_command))
     bot_app.add_handler(CommandHandler("checkspin", check_spin_command))
-
+    
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
 
