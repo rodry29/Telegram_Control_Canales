@@ -2903,7 +2903,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Error en datos", show_alert=True)
         return
     
-    group_id = int(parts[2])
+    group_id = int(parts[1])
     user_id = query.from_user.id
     
     group = get_group_by_id(group_id)
