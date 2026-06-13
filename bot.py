@@ -2727,6 +2727,58 @@ async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode="Markdown"
     )
 
+async def config_free_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configura el link de invitación del canal FREE."""
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Uso: `/configfreelink group_id link_invitación`*\n\n"
+            "Ejemplo:\n"
+            "`/configfreelink -1001234567890 https://t.me/+AbCdEfGhIjKlMnOp`\n\n"
+            "O para canal público:\n"
+            "`/configfreelink -1001234567890 https://t.me/micanal`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID del grupo debe ser un número")
+        return
+    
+    if not can_manage_group(user_id, group_id):
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    group = get_group_by_id(group_id)
+    if not group or group.get("type") != "FREE":
+        await update.message.reply_text("❌ Este comando solo funciona en grupos FREE")
+        return
+    
+    # El link puede tener espacios, unir todo después del group_id
+    invite_link = " ".join(context.args[1:]).strip()
+    
+    if not invite_link.startswith(("https://t.me/", "http://t.me/")):
+        await update.message.reply_text(
+            "❌ Link inválido. Debe empezar con `https://t.me/`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Guardar en settings
+    settings = dict(group.get("settings", {}))
+    settings['invite_link'] = invite_link
+    group["settings"] = settings
+    await db.update_group_fields(group_id, {'settings': settings})
+    
+    await update.message.reply_text(
+        f"✅ *Link configurado*\n\n"
+        f"📋 Grupo: {group['group_name']}\n"
+        f"🔗 Link: `{invite_link}`\n\n"
+        f"Los usuarios podrán unirse al canal desde el botón.",
+        parse_mode="Markdown"
+    )
 
 async def handle_payment_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
