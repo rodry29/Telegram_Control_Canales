@@ -153,7 +153,7 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False) -
     else:
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data="spin_used")])
     
-    keyboard.append([InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")])
+    keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     
     return InlineKeyboardMarkup(keyboard)
 
@@ -2953,7 +2953,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ ¿Aún no lo usaste? Contacta a @{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
                 f"💳 Presiona para pagar con tu descuento:",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Pagar con Descuento", callback_data=f"pay_{group_id}_{user_id}")]
+                    [InlineKeyboardButton("💳 Info de Pago con Descuento", callback_data=f"pay_{group_id}_{user_id}")]
                 ]),
                 parse_mode="Markdown"
             )
@@ -2987,13 +2987,12 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 *Precios con tu descuento:*\n"
         f"• 📆 Mensual: ~~{fmt_price(cfg_m['price'])}~~ → *{fmt_price(price_m)}*\n"
         f"• 📅 Semanal: ~~{fmt_price(cfg_s['price'])}~~ → *{fmt_price(price_s)}*\n\n"
-        f"⏳ *Válido por 24 horas*\n"
+        f"⏳ *Descuento permanente* — puedes usarlo cuando quieras\n"
         f"📤 Envía el comprobante + captura de este mensaje a:\n"
         f"@{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
         f"_Solo puedes usar la ruleta 1 vez. ¡No lo pierdas!_",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Pagar Mensual con Descuento", callback_data=f"pay_{group_id}_{user_id}")],
-            [InlineKeyboardButton("📅 Pagar Semanal con Descuento", callback_data=f"pay_{group_id}_{user_id}")]
+            [InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")],
         ]),
         parse_mode="Markdown"
     )
