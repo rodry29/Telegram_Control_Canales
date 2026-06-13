@@ -1238,14 +1238,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             ])
         
-        # O link para unirse a canal FREE si existe
+        # ✅ CÓDIGO CORREGIDO
         if free_groups:
-            keyboard.append([
-                InlineKeyboardButton(
-                    "📢 Ver canal FREE", 
-                    url=f"https://t.me/c/{str(free_groups[0]['group_id']).replace('-100', '')}"
-                )
-            ])
+            free_group = free_groups[0]
+            invite_link = free_group.get("settings", {}).get("invite_link")
+            
+            if invite_link:
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "📢 Ver canal FREE", 
+                        url=invite_link
+                    )
+                ])
+            else:
+                # Fallback: intentar con el username del canal si es público
+                # o mostrar mensaje de error
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "📢 Ver canal FREE (configurar link)", 
+                        callback_data="no_free_link"
+                    )
+                ])
         
         await send(
             f"👋 *¡Bienvenido!*\n\n"
@@ -2967,6 +2980,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Este usuario presionó el botón 'Ruleta ya usada'.",
                         parse_mode="Markdown"
                     )
+
+        elif data == "no_free_link":   # ←── AÑADIR ESTO AQUÍ
+            await query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
+            
         else:
             await query.answer()
             logger.warning(f"Callback desconocido: {data}")
@@ -4033,6 +4050,7 @@ async def main():
     bot_app.add_handler(CommandHandler("fixtrial",    fix_trial_command))
     bot_app.add_handler(CommandHandler("linkvip", link_vip_command))
     bot_app.add_handler(CommandHandler("checkspin", check_spin_command))
+    bot_app.add_handler(CommandHandler("configfreelink", config_free_link_command))
     
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
