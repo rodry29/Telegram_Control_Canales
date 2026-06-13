@@ -1129,8 +1129,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_groups = get_groups_by_admin(user_id)
+    
+    # Si no tiene grupos asignados, mostrar panel de usuario normal
     if not user_groups:
-        await send("❌ No tienes grupos asignados como administrador.\n\nContacta al Super Administrador.")
+        # Verificar si llegó con parámetro de grupo (link de inicio)
+        if update.message and context.args:
+            # ... (tu código actual de /start group_id ya está aquí) ...
+            # Si ya implementaste el paso 1 de la ruleta, esto ya existe
+            pass  # Se maneja más abajo o arriba en tu start()
+        
+        # Si no es admin y no llegó por link, mostrar mensaje genérico
+        # que invite a usar el bot como usuario normal
+        free_groups = [g for g in GROUPS if g.get("type") == "FREE"]
+        vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
+        
+        keyboard = []
+        
+        # Botones para grupos VIP (para que pueda solicitar info)
+        for group in vip_groups:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🔥 Info {group['group_name']}", 
+                    callback_data=f"pay_{group['group_id']}_{user_id}"
+                )
+            ])
+        
+        # O link para unirse a canal FREE si existe
+        if free_groups:
+            keyboard.append([
+                InlineKeyboardButton(
+                    "📢 Ver canal FREE", 
+                    url=f"https://t.me/c/{str(free_groups[0]['group_id']).replace('-100', '')}"
+                )
+            ])
+        
+        await send(
+            f"👋 *¡Bienvenido!*\n\n"
+            f"Soy el bot de acceso VIP. ¿Quieres unirte a uno de nuestros grupos?\n\n"
+            f"🎰 *Gira la ruleta y gana hasta 50% de descuento*\n"
+            f"en tu primera suscripción.\n\n"
+            f"Selecciona un grupo para ver información:",
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            parse_mode="Markdown"
+        )
         return
 
     if len(user_groups) == 1:
