@@ -995,7 +995,7 @@ bot_app   = None
 # ==================== HELPERS INTERNOS ====================
 async def _safe_send(chat_id: int, text: str, **kwargs):
     try:
-        await bot_app.bot.send_message(chat_id, text, **kwargs)
+        return await bot_app.bot.send_message(chat_id, text, **kwargs)
     except Exception as e:
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
         return None
@@ -3250,18 +3250,18 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: str, sent_by: int):
-    logger.info(f"DEBUG: execute_broadcast START - bot={bot}, group_id={group_id}, filter={filter_type}")
     targets = await db.get_broadcast_targets(group_id, filter_type)
-    logger.info(f"DEBUG: targets={len(targets)}")
+    logger.info(f"DEBUG execute_broadcast START: targets={len(targets)}, filter={filter_type}")
+    
     if not targets:
-        await _safe_send(sent_by, "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.",
-                         parse_mode="Markdown")
+        # Usar bot.send_message directamente o el _safe_send arreglado
+        await bot.send_message(
+            sent_by,
+            "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.",
+            parse_mode="Markdown"
+        )
         return
-
-    logger.info(f"DEBUG: starting loop")
-    for i, user in enumerate(targets, 1):
-        user_id = user['user_id']
-        logger.info(f"DEBUG: processing user {i}/{len(targets)}: {user_id}")
+    
     group      = get_group_by_id(group_id)
     group_name = group.get('group_name', 'VIP') if group else 'VIP'
     total      = len(targets)
@@ -3269,11 +3269,17 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
     fail_count    = 0
     delay = 0.12  # ~8 msg/segundo
 
-    progress_msg = await _safe_send(
-        sent_by,
-        f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0\n• Fallidos: 0",
-        parse_mode="Markdown"
-    )
+    # Enviar mensaje de progreso INICIAL y GUARDAR el objeto Message
+    try:
+        progress_msg = await bot.send_message(
+            sent_by,
+            f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0\n• Fallidos: 0",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"❌ No se pudo enviar mensaje de progreso: {e}")
+        progress_msg = None
+
     last_update = datetime.utcnow()
 
     for i, user in enumerate(targets, 1):
@@ -3290,29 +3296,72 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
         except Exception as e:
             fail_count += 1
             logger.warning(f"❌ Fallo broadcast a {user_id}: {e}")
+        
         await asyncio.sleep(delay)
+        
+        # Actualizar progreso cada 5 segundos o cada 10 mensajes
         now = datetime.utcnow()
-        if (now - last_update).seconds >= 5 or i % 10 == 0:
+        if progress_msg and ((now - last_update).seconds >= 5 or i % 10 == 0):
             try:
-                if progress_msg and hasattr(progress_msg, 'message_id'):
-                    await bot.edit_message_text(
-                        f"🚀 *Broadcast en progreso...*\n\n"
-                        f"• Total: {total}\n• Enviados: {success_count}\n"
-                        f"• Fallidos: {fail_count}\n• Progreso: {int(i/total*100)}%",
-                        chat_id=sent_by, message_id=progress_msg.message_id, parse_mode="Markdown"
+                await bot.edit_message_text(
+                    f"🚀 *Broadcast en progreso...*\n\n"
+                    f"• Total: {total}\n• Enviados: {success_count}\n"
+                    f"• Fallidos: {fail_count}\n• Progreso: {int(i/total*100)}%",
+                    chat_id=sent_by,
+                    message_id=progress_msg.message_id,
+                    parse_mode="Markdown"
+                )
+                last_update = now
+            except Exception as e:
+                logger.warning(f"⚠️ No se pudo actualizar progreso: {e}")
+                # Si falla la edición, intentar enviar nuevo mensaje
+                try:
+                    progress_msg = await bot.send_message(
+                        sent_by,
+                        f"🚀 *Broadcast en progreso...* {int(i/total*100)}%\n"
+                        f"• Enviados: {success_count} | Fallidos: {fail_count}",
+                        parse_mode="Markdown"
                     )
-            except Exception:
-                pass
-            last_update = now
+                    last_update = now
+                except Exception:
+                    pass
 
+    # Guardar log en base de datos
     await db.log_broadcast_sent(group_id, filter_type, message_text, total, success_count, fail_count, sent_by)
-    await _safe_send(
-        sent_by,
-        f"✅ *Broadcast completado*\n\n"
-        f"• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}\n"
-        f"• 📈 Éxito: {(success_count/total*100):.1f}%\n\nFiltro: {filter_type} | Grupo: {group_name}",
-        parse_mode="Markdown"
-    )
+    
+    # Mensaje FINAL de completado
+    try:
+        # Editar el mensaje de progreso a mensaje final
+        if progress_msg:
+            await bot.edit_message_text(
+                f"✅ *Broadcast completado*\n\n"
+                f"• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}\n"
+                f"• 📈 Éxito: {(success_count/total*100):.1f}%\n\n"
+                f"Filtro: {filter_type} | Grupo: {group_name}",
+                chat_id=sent_by,
+                message_id=progress_msg.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            await bot.send_message(
+                sent_by,
+                f"✅ *Broadcast completado*\n\n"
+                f"• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}\n"
+                f"• 📈 Éxito: {(success_count/total*100):.1f}%\n\n"
+                f"Filtro: {filter_type} | Grupo: {group_name}",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"❌ Error enviando mensaje final: {e}")
+        # Fallback: intentar enviar de cualquier forma
+        try:
+            await bot.send_message(
+                sent_by,
+                f"✅ *Broadcast completado* — {success_count}/{total} enviados",
+                parse_mode="Markdown"
+            )
+        except Exception as e2:
+            logger.error(f"❌ Fallback también falló: {e2}")
 
 
 # ==================== TAREAS PROGRAMADAS ====================
