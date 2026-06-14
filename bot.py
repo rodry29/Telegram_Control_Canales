@@ -45,7 +45,8 @@ if not DATABASE_URL:
 PLANS = {
     "trial":   {"minutes": 1440, "price": 0,  "name": "🎁 Trial (1 día)"},
     "semanal": {"days": 7,       "price": 10, "name": "📅 Semanal (7 días)"},
-    "mensual": {"days": 30,      "price": 20, "name": "📆 Mensual (30 días)"}
+    "mensual": {"days": 30,      "price": 20, "name": "📆 Mensual (30 días)"},
+    "anual":   {"days": 365,     "price": 150, "name": "🏆 Anual (365 días)"}
 }
 
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
@@ -128,6 +129,10 @@ def get_group_plan_config(group_id: int, plan: str) -> dict:
         base["days"]  = settings.get("duration_mensual", base.get("days", 30))
         base["price"] = float(settings.get("price_mensual", base.get("price", 20)))
         base["name"]  = f"📆 Mensual ({base['days']} días) - ${base['price']:.2f}"
+    elif plan == "anual":
+        base["days"]  = settings.get("duration_anual", base.get("days", 365))
+        base["price"] = float(settings.get("price_anual", base.get("price", 150)))
+        base["name"]  = f"🏆 Anual ({base['days']} días) - {fmt_price(base['price'])}"
     return base
 
 def fmt_price(amount) -> str:
@@ -1048,7 +1053,69 @@ class Database:
                 """, (plan, user_id, group_id))
         await self._run(_upd)
         
+    async def renew_user_subscription(self, group_id: int, user_id: int, plan: str,
+                                       custom_price: float = None, custom_days: int = None,
+                                       first_name: str = "") -> tuple:
+        """
+        Renueva/Extiende la suscripción de un usuario activo.
+        Añade tiempo a partir de su end_date actual (no desde NOW).
+        """
+        if plan not in PLANS:
+            return False, "❌ Plan inválido"
 
+        config = get_group_plan_config(group_id, plan)
+        effective_price = custom_price if custom_price is not None else config.get('price', 0)
+        effective_days = custom_days if custom_days is not None else config.get('days', 7)
+        effective_mins = config.get('minutes', effective_days * 1440)
+
+        def _renew(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT user_id, status, end_date, plan, trial_used, first_name, username "
+                    "FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE",
+                    (user_id, group_id)
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    return False, "❌ Usuario no encontrado en este grupo"
+
+                base_date = existing['end_date'] if existing['status'] == 'active' and existing['end_date'] > datetime.utcnow() else datetime.utcnow()
+                
+                if plan == "trial":
+                    new_end_date = base_date + timedelta(minutes=effective_mins)
+                    dur_minutes = effective_mins
+                    expiry_str = fmt_dt(new_end_date)
+                else:
+                    new_end_date = base_date + timedelta(days=effective_days)
+                    dur_minutes = effective_days * 1440
+                    expiry_str = fmt_dt(new_end_date, include_time=False)
+
+                fn = first_name or existing.get('first_name', '') or ''
+                username = existing.get('username', f"user_{user_id}")
+
+                cur.execute("""
+                    UPDATE users SET
+                        plan=%s, end_date=%s, status='active', updated_at=NOW(),
+                        first_name=%s, kicked_at=NULL
+                    WHERE user_id=%s AND group_id=%s
+                """, (plan, new_end_date, fn, user_id, group_id))
+
+                cur.execute("""
+                    INSERT INTO payments
+                        (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (user_id, group_id, username, fn, plan, effective_price, dur_minutes, datetime.utcnow()))
+
+                price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
+                action_type = "RENOVADO" if existing['status'] == 'active' and existing['end_date'] > datetime.utcnow() else "REACTIVADO"
+                
+                return True, (f"✅ *{fn or username}* {action_type}\n"
+                             f"📋 Plan: {plan} | 💰 {price_str}\n"
+                             f"📅 Nueva expiración: {expiry_str}\n"
+                             f"⏳ Añadido desde: {'expiración actual' if action_type == 'RENOVADO' else 'ahora'}")
+
+        return await self._run(_renew)
+                                           
 # ==================== INSTANCIAS GLOBALES ====================
 db        = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
@@ -1628,6 +1695,105 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def renew_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Renueva la suscripción de un usuario existente extendiendo su end_date."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    current_group = context.user_data.get('current_group')
+    if not current_group:
+        group = get_group_by_id(chat_id)
+        if group and can_manage_group(user_id, chat_id):
+            current_group = chat_id
+        else:
+            await update.message.reply_text("❌ Usa /start primero o ejecuta en un grupo que administres")
+            return
+    
+    if not can_manage_group(user_id, current_group):
+        await update.message.reply_text("❌ No autorizado")
+        return
+
+    if len(context.args) < 2:
+        cfg_t = get_group_plan_config(current_group, "trial")
+        cfg_s = get_group_plan_config(current_group, "semanal")
+        cfg_m = get_group_plan_config(current_group, "mensual")
+        cfg_a = get_group_plan_config(current_group, "anual")
+        await update.message.reply_text(
+            "❌ *Uso:* `/renew @username|ID plan [precio] [días]`\n\n"
+            "*Planes:*\n"
+            f"• `trial`   — {cfg_t['name']}\n"
+            f"• `semanal` — {cfg_s['name']}\n"
+            f"• `mensual` — {cfg_m['name']}\n"
+            f"• `anual`   — {cfg_a['name']}\n\n"
+            "*Ejemplos:*\n"
+            "`/renew @juan mensual`\n"
+            "`/renew 123456789 anual`\n"
+            "`/renew @juan mensual 15.00`\n"
+            "`/renew @juan semanal 8.99 14`\n\n"
+            "💡 *La renovación extiende desde la fecha de expiración actual*",
+            parse_mode="Markdown"
+        )
+        return
+
+    identifier = context.args[0].replace("@", "")
+    plan = context.args[1].lower()
+    if plan not in PLANS:
+        await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal, mensual, anual")
+        return
+
+    custom_price = None
+    custom_days = None
+    if len(context.args) >= 3:
+        try:
+            custom_price = float(context.args[2].replace(",", "."))
+            if custom_price < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Precio inválido", parse_mode="Markdown")
+            return
+    if len(context.args) >= 4:
+        try:
+            custom_days = int(context.args[3])
+            if custom_days <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Días inválidos", parse_mode="Markdown")
+            return
+
+    if identifier.isdigit():
+        target_user_id = int(identifier)
+        first_name = ""
+        try:
+            member = await context.bot.get_chat_member(current_group, target_user_id)
+            if member and member.user:
+                first_name = member.user.first_name or ""
+        except Exception as e:
+            logger.warning(f"No se pudo obtener info: {e}")
+    else:
+        user_record = await db.get_user_by_username(identifier, current_group)
+        if not user_record:
+            await update.message.reply_text(f"❌ No tengo registro de @{identifier}")
+            return
+        target_user_id = user_record['user_id']
+        first_name = user_record.get('first_name', '')
+
+    success, msg = await db.renew_user_subscription(
+        current_group, target_user_id, plan, custom_price, custom_days, first_name
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+    if success:
+        group = get_group_by_id(current_group)
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                f"🔄 *¡Tu suscripción ha sido renovada!*\n\n"
+                f"Tu plan *{plan}* en *{group['group_name'] if group else 'VIP'}* ha sido extendido.\n"
+                f"¡Gracias por seguir con nosotros! 🎉",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo notificar al usuario {target_user_id}: {e}")
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query    = update.callback_query
@@ -2406,6 +2572,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     cfg_trial   = get_group_plan_config(group_id, "trial")
     cfg_semanal = get_group_plan_config(group_id, "semanal")
     cfg_mensual = get_group_plan_config(group_id, "mensual")
+    cfg_anual   = get_group_plan_config(group_id, "anual")
     trial_str   = fmt_minutes(cfg_trial.get('minutes', 1440))
     keyboard = [
         [InlineKeyboardButton(f"⏱ Trial: {trial_str}",                                callback_data=f"cfg_trial_{group_id}")],
@@ -2413,6 +2580,8 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton(f"💲 Precio semanal: {fmt_price(cfg_semanal['price'])}", callback_data=f"cfg_price_semanal_{group_id}")],
         [InlineKeyboardButton(f"📆 Días mensual: {cfg_mensual['days']}d",              callback_data=f"cfg_dur_mensual_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio mensual: {fmt_price(cfg_mensual['price'])}", callback_data=f"cfg_price_mensual_{group_id}")],
+        [InlineKeyboardButton(f"🏆 Días anual: {cfg_anual['days']}d",              callback_data=f"cfg_dur_anual_{group_id}")],
+        [InlineKeyboardButton(f"💲 Precio anual: {fmt_price(cfg_anual['price'])}", callback_data=f"cfg_price_anual_{group_id}")],
         [InlineKeyboardButton("💳 Configurar Pago",                                   callback_data=f"cfg_payment_{group_id}")],
         [InlineKeyboardButton("🔔 Configurar Avisos",                                 callback_data=f"cfg_warnings_{group_id}")],
         [InlineKeyboardButton("🔙 Volver",                                             callback_data=f"select_group_{group_id}")]
@@ -2422,6 +2591,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• ⏱ *Trial:* {trial_str}\n"
         f"• 📅 *Semanal:* {cfg_semanal['days']} días | {fmt_price(cfg_semanal['price'])}\n"
         f"• 📆 *Mensual:* {cfg_mensual['days']} días | {fmt_price(cfg_mensual['price'])}\n\n"
+        f"• 🏆 *Anual:* {cfg_anual['days']} días | {fmt_price(cfg_anual['price'])}\n\n"
         f"_Con `/add` puedes sobreescribir precio y días por usuario._",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
@@ -2959,6 +3129,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cfg_duration_request(update, context, int(data.replace("cfg_dur_semanal_", "")), "semanal")
         elif data.startswith("cfg_dur_mensual_"):
             await cfg_duration_request(update, context, int(data.replace("cfg_dur_mensual_", "")), "mensual")
+        elif data.startswith("cfg_price_anual_"):
+            await cfg_price_request(update, context, int(data.replace("cfg_price_anual_", "")), "anual")
+        elif data.startswith("cfg_dur_anual_"):
+            await cfg_duration_request(update, context, int(data.replace("cfg_dur_anual_", "")), "anual")
         elif data == "trial_stats":
             await trial_stats(update, context)
         elif data.startswith("pay_"):
@@ -4086,6 +4260,7 @@ async def main():
     # Comandos
     bot_app.add_handler(CommandHandler("start",       start))
     bot_app.add_handler(CommandHandler("add",         add_user_command))
+    bot_app.add_handler(CommandHandler("renew",       renew_user_command))
     bot_app.add_handler(CommandHandler("groups",      list_groups))
     bot_app.add_handler(CommandHandler("addgroup",    add_group_command))
     bot_app.add_handler(CommandHandler("backup",      manual_backup))
