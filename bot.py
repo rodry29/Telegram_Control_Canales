@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import json
+import threading
 from io import StringIO
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Callable
@@ -29,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURACIÓN ====================
 DATABASE_URL = os.getenv("DATABASE_URL")
-SUPER_ADMIN_ID = 5054216496
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "5054216496"))
+EXTRA_ADMINS = [int(x.strip()) for x in os.getenv("EXTRA_ADMINS", "").split(",") if x.strip()]
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 EC_TZ = ZoneInfo("America/Guayaquil")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "AyudanteVIP_bot")
@@ -50,6 +52,7 @@ PLANS = {
 
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
 GROUPS: List[Dict[str, Any]] = []
+GROUPS_LOCK = threading.Lock()
 
 for _group_config in GROUPS_CONFIG.split(","):
     if _group_config.strip():
@@ -65,14 +68,19 @@ for _group_config in GROUPS_CONFIG.split(","):
 
 # ==================== UTILIDADES DE TIEMPO ====================
 def now_ec() -> datetime:
-    return datetime.now(EC_TZ).replace(tzinfo=None)
+    """Retorna datetime naive en UTC (para DB) pero con contexto de Ecuador para display."""
+    return datetime.now(ZoneInfo("UTC"))
 
 def fmt_dt(dt: datetime, include_time: bool = True) -> str:
     if dt is None:
         return "N/A"
     try:
-        dt_utc = dt.replace(tzinfo=ZoneInfo("UTC"))
-        dt_ec  = dt_utc.astimezone(EC_TZ)
+        # Asumimos que dt viene de DB en UTC naive o con tz UTC
+        if dt.tzinfo is None:
+            dt_utc = dt.replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            dt_utc = dt.astimezone(ZoneInfo("UTC"))
+        dt_ec = dt_utc.astimezone(EC_TZ)
     except Exception:
         dt_ec = dt
     if include_time:
@@ -81,16 +89,18 @@ def fmt_dt(dt: datetime, include_time: bool = True) -> str:
 
 # ==================== UTILIDADES ====================
 def get_group_by_id(group_id: int) -> Optional[dict]:
-    return next((g for g in GROUPS if g["group_id"] == group_id), None)
+    with GROUPS_LOCK:
+        return next((g for g in GROUPS if g["group_id"] == group_id), None)
 
 def get_groups_by_admin(admin_id: int, group_type: str = None) -> list:
-    groups = GROUPS if admin_id == SUPER_ADMIN_ID else [g for g in GROUPS if g["admin_id"] == admin_id]
-    if group_type:
-        groups = [g for g in groups if g.get("type", "VIP") == group_type]
-    return groups
+    with GROUPS_LOCK:
+        groups = GROUPS if admin_id == SUPER_ADMIN_ID or admin_id in EXTRA_ADMINS else [g for g in GROUPS if g["admin_id"] == admin_id]
+        if group_type:
+            groups = [g for g in groups if g.get("type", "VIP") == group_type]
+        return groups
 
 def can_manage_group(user_id: int, group_id: int) -> bool:
-    if user_id == SUPER_ADMIN_ID:
+    if user_id == SUPER_ADMIN_ID or user_id in EXTRA_ADMINS:
         return True
     group = get_group_by_id(group_id)
     return group is not None and group["admin_id"] == user_id
@@ -131,6 +141,57 @@ def fmt_minutes(mins: int) -> str:
         return f"{h}h {m}m" if m else f"{h}h"
     return f"{m} min"
 
+def _plan_emoji(plan: str) -> str:
+    return {'semanal': '📅', 'mensual': '📆', 'anual': '🏆'}.get(plan, '💎')
+
+def _build_price_list(group_id: int, plans: list = None, discounted_pct: float = 0) -> str:
+    """Helper centralizado para construir listas de precios con descuento opcional."""
+    plans = plans or ["semanal", "mensual", "anual"]
+    lines = []
+    for p in plans:
+        cfg = get_group_plan_config(group_id, p)
+        price = cfg['price'] * (1 - discounted_pct/100)
+        original = fmt_price(cfg['price'])
+        final = fmt_price(price)
+        if discounted_pct > 0:
+            lines.append(f"• {_plan_emoji(p)} {p.capitalize()} ({cfg.get('days', 7)} días): ~~{original}~~ → *{final}*")
+        else:
+            lines.append(f"• {_plan_emoji(p)} {p.capitalize()} ({cfg.get('days', 7)} días): *{fmt_price(cfg['price'])}*")
+    return "\n".join(lines)
+
+# ==================== MENSAJES CONFIGURABLES ====================
+DEFAULT_WELCOME_MESSAGE = (
+    "🎉 *¡Bienvenido al VIP!*\n\n"
+    "✨ Tu prueba de *{trial_duration}* ha comenzado.\n"
+    "📅 Expira a las: *{expiry_time}*\n\n"
+    "🔥 *¿Te gusta el contenido?*\n"
+    "Paga antes de que termine tu prueba y asegura tu acceso.\n\n"
+    "🎰 *Gira la ruleta para descuento:*"
+)
+
+DEFAULT_REJECTION_MESSAGE = (
+    "🚫 *Acceso denegado — {group_name}*\n\n"
+    "Este grupo es exclusivo para miembros VIP.\n\n"
+    "📋 *Para acceder tienes 2 opciones:*\n\n"
+    "🎁 *Opción 1 (Recomendada):*\n"
+    "1️⃣ Únete a nuestro canal FREE\n"
+    "2️⃣ Obtén tu prueba GRATIS desde el bot\n\n"
+    "💳 *Opción 2 (Inmediata):*\n"
+    "Paga directamente y accede ahora:\n"
+    "{price_list}\n\n"
+    "🎰 *¿Quieres descuento?*\n"
+    "🎰 Gira la ruleta y gana hasta 50% OFF\n\n"
+    "👇 *Elige tu camino:*"
+)
+
+def format_message(template: str, variables: dict) -> str:
+    if not template:
+        return ""
+    result = template
+    for key, value in variables.items():
+        result = result.replace(f"{{{key}}}", str(value))
+    return result
+
 # ==================== HELPERS DE PAGO ====================
 def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False) -> InlineKeyboardMarkup:
     keyboard = []
@@ -151,9 +212,7 @@ def get_payment_info_text(group_id: int) -> str:
     paypal_data = settings.get("paypal_data", "").strip()
     group_name = group.get("group_name", "VIP")
     lines = [f"💰 *INFORMACIÓN DE PAGO — {group_name}*", "", "📋 *Planes disponibles:*"]
-    for p in ["semanal", "mensual", "anual"]:
-        cfg = get_group_plan_config(group_id, p)
-        lines.append(f"• {'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} {p.capitalize()} ({cfg.get('days', 7)} días): *{fmt_price(cfg.get('price', 0))}*")
+    lines.append(_build_price_list(group_id))
     lines.append("")
     if bank_data:
         lines += ["🏦 *Transferencia Bancaria:*", bank_data, ""]
@@ -170,10 +229,21 @@ def get_payment_info_text(group_id: int) -> str:
     ]
     return "\n".join(lines)
 
+# Rate limiting simple en memoria para /pagar y leads
+_PAYMENT_COOLDOWN: Dict[str, datetime] = {}
+
 async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str = "comando"):
     group = get_group_by_id(group_id)
     if not group:
         return False
+    # Rate limiting: máximo 1 notificación cada 5 minutos por usuario/grupo
+    cooldown_key = f"pay_{user_id}_{group_id}"
+    last_sent = _PAYMENT_COOLDOWN.get(cooldown_key)
+    now = datetime.now(ZoneInfo("UTC"))
+    if last_sent and (now - last_sent).total_seconds() < 300:
+        logger.info(f"Rate limit: pago info para {user_id} en grupo {group_id} omitido")
+        return True  # Silencioso, no spamear al admin
+    _PAYMENT_COOLDOWN[cooldown_key] = now
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
         spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
@@ -250,7 +320,7 @@ class Database:
                     CREATE TABLE IF NOT EXISTS groups (
                         group_id BIGINT PRIMARY KEY, group_name TEXT, group_type TEXT DEFAULT 'VIP',
                         admin_id BIGINT, super_admin_id BIGINT, created_at TIMESTAMP DEFAULT NOW(),
-                        settings JSONB DEFAULT '{}\'::jsonb
+                        settings JSONB DEFAULT '{}'::jsonb
                     )
                 """)
                 cur.execute("""
@@ -294,6 +364,16 @@ class Database:
                         UNIQUE(user_id, group_id)
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS group_messages (
+                        group_id BIGINT PRIMARY KEY,
+                        welcome_message TEXT DEFAULT NULL,
+                        welcome_buttons JSONB DEFAULT '[]'::jsonb,
+                        rejection_message TEXT DEFAULT NULL,
+                        rejection_buttons JSONB DEFAULT '[]'::jsonb,
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
                 # Índices
                 for idx_sql in [
                     "CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)",
@@ -335,11 +415,12 @@ class Database:
                 return cur.fetchall()
         rows = await self._run(_load)
         if rows:
-            GROUPS.clear()
-            for g in rows:
-                settings = g["settings"] if isinstance(g["settings"], dict) else {}
-                GROUPS.append({"group_id": g["group_id"], "group_name": g["group_name"],
-                               "admin_id": g["admin_id"], "type": g["group_type"], "settings": settings})
+            with GROUPS_LOCK:
+                GROUPS.clear()
+                for g in rows:
+                    settings = g["settings"] if isinstance(g["settings"], dict) else {}
+                    GROUPS.append({"group_id": g["group_id"], "group_name": g["group_name"],
+                                   "admin_id": g["admin_id"], "type": g["group_type"], "settings": settings})
             logger.info(f"📦 {len(GROUPS)} grupos cargados desde BD")
             return True
         return False
@@ -355,6 +436,14 @@ class Database:
                 """, (group_id, group_name, admin_id, SUPER_ADMIN_ID, group_type))
         await self._run(_save)
 
+    async def get_user(self, user_id: int, group_id: int, columns: str = "*") -> Optional[dict]:
+        """Consulta unificada con proyección de columnas configurable."""
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT {columns} FROM users WHERE user_id=%s AND group_id=%s LIMIT 1", (user_id, group_id))
+                return cur.fetchone()
+        return await self._run(_get)
+
     async def get_user_by_username(self, username: str, group_id: int = None):
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -366,18 +455,10 @@ class Database:
         return await self._run(_get)
 
     async def get_user_by_id(self, user_id: int, group_id: int):
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id, status, end_date, plan, trial_used FROM users WHERE user_id=%s AND group_id=%s LIMIT 1", (user_id, group_id))
-                return cur.fetchone()
-        return await self._run(_get)
+        return await self.get_user(user_id, group_id, "user_id, status, end_date, plan, trial_used")
 
     async def get_user_by_id_full(self, user_id: int, group_id: int):
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM users WHERE user_id=%s AND group_id=%s LIMIT 1", (user_id, group_id))
-                return cur.fetchone()
-        return await self._run(_get)
+        return await self.get_user(user_id, group_id, "*")
 
     async def register_user_auto(self, group_id: int, user_id: int, username: str, first_name: str):
         now = datetime.utcnow()
@@ -400,13 +481,17 @@ class Database:
                     return True, "trial_nuevo", end_date
                 cur.execute("UPDATE users SET username=%s, first_name=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s",
                             (username, first_name, user_id, group_id))
+                # Estado activo y vigente → permitir reingreso
                 if existing["status"] == "active" and existing["end_date"] > now:
                     cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
                     return True, "activo", existing["end_date"]
-                if existing["status"] in ("expired", "active") and existing["end_date"] <= now:
+                # Cualquier estado con end_date vencido → expirado
+                if existing["end_date"] <= now:
                     return False, "expirado", None
-                if existing["trial_used"]:
+                # Trial ya usado y no expirado → sin trial
+                if existing.get("trial_used"):
                     return False, "sin_trial", None
+                # Otorgar trial nuevo
                 end_date = now + timedelta(minutes=trial_minutes)
                 cur.execute("""
                     UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW()
@@ -813,6 +898,51 @@ class Database:
                 """, (plan, user_id, group_id))
         await self._run(_upd)
 
+    async def get_group_messages(self, group_id: int) -> dict:
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM group_messages WHERE group_id = %s", (group_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return dict(row)
+        return await self._run(_get)
+
+    async def save_group_messages(self, group_id: int, welcome_msg: str = None, welcome_buttons: list = None,
+                                   rejection_msg: str = None, rejection_buttons: list = None):
+        def _save(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO group_messages (group_id, welcome_message, welcome_buttons, rejection_message, rejection_buttons, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (group_id) DO UPDATE SET
+                        welcome_message = COALESCE(EXCLUDED.welcome_message, group_messages.welcome_message),
+                        welcome_buttons = COALESCE(EXCLUDED.welcome_buttons, group_messages.welcome_buttons),
+                        rejection_message = COALESCE(EXCLUDED.rejection_message, group_messages.rejection_message),
+                        rejection_buttons = COALESCE(EXCLUDED.rejection_buttons, group_messages.rejection_buttons),
+                        updated_at = NOW()
+                """, (group_id, welcome_msg, json.dumps(welcome_buttons) if welcome_buttons else None,
+                      rejection_msg, json.dumps(rejection_buttons) if rejection_buttons else None))
+        await self._run(_save)
+
+    # --- Backup tracking en DB en vez de archivo local ---
+    async def get_last_backup_date(self) -> Optional[datetime]:
+        def _get(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(sent_at) FROM broadcast_logs WHERE filter_type = 'auto_backup'")
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+        return await self._run(_get)
+
+    async def log_backup_sent(self):
+        def _log(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO broadcast_logs (group_id, filter_type, message_preview, total_count, success_count, fail_count, sent_by)
+                    VALUES (0, 'auto_backup', 'Backup automatico', 0, 0, 0, %s)
+                """, (SUPER_ADMIN_ID,))
+        await self._run(_log)
+
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
@@ -855,14 +985,6 @@ async def _kick_user_with_retry(group_id: int, user_id: int, retries: int = 3) -
     logger.error(f"❌ No se pudo expulsar al usuario {user_id} tras {retries} intentos")
     return False
 
-def _admin_alert_text(title: str, user_id: int, first_name: str, username: str, group: dict, extra: str = "") -> str:
-    display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
-    chat_link = f"tg://user?id={user_id}"
-    text = f"{title}\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group.get('group_name', 'VIP')}"
-    if extra:
-        text += f"\n{extra}"
-    return text
-
 def _back_button(callback: str) -> list:
     return [InlineKeyboardButton("🔙 Volver", callback_data=callback)]
 
@@ -884,7 +1006,7 @@ async def _show_vip_info(send_func, user_id: int, vip_group: dict):
         if p == "trial":
             lines.append(f"🎁 *Trial gratuito:* {fmt_minutes(cfg.get('minutes', 1440))}")
         else:
-            lines.append(f"{'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} *{p.capitalize()}:* {fmt_price(cfg['price'])}")
+            lines.append(f"{_plan_emoji(p)} *{p.capitalize()}:* {fmt_price(cfg['price'])}")
     lines += ["", "🎰 *Gira la ruleta y gana hasta 50% de descuento* en tu primera suscripción.", "", "⏳ *El descuento es permanente* — úsalo cuando quieras."]
     await send_func("\n".join(lines), reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used), parse_mode="Markdown")
 
@@ -925,9 +1047,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _show_vip_info(send, user_id, group)
                 return
 
-    if user_id == SUPER_ADMIN_ID:
-        vip_count = sum(1 for g in GROUPS if g.get("type", "VIP") == "VIP")
-        free_count = sum(1 for g in GROUPS if g.get("type") == "FREE")
+    if user_id == SUPER_ADMIN_ID or user_id in EXTRA_ADMINS:
+        with GROUPS_LOCK:
+            vip_count = sum(1 for g in GROUPS if g.get("type", "VIP") == "VIP")
+            free_count = sum(1 for g in GROUPS if g.get("type") == "FREE")
         total_earnings = await db.get_total_monthly_earnings()
         total_users = await db.get_total_users_count()
         keyboard = [
@@ -945,8 +1068,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_groups = get_groups_by_admin(user_id)
     if not user_groups:
-        free_groups = [g for g in GROUPS if g.get("type") == "FREE"]
-        vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
+        with GROUPS_LOCK:
+            free_groups = [g for g in GROUPS if g.get("type") == "FREE"]
+            vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
         keyboard = []
         for group in vip_groups:
             keyboard.append([InlineKeyboardButton(f"🔥 Info {group['group_name']}", callback_data=f"pay_{group['group_id']}_{user_id}")])
@@ -1048,6 +1172,7 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")],
             [InlineKeyboardButton("📊 Estadísticas Trial", callback_data="trial_stats")],
             [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group_id}")],
+            [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
             [InlineKeyboardButton("📢 Broadcast Trial", callback_data="broadcast_menu")],
         ]
         await query.edit_message_text(
@@ -1072,7 +1197,7 @@ async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         await query.answer()
     total = await db.get_total_monthly_earnings()
-    now = now_ec()
+    now = datetime.now(EC_TZ)
     await message.reply_text(
         f"💰 *GANANCIAS TOTALES DEL MES*\n\n📅 {now.strftime('%B %Y')}\n💵 Total recaudado: *${total}*\n\n📊 Incluye todos los grupos configurados.",
         parse_mode="Markdown"
@@ -1376,6 +1501,8 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display = f"{first_name} (@{username})" if username and not username.startswith('user_') else f"{first_name} (ID: `{user['user_id']}`)"
         chat_link = f"tg://user?id={user['user_id']}"
         msg += f"{emoji} {display}\n   📅 Expira: {expiry_date} ({expiry_text})\n   📋 Plan: {user['plan']}\n   🔗 [Abrir chat]({chat_link})\n\n"
+    if len(users) > 30:
+        msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.* Usa el panel para ver más detalles."
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1388,7 +1515,7 @@ async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Selecciona un grupo con /start")
         return
     earnings = await db.get_monthly_earnings(group_id)
-    now = now_ec()
+    now = datetime.now(EC_TZ)
     msg = f"💰 *GANANCIAS DE {now.strftime('%B %Y').upper()}*\n\n"
     if not earnings['summary']:
         msg += "📭 No hay ventas"
@@ -1412,7 +1539,7 @@ async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
         return
-    now = now_ec()
+    now = datetime.now(EC_TZ)
     transactions = await db.get_export_data(group_id)
     if not transactions:
         await message.reply_text(f"📭 No hay transacciones en {now.strftime('%B %Y')}")
@@ -1436,20 +1563,15 @@ async def auto_backup():
     global bot_app
     if not bot_app:
         return
-    last_backup_file = "last_backup.txt"
-    last_backup_date = None
-    try:
-        if os.path.exists(last_backup_file):
-            with open(last_backup_file, 'r') as f:
-                last_backup_date = datetime.fromisoformat(f.read().strip())
-    except Exception:
-        pass
-    now = now_ec()
-    if not last_backup_date or (now - last_backup_date).days >= 15:
+    last_backup_date = await db.get_last_backup_date()
+    now = datetime.now(EC_TZ)
+    if not last_backup_date or (now - last_backup_date.replace(tzinfo=None)).days >= 15:
         output = StringIO()
         writer = csv.writer(output)
         writer.writerow(['group_id', 'group_name', 'group_type', 'admin_id', 'backup_date'])
-        for group in GROUPS:
+        with GROUPS_LOCK:
+            groups_snapshot = list(GROUPS)
+        for group in groups_snapshot:
             writer.writerow([group['group_id'], group['group_name'], group.get('type', 'VIP'), group['admin_id'],
                              now.strftime('%Y-%m-%d %H:%M:%S')])
         output.seek(0)
@@ -1459,27 +1581,27 @@ async def auto_backup():
                 document=output.getvalue().encode('utf-8-sig'),
                 filename=f"backup_automatico_{now.strftime('%Y%m%d')}.csv",
                 caption=(f"📦 *Backup Automático*\n\n📅 Fecha: {now.strftime('%d/%m/%Y %H:%M')} (EC)\n"
-                         f"📊 Grupos incluidos: {len(GROUPS)}\n\n⚠️ Guarda este archivo en un lugar seguro."),
+                         f"📊 Grupos incluidos: {len(groups_snapshot)}\n\n⚠️ Guarda este archivo en un lugar seguro."),
                 parse_mode="Markdown"
             )
             output.close()
-            with open(last_backup_file, 'w') as f:
-                f.write(now.isoformat())
+            await db.log_backup_sent()
             logger.info("✅ Backup automático enviado")
         except Exception as e:
             logger.error(f"❌ Error enviando backup automático: {e}")
 
 async def manual_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
         return
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(['group_id', 'group_name', 'group_type', 'admin_id', 'backup_date'])
-    now = now_ec()
-    for group in GROUPS:
-        writer.writerow([group['group_id'], group['group_name'], group.get('type', 'VIP'), group['admin_id'],
-                         now.strftime('%Y-%m-%d %H:%M:%S')])
+    now = datetime.now(EC_TZ)
+    with GROUPS_LOCK:
+        for group in GROUPS:
+            writer.writerow([group['group_id'], group['group_name'], group.get('type', 'VIP'), group['admin_id'],
+                             now.strftime('%Y-%m-%d %H:%M:%S')])
     output.seek(0)
     await update.message.reply_document(
         document=output.getvalue().encode('utf-8-sig'),
@@ -1490,7 +1612,7 @@ async def manual_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output.close()
 
 async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
         return
     if not update.message.document:
@@ -1502,25 +1624,39 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await update.message.document.get_file()
         file_content = await file.download_as_bytearray()
         reader = csv.reader(io.StringIO(file_content.decode('utf-8')))
-        next(reader)
+        header = next(reader, None)
+        if not header or len(header) < 4:
+            await update.message.reply_text("❌ CSV inválido: encabezado incorrecto")
+            return
+        expected = ['group_id', 'group_name', 'group_type', 'admin_id']
+        if header[:4] != expected:
+            await update.message.reply_text(f"❌ CSV inválido: encabezado esperado {expected}, recibido {header[:4]}")
+            return
         restored_count = 0
-        for row in reader:
-            if len(row) >= 4:
-                group_id = int(row[0])
-                group_name = row[1]
-                group_type = row[2]
-                admin_id = int(row[3])
-                if get_group_by_id(group_id):
-                    for g in GROUPS:
-                        if g["group_id"] == group_id:
-                            g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
-                            break
-                    await db.update_group_fields(group_id, {'admin': admin_id, 'type': group_type})
-                else:
-                    GROUPS.append({"group_id": group_id, "group_name": group_name, "type": group_type,
-                                   "admin_id": admin_id, "settings": {}})
-                    await db.save_group(group_id, group_name, admin_id, group_type)
-                restored_count += 1
+        with GROUPS_LOCK:
+            for row in reader:
+                if len(row) >= 4:
+                    try:
+                        group_id = int(row[0])
+                        group_name = row[1]
+                        group_type = row[2]
+                        admin_id = int(row[3])
+                    except (ValueError, IndexError):
+                        continue
+                    if group_type not in ("VIP", "FREE"):
+                        continue
+                    existing = get_group_by_id(group_id)
+                    if existing:
+                        for g in GROUPS:
+                            if g["group_id"] == group_id:
+                                g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
+                                break
+                        await db.update_group_fields(group_id, {'admin': admin_id, 'type': group_type})
+                    else:
+                        GROUPS.append({"group_id": group_id, "group_name": group_name, "type": group_type,
+                                       "admin_id": admin_id, "settings": {}})
+                        await db.save_group(group_id, group_name, admin_id, group_type)
+                    restored_count += 1
         await update.message.reply_text(f"✅ *Restauración completa*\n\n📊 Grupos restaurados: {restored_count}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error al restaurar: {e}")
@@ -1528,19 +1664,20 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     message = query.message if query else update.message
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await message.reply_text("❌ Solo Super Admin")
         return
-    if not GROUPS:
-        await message.reply_text("📭 No hay grupos")
-        return
-    msg = "📊 *GRUPOS CONFIGURADOS*\n\n"
-    for group in GROUPS:
-        msg += f"📌 *{group['group_name']}*\n   🆔 ID: `{group['group_id']}`\n   👑 Admin: `{group['admin_id']}`\n   📋 Tipo: {group.get('type', 'VIP')}\n\n"
+    with GROUPS_LOCK:
+        if not GROUPS:
+            await message.reply_text("📭 No hay grupos")
+            return
+        msg = "📊 *GRUPOS CONFIGURADOS*\n\n"
+        for group in GROUPS:
+            msg += f"📌 *{group['group_name']}*\n   🆔 ID: `{group['group_id']}`\n   👑 Admin: `{group['admin_id']}`\n   📋 Tipo: {group.get('type', 'VIP')}\n\n"
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
         return
     if len(context.args) < 4:
@@ -1554,7 +1691,11 @@ async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_type not in ["VIP", "FREE"]:
             await update.message.reply_text("❌ TIPO debe ser VIP o FREE")
             return
-        GROUPS.append({"group_id": group_id, "type": group_type, "group_name": group_name, "admin_id": admin_id, "settings": {}})
+        with GROUPS_LOCK:
+            if any(g["group_id"] == group_id for g in GROUPS):
+                await update.message.reply_text(f"⚠️ El grupo {group_id} ya existe. Usa editar para cambiarlo.")
+                return
+            GROUPS.append({"group_id": group_id, "type": group_type, "group_name": group_name, "admin_id": admin_id, "settings": {}})
         await db.save_group(group_id, group_name, admin_id, group_type)
         await update.message.reply_text(f"✅ Grupo {group_name} agregado")
     except Exception as e:
@@ -1568,7 +1709,8 @@ async def view_free_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_type: str, select_mode: bool = False):
     query = update.callback_query
-    groups = [g for g in GROUPS if g.get("type", "VIP") == group_type]
+    with GROUPS_LOCK:
+        groups = [g for g in GROUPS if g.get("type", "VIP") == group_type]
     if not groups:
         await query.edit_message_text(f"📭 No hay grupos {group_type}")
         return
@@ -1580,22 +1722,24 @@ async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def menu_edit_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not GROUPS:
-        await query.edit_message_text("📭 No hay grupos configurados")
-        return
-    keyboard = [[InlineKeyboardButton(f"{'👑' if g.get('type', 'VIP') == 'VIP' else '📋'} {g['group_name']}",
-                                      callback_data=f"edit_multiple_{g['group_id']}")] for g in GROUPS]
+    with GROUPS_LOCK:
+        if not GROUPS:
+            await query.edit_message_text("📭 No hay grupos configurados")
+            return
+        keyboard = [[InlineKeyboardButton(f"{'👑' if g.get('type', 'VIP') == 'VIP' else '📋'} {g['group_name']}",
+                                          callback_data=f"edit_multiple_{g['group_id']}")] for g in GROUPS]
     keyboard.append(_back_button("menu_groups"))
     await query.edit_message_text("✏️ *Selecciona el grupo que deseas editar*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def menu_delete_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not GROUPS:
-        await query.edit_message_text("📭 No hay grupos configurados")
-        return
-    keyboard = [[InlineKeyboardButton(f"{'👑' if g.get('type', 'VIP') == 'VIP' else '📋'} {g['group_name']}",
-                                      callback_data=f"delete_confirm_{g['group_id']}")] for g in GROUPS]
+    with GROUPS_LOCK:
+        if not GROUPS:
+            await query.edit_message_text("📭 No hay grupos configurados")
+            return
+        keyboard = [[InlineKeyboardButton(f"{'👑' if g.get('type', 'VIP') == 'VIP' else '📋'} {g['group_name']}",
+                                          callback_data=f"delete_confirm_{g['group_id']}")] for g in GROUPS]
     keyboard.append(_back_button("menu_groups"))
     await query.edit_message_text("❌ *Eliminar Grupo*\n\n⚠️ Esta acción es irreversible. Selecciona el grupo:",
                                   reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -1621,8 +1765,9 @@ async def delete_group_execute(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     group_name = group['group_name']
-    global GROUPS
-    GROUPS = [g for g in GROUPS if g["group_id"] != group_id]
+    with GROUPS_LOCK:
+        global GROUPS
+        GROUPS = [g for g in GROUPS if g["group_id"] != group_id]
     await db.delete_group_from_db(group_id)
     await query.edit_message_text(f"✅ *Grupo eliminado*\n\n📌 {group_name}\n🆔 ID: `{group_id}`", parse_mode="Markdown")
     await asyncio.sleep(2)
@@ -1663,7 +1808,7 @@ async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ Este comando solo funciona en grupos FREE")
         return
     count_month, count_last_month, total_all = await db.get_potential_clients_stats(group_id)
-    now = now_ec()
+    now = datetime.now(EC_TZ)
     if count_last_month > 0:
         growth = ((count_month - count_last_month) / count_last_month) * 100
         growth_text = f"{'📈' if growth > 0 else '📉' if growth < 0 else '➖'} {growth:+.1f}% vs mes anterior"
@@ -1694,7 +1839,7 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output.seek(0)
     await query.message.reply_document(
         document=output.getvalue().encode('utf-8-sig'),
-        filename=f"clientes_{now_ec().strftime('%Y%m%d')}.csv",
+        filename=f"clientes_{datetime.now(EC_TZ).strftime('%Y%m%d')}.csv",
         caption="📋 Clientes potenciales"
     )
     output.close()
@@ -1815,12 +1960,13 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     changes_made = []
-    for g in GROUPS:
-        if g["group_id"] == group_id:
-            if 'name' in pending: g["group_name"] = pending['name']; changes_made.append(f"📝 Nombre → {pending['name']}")
-            if 'admin' in pending: g["admin_id"] = pending['admin']; changes_made.append(f"👤 Admin → {pending['admin']}")
-            if 'type' in pending: g["type"] = pending['type']; changes_made.append(f"🔄 Tipo → {pending['type']}")
-            break
+    with GROUPS_LOCK:
+        for g in GROUPS:
+            if g["group_id"] == group_id:
+                if 'name' in pending: g["group_name"] = pending['name']; changes_made.append(f"📝 Nombre → {pending['name']}")
+                if 'admin' in pending: g["admin_id"] = pending['admin']; changes_made.append(f"👤 Admin → {pending['admin']}")
+                if 'type' in pending: g["type"] = pending['type']; changes_made.append(f"🔄 Tipo → {pending['type']}")
+                break
     await db.update_group_fields(group_id, pending)
     for key in ('pending_changes', 'editing_mode', 'editing_group_id'):
         context.user_data.pop(key, None)
@@ -1832,79 +1978,87 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def _process_new_vip_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
     display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
-    
+
     # PASO 1: VERIFICAR si el usuario está registrado en el FREE del mismo admin
     free_group = None
-    for g in GROUPS:
-        if g.get("type") == "FREE" and g["admin_id"] == group["admin_id"]:
-            free_group = g
-            break
-    
+    with GROUPS_LOCK:
+        for g in GROUPS:
+            if g.get("type") == "FREE" and g["admin_id"] == group["admin_id"]:
+                free_group = g
+                break
+
     # Si no hay FREE configurado, buscar linked_vip
     if not free_group:
         vip_settings = group.get("settings", {})
         free_id = vip_settings.get("linked_free_group_id")
         if free_id:
             free_group = get_group_by_id(free_id)
-    
+
     # PASO 2: VERIFICAR si el usuario está en el FREE
     user_in_free = False
     if free_group:
         free_user = await db.get_user_by_id(user_id, free_group["group_id"])
         if free_user:
             user_in_free = True
-    
+
     # PASO 3: SI NO ESTÁ EN FREE → EXPULSAR Y ENVIAR AL FREE + PAGO
     if not user_in_free:
         logger.info(f"🚫 Usuario {user_id} intentó entrar al VIP sin estar en FREE. Expulsando...")
-        
+
         kick_success = await _kick_user_with_retry(chat_id, user_id)
-        
+
         if kick_success:
             # Verificar si tiene descuento de ruleta
             spin_data = await db.get_spin_data(user_id, chat_id)
             spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
-            
+
             # Construir teclado
             free_link = None
             if free_group:
                 free_link = free_group.get("settings", {}).get("invite_link")
-            
+
             keyboard = []
             if free_link:
                 keyboard.append([InlineKeyboardButton("📢 Unirme al canal FREE", url=free_link)])
-            
+
             keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
-            
+
             if not spin_used:
                 keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")])
             else:
                 keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{chat_id}_{user_id}")])
-            
+
             # Construir mensaje con precios
-            price_lines = []
-            for p in ["semanal", "mensual", "anual"]:
-                cfg = get_group_plan_config(chat_id, p)
-                price_lines.append(f"• {'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} {p.capitalize()}: {fmt_price(cfg['price'])}")
-            
+            price_lines = _build_price_list(chat_id)
+
+            # OBTENER MENSAJE DE RECHAZO CONFIGURADO O DEFAULT
+            custom_messages = await db.get_group_messages(chat_id)
+
+            if custom_messages and custom_messages.get('rejection_message'):
+                rejection_msg = format_message(
+                    custom_messages['rejection_message'],
+                    {
+                        'group_name': group['group_name'],
+                        'user_name': first_name or username,
+                        'price_list': price_lines
+                    }
+                )
+            else:
+                rejection_msg = format_message(
+                    DEFAULT_REJECTION_MESSAGE,
+                    {
+                        'group_name': group['group_name'],
+                        'price_list': price_lines
+                    }
+                )
+
             await _safe_send(
                 user_id,
-                f"🚫 *Acceso denegado — {group['group_name']}*\n\n"
-                f"Este grupo es exclusivo para miembros VIP.\n\n"
-                f"📋 *Para acceder tienes 2 opciones:*\n\n"
-                f"🎁 *Opción 1 (Recomendada):*\n"
-                f"1️⃣ Únete a nuestro canal FREE\n"
-                f"2️⃣ Obtén tu prueba GRATIS desde el bot\n\n"
-                f"💳 *Opción 2 (Inmediata):*\n"
-                f"Paga directamente y accede ahora:\n"
-                f"{chr(10).join(price_lines)}\n\n"
-                f"🎰 *¿Quieres descuento?*\n"
-                f"🎰Gira la ruleta y gana hasta 50% OFF\n\n"
-                f"👇 *Elige tu camino:*",
+                rejection_msg,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
             )
-            
+
             # Notificar al admin
             await _safe_send(
                 group["admin_id"],
@@ -1917,34 +2071,63 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 parse_mode="Markdown"
             )
         return False
-    
+
     # PASO 4: SI ESTÁ EN FREE → OTORGAR TRIAL O VERIFICAR SUSCRIPCIÓN
     logger.info(f"✅ Usuario {user_id} está en FREE. Procesando acceso VIP...")
-    
+
     allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
     logger.info(f"register_user_auto → allow={allow_access}, code={result_code}, end_date={end_date}")
-    
+
     if allow_access:
         if result_code == "trial_nuevo":
             cfg_t = get_group_plan_config(chat_id, "trial")
             trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
             expiry_str = fmt_dt(end_date) if end_date else "N/A"
-            
-            await _safe_send(
-                user_id,
-                f"🎉 *¡Bienvenido al VIP!*\n\n"
-                f"✨ Tu prueba de *{trial_str}* ha comenzado.\n"
-                f"📅 Expira a las: *{expiry_str}*\n\n"
-                f"🔥 *¿Te gusta el contenido?*\n"
-                f"Paga antes de que termine tu prueba y asegura tu acceso.\n\n"
-                f"🎰 *Gira la ruleta para descuento:*",
-                reply_markup=InlineKeyboardMarkup([
+
+            # OBTENER MENSAJE CONFIGURADO O USAR DEFAULT
+            custom_messages = await db.get_group_messages(chat_id)
+
+            if custom_messages and custom_messages.get('welcome_message'):
+                welcome_msg = format_message(
+                    custom_messages['welcome_message'],
+                    {
+                        'trial_duration': trial_str,
+                        'expiry_time': expiry_str,
+                        'group_name': group['group_name'],
+                        'user_name': first_name or username
+                    }
+                )
+            else:
+                welcome_msg = format_message(
+                    DEFAULT_WELCOME_MESSAGE,
+                    {
+                        'trial_duration': trial_str,
+                        'expiry_time': expiry_str
+                    }
+                )
+
+            # BOTONES (configurables o default)
+            if custom_messages and custom_messages.get('welcome_buttons'):
+                buttons = json.loads(custom_messages['welcome_buttons'])
+                keyboard = []
+                for btn in buttons:
+                    if btn.get('url'):
+                        keyboard.append([InlineKeyboardButton(btn['text'], url=btn['url'])])
+                    else:
+                        keyboard.append([InlineKeyboardButton(btn['text'], callback_data=btn.get('callback_data', 'no_action'))])
+            else:
+                keyboard = [
                     [InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")],
                     [InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")]
-                ]),
+                ]
+
+            await _safe_send(
+                user_id,
+                welcome_msg,
+                reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
             )
-            
+
             await _safe_send(
                 group["admin_id"],
                 f"🆕 *Nuevo usuario VIP (vino desde FREE)*\n\n"
@@ -1956,12 +2139,12 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 f"💡 *Para activar pago:* Responde con `/add {user_id} mensual`",
                 parse_mode="Markdown"
             )
-            
+
         elif result_code == "activo":
             logger.info(f"✅ Reingreso permitido: {display} en {group['group_name']} — expira {end_date}")
-            
+
         return True
-    
+
     # PASO 5: SI NO PUEDE ACCEDER (trial usado, expirado, etc.)
     if result_code == "expirado":
         motivo_usuario = "Tu prueba o suscripción ha expirado."
@@ -1969,9 +2152,9 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     else:
         motivo_usuario = "Ya usaste tu prueba gratuita."
         motivo_admin = "Trial ya utilizado"
-    
+
     kick_success = await _kick_user_with_retry(chat_id, user_id)
-    
+
     if kick_success:
         await _safe_send(
             user_id,
@@ -2000,7 +2183,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             f"🔧 *Acción manual requerida.*",
             parse_mode="Markdown"
         )
-    
+
     return False
 
 async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
@@ -2210,9 +2393,10 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Ingresa los días como entero positivo. Ej: `7`", parse_mode="Markdown")
         return
     group = get_group_by_id(group_id)
-    settings = dict(group.get("settings", {}))
-    settings[field] = value
-    group["settings"] = settings
+    with GROUPS_LOCK:
+        settings = dict(group.get("settings", {}))
+        settings[field] = value
+        group["settings"] = settings
     await db.update_group_fields(group_id, {'settings': settings})
     context.user_data.pop('cfg_field', None)
     context.user_data.pop('cfg_group_id', None)
@@ -2232,14 +2416,15 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
         return
     if len(context.args) < 1:
         await update.message.reply_text("❌ Usa: `/searchgrupo nombre`", parse_mode="Markdown")
         return
     search_term = " ".join(context.args).lower()
-    results = [g for g in GROUPS if search_term in g['group_name'].lower()]
+    with GROUPS_LOCK:
+        results = [g for g in GROUPS if search_term in g['group_name'].lower()]
     if not results:
         await update.message.reply_text(f"📭 No se encontraron grupos con '{search_term}'")
         return
@@ -2249,8 +2434,45 @@ async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{emoji} *{group['group_name']}*\n   🆔 ID: `{group['group_id']}`\n   👑 Admin: `{group['admin_id']}`\n\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def handle_message_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get('config_msg_step')
+    group_id = context.user_data.get('config_msg_group_id')
+    msg_type = context.user_data.get('config_msg_type')
+
+    if not step or not group_id or not msg_type:
+        return
+
+    text = update.message.text.strip()
+
+    if text.lower() == 'cancelar':
+        for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'):
+            context.user_data.pop(k, None)
+        await update.message.reply_text("❌ Configuración cancelada")
+        return
+
+    if text.lower() == 'default':
+        text = None  # Guardará NULL, y el código usará default
+
+    if msg_type == "welcome":
+        await db.save_group_messages(group_id, welcome_msg=text)
+    else:
+        await db.save_group_messages(group_id, rejection_msg=text)
+
+    for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'):
+        context.user_data.pop(k, None)
+
+    await update.message.reply_text(
+        f"✅ *Mensaje de {msg_type} actualizado*\n\n"
+        f"📋 Grupo: `{group_id}`\n\n"
+        f"El mensaje se usará a partir de ahora.",
+        parse_mode="Markdown"
+    )
+
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
+        return
+    if context.user_data.get('config_msg_step') and context.user_data.get('config_msg_group_id'):
+        await handle_message_config_input(update, context)
         return
     if context.user_data.get('broadcast_step') == 'message' and context.user_data.get('broadcast_group_id'):
         await handle_broadcast_input(update, context)
@@ -2264,7 +2486,7 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('cfg_field') and context.user_data.get('cfg_group_id'):
         await handle_cfg_input(update, context)
         return
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         return
     text = update.message.text.strip()
     if text.lower() == 'cancelar':
@@ -2296,7 +2518,7 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ El ID debe ser un número")
 
 async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in [SUPER_ADMIN_ID, 8682208062]:
+    if update.effective_user.id not in [SUPER_ADMIN_ID] + EXTRA_ADMINS:
         await update.message.reply_text("❌ No autorizado")
         return
     if len(context.args) < 1:
@@ -2323,23 +2545,16 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-async def sync_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ *Sincronización manual no disponible*\n\n"
-        "Los usuarios se registran automáticamente al *entrar al grupo*.\n"
-        "Para registrar uno manualmente: `/add @usuario plan` o `/add ID plan`",
-        parse_mode="Markdown"
-    )
-
 async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
         return
     msg = "📊 *Estado actual de grupos*\n\n"
-    for group in GROUPS:
-        users = await db.get_all_active_users(group["group_id"])
-        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
-        msg += f"{emoji} *{group['group_name']}*: {len(users)} usuarios activos\n"
+    with GROUPS_LOCK:
+        for group in GROUPS:
+            users = await db.get_all_active_users(group["group_id"])
+            emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+            msg += f"{emoji} *{group['group_name']}*: {len(users)} usuarios activos\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2378,7 +2593,7 @@ async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
         return
     group_id = context.user_data.get('current_group')
@@ -2437,7 +2652,7 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
+
     if not context.args:
         await update.message.reply_text(
             "❌ *Uso: `/linkvip free_group_id vip_group_id`*\n\n"
@@ -2446,40 +2661,42 @@ async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    
+
     try:
         free_id = int(context.args[0])
         vip_id = int(context.args[1])
     except (ValueError, IndexError):
         await update.message.reply_text("❌ IDs inválidos. Usa: `/linkvip free_id vip_id`")
         return
-    
+
     if not can_manage_group(user_id, free_id):
         await update.message.reply_text("❌ No autorizado para gestionar este grupo FREE")
         return
-    
+
     free_group = get_group_by_id(free_id)
     if not free_group or free_group.get("type") != "FREE":
         await update.message.reply_text("❌ El primer grupo debe ser FREE")
         return
-    
+
     vip_group = get_group_by_id(vip_id)
     if not vip_group or vip_group.get("type", "VIP") != "VIP":
         await update.message.reply_text("❌ El segundo grupo debe ser VIP")
         return
-    
+
     # Guardar en FREE: linked_vip_group_id
     free_settings = dict(free_group.get("settings", {}))
     free_settings['linked_vip_group_id'] = vip_id
-    free_group["settings"] = free_settings
+    with GROUPS_LOCK:
+        free_group["settings"] = free_settings
     await db.update_group_fields(free_id, {'settings': free_settings})
-    
-    # Guardar en VIP: linked_free_group_id (NUEVO)
+
+    # Guardar en VIP: linked_free_group_id
     vip_settings = dict(vip_group.get("settings", {}))
     vip_settings['linked_free_group_id'] = free_id
-    vip_group["settings"] = vip_settings
+    with GROUPS_LOCK:
+        vip_group["settings"] = vip_settings
     await db.update_group_fields(vip_id, {'settings': vip_settings})
-    
+
     await update.message.reply_text(
         f"✅ *Vinculación completada*\n\n"
         f"📋 FREE: {free_group['group_name']}\n"
@@ -2523,11 +2740,8 @@ async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     used = spin_data.get("used", False)
     msg = f"👤 *{user.get('first_name', 'Usuario')}* (`{target_id}`)\n\n🎰 *Ruleta:* {'✅ Usado' if used else '⏳ Pendiente'}\n🏆 Descuento: *{best}% OFF*\n\n"
     if not used:
-        for p in ["semanal", "mensual", "anual"]:
-            cfg = get_group_plan_config(current_group, p)
-            price = cfg['price'] * (1 - best/100)
-            msg += f"• {'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} {p.capitalize()}: ~~{fmt_price(cfg['price'])}~~ → *{fmt_price(price)}*\n"
-        msg += f"\n✅ *Puedes aplicar este descuento al activar con:*\n"
+        msg += _build_price_list(current_group, discounted_pct=best) + "\n\n"
+        msg += f"✅ *Puedes aplicar este descuento al activar con:*\n"
         for p in ["semanal", "mensual", "anual"]:
             cfg = get_group_plan_config(current_group, p)
             price = cfg['price'] * (1 - best/100)
@@ -2535,6 +2749,68 @@ async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         msg += f"🚫 *Descuento ya fue aplicado a:* {spin_data.get('applied_to_plan', 'N/A')}\n💰 Precio normal para renovación."
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def config_messages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Uso: `/configmsg group_id [tipo]`*\n\n"
+            "Ejemplos:\n"
+            "`/configmsg -1001234567890 welcome` — Configurar mensaje de bienvenida\n"
+            "`/configmsg -1001234567890 rejection` — Configurar mensaje de rechazo\n\n"
+            "Variables disponibles:\n"
+            "• `{trial_duration}` — duración del trial\n"
+            "• `{expiry_time}` — fecha de expiración\n"
+            "• `{group_name}` — nombre del grupo\n"
+            "• `{user_name}` — nombre del usuario\n"
+            "• `{price_list}` — lista de precios",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        group_id = int(context.args[0])
+        msg_type = context.args[1].lower() if len(context.args) > 1 else "welcome"
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ Formato inválido")
+        return
+
+    if not can_manage_group(user_id, group_id):
+        await update.message.reply_text("❌ No autorizado")
+        return
+
+    group = get_group_by_id(group_id)
+    if not group:
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
+
+    if msg_type not in ("welcome", "rejection"):
+        await update.message.reply_text("❌ Tipo debe ser `welcome` o `rejection`")
+        return
+
+    context.user_data['config_msg_group_id'] = group_id
+    context.user_data['config_msg_type'] = msg_type
+    context.user_data['config_msg_step'] = 'text'
+
+    current = await db.get_group_messages(group_id)
+    current_msg = ""
+
+    if msg_type == "welcome":
+        current_msg = current.get('welcome_message', '') if current else ''
+        default_msg = DEFAULT_WELCOME_MESSAGE
+    else:
+        current_msg = current.get('rejection_message', '') if current else ''
+        default_msg = DEFAULT_REJECTION_MESSAGE
+
+    await update.message.reply_text(
+        f"✏️ *Configurar mensaje de {msg_type} — {group['group_name']}*\n\n"
+        f"📋 *Actual:*\n`{current_msg or 'No configurado (usando default)'}`\n\n"
+        f"📝 *Default:*\n`{default_msg[:200]}...`\n\n"
+        f"Envía el nuevo mensaje. Usa las variables entre `{{}}`.\n\n"
+        f"*Escribe 'default' para restaurar el mensaje por defecto.*\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
 
 # ==================== PAGO ====================
 async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2627,7 +2903,8 @@ async def config_free_link_command(update: Update, context: ContextTypes.DEFAULT
         return
     settings = dict(group.get("settings", {}))
     settings['invite_link'] = invite_link
-    group["settings"] = settings
+    with GROUPS_LOCK:
+        group["settings"] = settings
     await db.update_group_fields(group_id, {'settings': settings})
     await update.message.reply_text(
         f"✅ *Link configurado*\n\n📋 Grupo: {group['group_name']}\n🔗 Link: `{invite_link}`\n\n"
@@ -2658,7 +2935,8 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
                 settings.pop('bank_data', None)
             else:
                 settings['bank_data'] = text
-        group["settings"] = settings
+        with GROUPS_LOCK:
+            group["settings"] = settings
         await db.update_group_fields(group_id, {'settings': settings})
         context.user_data['config_payment_step'] = 'payment_contact'
         current_contact = settings.get("payment_contact", "")
@@ -2671,7 +2949,8 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
     elif step == 'payment_contact':
         if text.lower() != 'saltar':
             settings['payment_contact'] = text.lstrip('@').strip()
-        group["settings"] = settings
+        with GROUPS_LOCK:
+            group["settings"] = settings
         await db.update_group_fields(group_id, {'settings': settings})
         context.user_data['config_payment_step'] = 'paypal_data'
         current_paypal = settings.get("paypal_data", "")
@@ -2687,7 +2966,8 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
                 settings.pop('paypal_data', None)
             else:
                 settings['paypal_data'] = text
-        group["settings"] = settings
+        with GROUPS_LOCK:
+            group["settings"] = settings
         await db.update_group_fields(group_id, {'settings': settings})
         context.user_data.pop('config_payment_step', None)
         context.user_data.pop('config_payment_group_id', None)
@@ -2722,6 +3002,8 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 # ==================== RULETA VIP ====================
+_SPIN_LOCKS: Dict[str, asyncio.Lock] = {}
+
 async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2735,68 +3017,72 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group or group.get("type", "VIP") != "VIP":
         await query.answer("❌ Grupo no válido", show_alert=True)
         return
-    spin_data = await db.get_spin_data(user_id, group_id)
-    if spin_data.get("spin_count", 0) >= 1:
-        best = spin_data.get("best_discount", 0)
-        chat_link = f"tg://user?id={user_id}"
-        await _safe_send(
-            group["admin_id"],
-            f"⚠️ *Intento de ruleta repetida*\n\n"
-            f"👤 Usuario: [{query.from_user.first_name or 'Usuario'}]({chat_link})\n"
-            f"🆔 ID: `{user_id}`\n📌 Grupo: {group['group_name']}\n\n"
-            f"🎰 Este usuario ya giró la ruleta ({best}% OFF).\n"
-            f"{'✅ Descuento ya fue aplicado.' if spin_data.get('used') else '⏳ Descuento aún pendiente.'}\n\n"
-            f"Verifica con: `/checkspin {user_id}`",
+
+    # Bloqueo por usuario para evitar doble clic
+    lock_key = f"spin_{user_id}_{group_id}"
+    if lock_key not in _SPIN_LOCKS:
+        _SPIN_LOCKS[lock_key] = asyncio.Lock()
+    async with _SPIN_LOCKS[lock_key]:
+        spin_data = await db.get_spin_data(user_id, group_id)
+        if spin_data.get("spin_count", 0) >= 1:
+            best = spin_data.get("best_discount", 0)
+            chat_link = f"tg://user?id={user_id}"
+            await _safe_send(
+                group["admin_id"],
+                f"⚠️ *Intento de ruleta repetida*\n\n"
+                f"👤 Usuario: [{query.from_user.first_name or 'Usuario'}]({chat_link})\n"
+                f"🆔 ID: `{user_id}`\n📌 Grupo: {group['group_name']}\n\n"
+                f"🎰 Este usuario ya giró la ruleta ({best}% OFF).\n"
+                f"{'✅ Descuento ya fue aplicado.' if spin_data.get('used') else '⏳ Descuento aún pendiente.'}\n\n"
+                f"Verifica con: `/checkspin {user_id}`",
+                parse_mode="Markdown"
+            )
+            if spin_data.get("used"):
+                await query.edit_message_text(
+                    f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
+                    f"Ya usaste tu spin y tu descuento del *{best}%* fue aplicado.\n\n"
+                    f"🚫 *La ruleta es 1 vez por usuario.*\n"
+                    f"Para renovar, paga al precio normal:\n\n"
+                    + _build_price_list(group_id)
+                    + "\n\n💳 Presiona el botón para ver datos de pago:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")]]),
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.edit_message_text(
+                    f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
+                    f"Ya giraste la ruleta. Tu descuento es: *{best}% OFF*\n\n"
+                    f"⏳ ¿Aún no lo usaste? Contacta a @{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
+                    f"💳 Presiona para pagar con tu descuento:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Info de Pago con Descuento", callback_data=f"pay_{group_id}_{user_id}")]]),
+                    parse_mode="Markdown"
+                )
+            return
+
+        import random
+        discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
+        discount = random.choice(discounts)
+        await db.record_spin(user_id, group_id, discount)
+        for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
+            try:
+                await query.edit_message_text(msg)
+                await asyncio.sleep(0.8)
+            except:
+                pass
+
+        price_lines = _build_price_list(group_id, discounted_pct=discount)
+        await query.edit_message_text(
+            f"🎰 *¡RULETA VIP — {group['group_name']}*\n\n"
+            f"@{query.from_user.username or query.from_user.first_name} giró la ruleta...\n\n"
+            f"🎉 *¡FELICIDADES!*\n\n🏆 *Descuento: {discount}% OFF*\n\n"
+            f"💰 *Precios con tu descuento:*\n" + price_lines + "\n\n"
+            f"⏳ *Descuento permanente* — puedes usarlo cuando quieras\n"
+            f"📤 Envía el comprobante + captura de este mensaje a:\n"
+            f"@{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
+            f"_Solo puedes usar la ruleta 1 vez. ¡No lo pierdas!_",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]),
             parse_mode="Markdown"
         )
-        if spin_data.get("used"):
-            await query.edit_message_text(
-                f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
-                f"Ya usaste tu spin y tu descuento del *{best}%* fue aplicado.\n\n"
-                f"🚫 *La ruleta es 1 vez por usuario.*\n"
-                f"Para renovar, paga al precio normal:\n\n"
-                + "\n".join([f"• {'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} {p.capitalize()}: {fmt_price(get_group_plan_config(group_id, p)['price'])}" for p in ["semanal", "mensual", "anual"]])
-                + "\n\n💳 Presiona el botón para ver datos de pago:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")]]),
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text(
-                f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
-                f"Ya giraste la ruleta. Tu descuento es: *{best}% OFF*\n\n"
-                f"⏳ ¿Aún no lo usaste? Contacta a @{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
-                f"💳 Presiona para pagar con tu descuento:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Info de Pago con Descuento", callback_data=f"pay_{group_id}_{user_id}")]]),
-                parse_mode="Markdown"
-            )
-        return
-    import random
-    discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
-    discount = random.choice(discounts)
-    await db.record_spin(user_id, group_id, discount)
-    for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
-        try:
-            await query.edit_message_text(msg)
-            await asyncio.sleep(0.8)
-        except:
-            pass
-    price_lines = []
-    for p in ["semanal", "mensual", "anual"]:
-        cfg = get_group_plan_config(group_id, p)
-        price = cfg['price'] * (1 - discount/100)
-        price_lines.append(f"• {'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} {p.capitalize()}: ~~{fmt_price(cfg['price'])}~~ → *{fmt_price(price)}*")
-    await query.edit_message_text(
-        f"🎰 *¡RULETA VIP — {group['group_name']}*\n\n"
-        f"@{query.from_user.username or query.from_user.first_name} giró la ruleta...\n\n"
-        f"🎉 *¡FELICIDADES!*\n\n🏆 *Descuento: {discount}% OFF*\n\n"
-        f"💰 *Precios con tu descuento:*\n" + "\n".join(price_lines) + "\n\n"
-        f"⏳ *Descuento permanente* — puedes usarlo cuando quieras\n"
-        f"📤 Envía el comprobante + captura de este mensaje a:\n"
-        f"@{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
-        f"_Solo puedes usar la ruleta 1 vez. ¡No lo pierdas!_",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]),
-        parse_mode="Markdown"
-    )
 
 async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2819,9 +3105,9 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==================== SISTEMA DE AVISOS ====================
 async def send_trial_warnings():
     logger.info("⏰ Enviando avisos de expiración de trial...")
-    for group in GROUPS:
-        if group.get("type", "VIP") != "VIP":
-            continue
+    with GROUPS_LOCK:
+        groups_snapshot = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
+    for group in groups_snapshot:
         group_id = group["group_id"]
         try:
             warning_config = await db.get_warning_config(group_id)
@@ -3223,10 +3509,10 @@ async def broadcast_history_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     if group_id is None:
         data = query.data
-        if data.startswith("bc_history_"):
+        if data.startswith("bc|history|"):
             try:
-                group_id = int(data[len("bc_history_"):])
-            except ValueError:
+                group_id = int(data.split("|")[2])
+            except (ValueError, IndexError):
                 await query.edit_message_text("❌ Error en ID de grupo")
                 return
         else:
@@ -3367,6 +3653,8 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     logger.info("🔍 Verificando suscripciones expiradas...")
+    with GROUPS_LOCK:
+        vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
     async def _process_group(group: dict):
         group_id = group["group_id"]
         expired_users = await db.get_expired_users(group_id)
@@ -3406,7 +3694,6 @@ async def check_expired_subscriptions():
                 f"💳 ¿Quieres renovar? Presiona el botón:",
                 reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown"
             )
-    vip_groups = [g for g in GROUPS if g.get("type", "VIP") == "VIP"]
     results = await asyncio.gather(*[_process_group(g) for g in vip_groups], return_exceptions=True)
     for group, result in zip(vip_groups, results):
         if isinstance(result, Exception):
@@ -3482,7 +3769,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await multi_type_request(update, context, int(data.replace("multi_type_", "")))
         elif data.startswith("multi_set_type_"):
             parts = data.split("_")
-            await multi_set_type(update, context, int(parts[3]), parts[4])
+            if len(parts) >= 5:
+                await multi_set_type(update, context, int(parts[3]), parts[4])
+            else:
+                await query.answer("❌ Datos incompletos", show_alert=True)
         elif data.startswith("edit_multiple_"):
             await edit_group_multiple(update, context, int(data.replace("edit_multiple_", "")))
         elif data.startswith("cfg_group_"):
@@ -3519,30 +3809,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await config_payment_callback(update, context, int(data.replace("cfg_payment_", "")))
         elif data.startswith("cfg_warnings_"):
             await menu_warning_settings(update, context, int(data.replace("cfg_warnings_", "")))
+        elif data.startswith("cfg_messages_"):
+            await config_messages_callback(update, context, int(data.replace("cfg_messages_", "")))
+        elif data.startswith("cfg_msg_edit_"):
+            parts = data.split("_")
+            if len(parts) >= 5:
+                group_id = int(parts[3])
+                msg_type = parts[4]
+                await _start_message_config(update, context, group_id, msg_type)
+            else:
+                await query.answer("❌ Datos incompletos", show_alert=True)
         elif data.startswith("warn_toggle_"):
             await toggle_warnings(update, context, int(data.replace("warn_toggle_", "")))
         elif data.startswith("warn_add_"):
             await add_warning_step1(update, context, int(data.replace("warn_add_", "")))
         elif data.startswith("warn_edit_"):
             parts = data.split("_")
-            await edit_warning_step1(update, context, int(parts[2]), int(parts[3]))
+            if len(parts) >= 4:
+                await edit_warning_step1(update, context, int(parts[2]), int(parts[3]))
+            else:
+                await query.answer("❌ Datos incompletos", show_alert=True)
         elif data.startswith("warn_delete_"):
             parts = data.split("_")
-            await delete_warning(update, context, int(parts[2]), int(parts[3]))
+            if len(parts) >= 4:
+                await delete_warning(update, context, int(parts[2]), int(parts[3]))
+            else:
+                await query.answer("❌ Datos incompletos", show_alert=True)
         elif data.startswith("warn_test_"):
             await test_warning(update, context, int(data.replace("warn_test_", "")))
         elif data == "broadcast_menu":
             await broadcast_menu_callback(update, context)
         elif data.startswith("bc|"):
             await broadcast_callback_handler(update, context)
+        elif data.startswith("spin_used_"):
+            await spin_used_callback(update, context)
         elif data.startswith("spin_"):
             parts = data.split("_")
-            if len(parts) >= 3 and data != "spin_used":
+            if len(parts) >= 3:
                 await spin_discount(update, context)
             else:
                 await query.answer("❌ Error en datos", show_alert=True)
-        elif data.startswith("spin_used_"):
-            await spin_used_callback(update, context)
         elif data == "no_free_link":
             await query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
         else:
@@ -3555,12 +3861,83 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, msg_type: str):
+    query = update.callback_query
+    await query.answer()
+
+    if not can_manage_group(query.from_user.id, group_id):
+        await query.edit_message_text("❌ No autorizado")
+        return
+
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+
+    context.user_data['config_msg_group_id'] = group_id
+    context.user_data['config_msg_type'] = msg_type
+    context.user_data['config_msg_step'] = 'text'
+
+    current = await db.get_group_messages(group_id)
+    current_msg = ""
+
+    if msg_type == "welcome":
+        current_msg = current.get('welcome_message', '') if current else ''
+        default_msg = DEFAULT_WELCOME_MESSAGE
+    else:
+        current_msg = current.get('rejection_message', '') if current else ''
+        default_msg = DEFAULT_REJECTION_MESSAGE
+
+    await query.edit_message_text(
+        f"✏️ *Configurar mensaje de {msg_type} — {group['group_name']}*\n\n"
+        f"📋 *Actual:*\n`{current_msg or 'No configurado (usando default)'}`\n\n"
+        f"📝 *Default:*\n`{default_msg[:200]}...`\n\n"
+        f"Envía el nuevo mensaje. Usa las variables entre `{{}}`.\n\n"
+        f"*Escribe 'default' para restaurar el mensaje por defecto.*\n"
+        f"*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
+
+async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+
+    if not can_manage_group(query.from_user.id, group_id):
+        await query.edit_message_text("❌ No autorizado")
+        return
+
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+
+    current = await db.get_group_messages(group_id)
+
+    welcome_status = "✅ Configurado" if current and current.get('welcome_message') else "📋 Default"
+    rejection_status = "✅ Configurado" if current and current.get('rejection_message') else "📋 Default"
+
+    keyboard = [
+        [InlineKeyboardButton(f"🎉 Bienvenida ({welcome_status})", callback_data=f"cfg_msg_edit_{group_id}_welcome")],
+        [InlineKeyboardButton(f"🚫 Rechazo ({rejection_status})", callback_data=f"cfg_msg_edit_{group_id}_rejection")],
+        _back_button(f"select_group_{group_id}"),
+    ]
+
+    await query.edit_message_text(
+        f"📝 *Configurar Mensajes — {group['group_name']}*\n\n"
+        f"📋 *Bienvenida:* {welcome_status}\n"
+        f"📋 *Rechazo:* {rejection_status}\n\n"
+        f"Selecciona qué mensaje editar:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
 # ==================== MAIN ====================
 async def main():
     global bot_app
     await db.init_tables()
     await db.load_groups_from_db()
-    logger.info(f"📦 {len(GROUPS)} grupos disponibles")
+    with GROUPS_LOCK:
+        logger.info(f"📦 {len(GROUPS)} grupos disponibles")
 
     bot_app = ApplicationBuilder().token(TOKEN).build()
 
@@ -3573,7 +3950,6 @@ async def main():
     bot_app.add_handler(CommandHandler("backup", manual_backup))
     bot_app.add_handler(CommandHandler("restore", restore_backup))
     bot_app.add_handler(CommandHandler("getlink", get_link))
-    bot_app.add_handler(CommandHandler("syncgroup", sync_group))
     bot_app.add_handler(CommandHandler("syncall", sync_all_groups))
     bot_app.add_handler(CommandHandler("searchgrupo", search_group))
     bot_app.add_handler(CommandHandler("pagar", pay_command))
@@ -3585,6 +3961,7 @@ async def main():
     bot_app.add_handler(CommandHandler("linkvip", link_vip_command))
     bot_app.add_handler(CommandHandler("checkspin", check_spin_command))
     bot_app.add_handler(CommandHandler("configfreelink", config_free_link_command))
+    bot_app.add_handler(CommandHandler("configmsg", config_messages_command))
 
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
