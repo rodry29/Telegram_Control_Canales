@@ -3591,7 +3591,6 @@ async def main():
 
     # Detección de miembros
     bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, detect_new_member))
 
     # Mensajes en grupos (detección de usuarios activos)
     bot_app.add_handler(MessageHandler(
