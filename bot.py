@@ -42,7 +42,7 @@ if not DATABASE_URL:
     exit(1)
 
 PLANS = {
-    "trial":   {"minutes": 1440, "price": 0,   "name": "🎁 Trial (1 día)"},
+    "trial":   {"minutes": 1440, "price": 0,   "name": "🎁 Trial"},
     "semanal": {"days": 7,       "price": 10,  "name": "📅 Semanal (7 días)"},
     "mensual": {"days": 30,      "price": 20,  "name": "📆 Mensual (30 días)"},
     "anual":   {"days": 365,     "price": 150, "name": "🏆 Anual (365 días)"}
@@ -1832,78 +1832,175 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def _process_new_vip_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
     display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
-    logger.info(f"🔔 Nuevo miembro VIP: user={user_id} ({display}) en {group['group_name']}")
+    
+    # PASO 1: VERIFICAR si el usuario está registrado en el FREE del mismo admin
+    free_group = None
+    for g in GROUPS:
+        if g.get("type") == "FREE" and g["admin_id"] == group["admin_id"]:
+            free_group = g
+            break
+    
+    # Si no hay FREE configurado, buscar linked_vip
+    if not free_group:
+        vip_settings = group.get("settings", {})
+        free_id = vip_settings.get("linked_free_group_id")
+        if free_id:
+            free_group = get_group_by_id(free_id)
+    
+    # PASO 2: VERIFICAR si el usuario está en el FREE
+    user_in_free = False
+    if free_group:
+        free_user = await db.get_user_by_id(user_id, free_group["group_id"])
+        if free_user:
+            user_in_free = True
+    
+    # PASO 3: SI NO ESTÁ EN FREE → EXPULSAR Y ENVIAR AL FREE + PAGO
+    if not user_in_free:
+        logger.info(f"🚫 Usuario {user_id} intentó entrar al VIP sin estar en FREE. Expulsando...")
+        
+        kick_success = await _kick_user_with_retry(chat_id, user_id)
+        
+        if kick_success:
+            # Verificar si tiene descuento de ruleta
+            spin_data = await db.get_spin_data(user_id, chat_id)
+            spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+            
+            # Construir teclado
+            free_link = None
+            if free_group:
+                free_link = free_group.get("settings", {}).get("invite_link")
+            
+            keyboard = []
+            if free_link:
+                keyboard.append([InlineKeyboardButton("📢 Unirme al canal FREE", url=free_link)])
+            
+            keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
+            
+            if not spin_used:
+                keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")])
+            else:
+                keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{chat_id}_{user_id}")])
+            
+            # Construir mensaje con precios
+            price_lines = []
+            for p in ["semanal", "mensual", "anual"]:
+                cfg = get_group_plan_config(chat_id, p)
+                price_lines.append(f"• {'📅' if p=='semanal' else '📆' if p=='mensual' else '🏆'} {p.capitalize()}: {fmt_price(cfg['price'])}")
+            
+            await _safe_send(
+                user_id,
+                f"🚫 *Acceso denegado — {group['group_name']}*\n\n"
+                f"Este grupo es exclusivo para miembros VIP.\n\n"
+                f"📋 *Para acceder tienes 2 opciones:*\n\n"
+                f"🎁 *Opción 1 (Recomendada):*\n"
+                f"1️⃣ Únete a nuestro canal FREE\n"
+                f"2️⃣ Obtén tu prueba GRATIS desde el bot\n\n"
+                f"💳 *Opción 2 (Inmediata):*\n"
+                f"Paga directamente y accede ahora:\n"
+                f"{chr(10).join(price_lines)}\n\n"
+                f"🎰 *¿Quieres descuento?*\n"
+                f"🎰Gira la ruleta y gana hasta 50% OFF\n\n"
+                f"👇 *Elige tu camino:*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            
+            # Notificar al admin
+            await _safe_send(
+                group["admin_id"],
+                f"🚫 *Acceso directo bloqueado*\n\n"
+                f"👤 Usuario: [{display}]({chat_link})\n"
+                f"🆔 ID: `{user_id}`\n"
+                f"📌 Grupo: {group['group_name']}\n\n"
+                f"❌ No estaba en el FREE. Expulsado automáticamente.\n"
+                f"✅ Se le envió opciones: FREE + Pago + Ruleta.",
+                parse_mode="Markdown"
+            )
+        return False
+    
+    # PASO 4: SI ESTÁ EN FREE → OTORGAR TRIAL O VERIFICAR SUSCRIPCIÓN
+    logger.info(f"✅ Usuario {user_id} está en FREE. Procesando acceso VIP...")
+    
     allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
     logger.info(f"register_user_auto → allow={allow_access}, code={result_code}, end_date={end_date}")
+    
     if allow_access:
         if result_code == "trial_nuevo":
             cfg_t = get_group_plan_config(chat_id, "trial")
             trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
             expiry_str = fmt_dt(end_date) if end_date else "N/A"
+            
             await _safe_send(
                 user_id,
-                f"🎉 *¡Bienvenido al grupo VIP!*\n\n"
-                f"✨ Tu período de prueba de *{trial_str}* ha comenzado.\n"
-                f"📅 Tu acceso expira el: *{expiry_str}* (hora Ecuador)\n\n"
-                f"🔥 *Oferta por tiempo limitado:* si pagas *antes* de que termine tu prueba, obtienes un *precio especial*.\n\n"
-                f"🎰 *¿Sabías que puedes ganar hasta 50% de descuento?*\n"
-                f"Gira la ruleta VIP y usa tu descuento cuando quieras:\n\n",
+                f"🎉 *¡Bienvenido al VIP!*\n\n"
+                f"✨ Tu prueba de *{trial_str}* ha comenzado.\n"
+                f"📅 Expira a las: *{expiry_str}*\n\n"
+                f"🔥 *¿Te gusta el contenido?*\n"
+                f"Paga antes de que termine tu prueba y asegura tu acceso.\n\n"
+                f"🎰 *Gira la ruleta para descuento:*",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")],
                     [InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")]
                 ]),
                 parse_mode="Markdown"
             )
+            
             await _safe_send(
                 group["admin_id"],
-                f"🆕 *Nuevo usuario en TRIAL*\n\n"
+                f"🆕 *Nuevo usuario VIP (vino desde FREE)*\n\n"
                 f"👤 *Nombre:* [{display}]({chat_link})\n"
                 f"🆔 *ID:* `{user_id}`\n"
                 f"📌 *Grupo:* {group['group_name']}\n"
-                f"⏱ *Duración:* {trial_str}\n"
-                f"📅 *Expira:* {expiry_str} (hora Ecuador)\n\n"
-                f"💡 *Para activar suscripción:* RESPONDE a este mensaje con:\n"
-                f"• `/add mensual`\n• `/add semanal 5.99`\n• O usa: `/add {user_id} mensual`",
+                f"⏱ *Trial:* {trial_str}\n"
+                f"📅 *Expira:* {expiry_str} (EC)\n\n"
+                f"💡 *Para activar pago:* Responde con `/add {user_id} mensual`",
                 parse_mode="Markdown"
             )
+            
         elif result_code == "activo":
-            logger.info(f"✅ Reingreso permitido (plan activo): {display} en {group['group_name']} — expira {end_date}")
+            logger.info(f"✅ Reingreso permitido: {display} en {group['group_name']} — expira {end_date}")
+            
         return True
+    
+    # PASO 5: SI NO PUEDE ACCEDER (trial usado, expirado, etc.)
     if result_code == "expirado":
-        motivo_usuario = "Tu período de prueba o suscripción ha expirado."
+        motivo_usuario = "Tu prueba o suscripción ha expirado."
         motivo_admin = "Plan vencido"
     else:
-        motivo_usuario = "Ya usaste tu prueba gratuita y no tienes suscripción activa."
+        motivo_usuario = "Ya usaste tu prueba gratuita."
         motivo_admin = "Trial ya utilizado"
-    try:
-        member_check = await bot_app.bot.get_chat_member(chat_id, user_id)
-        if member_check.status in ("left", "kicked", "banned"):
-            logger.info(f"⏭️ Usuario {display} ya está fuera del grupo — omitiendo")
-            return False
-    except Exception as e:
-        logger.debug(f"No se pudo verificar estado previo de {user_id}: {e}")
+    
     kick_success = await _kick_user_with_retry(chat_id, user_id)
+    
     if kick_success:
         await _safe_send(
             user_id,
-            f"🚫 *Acceso denegado — {group['group_name']}*\n\n{motivo_usuario}\n\n💳 ¿Quieres renovar? Presiona el botón:",
-            reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown"
+            f"⏰ *{motivo_usuario}*\n\n"
+            f"Tu acceso a *{group['group_name']}* ha terminado.\n\n"
+            f"💳 *¿Quieres renovar?*",
+            reply_markup=get_payment_keyboard(chat_id, user_id),
+            parse_mode="Markdown"
         )
         await _safe_send(
             group["admin_id"],
-            f"🚫 *Reingreso denegado y expulsado*\n\n"
-            f"👤 *Usuario:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n"
-            f"📌 *Grupo:* {group['group_name']}\n⚠️ *Motivo:* {motivo_admin}",
+            f"🚫 *Reingreso denegado*\n\n"
+            f"👤 *Usuario:* [{display}]({chat_link})\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 *Grupo:* {group['group_name']}\n"
+            f"⚠️ *Motivo:* {motivo_admin}",
             parse_mode="Markdown"
         )
     else:
         await _safe_send(
             group["admin_id"],
-            f"⚠️ *No se pudo expulsar automáticamente*\n\n"
-            f"👤 Usuario: [{display}]({chat_link})\n📌 Grupo: {group['group_name']}\n"
-            f"⚠️ Motivo: {motivo_admin}\n\n🔧 *Acción manual requerida.*",
+            f"⚠️ *Expulsión fallida*\n\n"
+            f"👤 [{display}]({chat_link})\n"
+            f"📌 {group['group_name']}\n"
+            f"⚠️ {motivo_admin}\n\n"
+            f"🔧 *Acción manual requerida.*",
             parse_mode="Markdown"
         )
+    
     return False
 
 async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
@@ -2340,36 +2437,56 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
     if not context.args:
         await update.message.reply_text(
-            "❌ *Uso: `/linkvip free_group_id vip_group_id`*\n\nEjemplo: `/linkvip -1001234567890 -1009876543210`",
+            "❌ *Uso: `/linkvip free_group_id vip_group_id`*\n\n"
+            "Ejemplo: `/linkvip -1001234567890 -1009876543210`\n\n"
+            "💡 Esto vincula el FREE con el VIP bidireccionalmente.",
             parse_mode="Markdown"
         )
         return
+    
     try:
         free_id = int(context.args[0])
         vip_id = int(context.args[1])
     except (ValueError, IndexError):
         await update.message.reply_text("❌ IDs inválidos. Usa: `/linkvip free_id vip_id`")
         return
+    
     if not can_manage_group(user_id, free_id):
         await update.message.reply_text("❌ No autorizado para gestionar este grupo FREE")
         return
+    
     free_group = get_group_by_id(free_id)
     if not free_group or free_group.get("type") != "FREE":
         await update.message.reply_text("❌ El primer grupo debe ser FREE")
         return
+    
     vip_group = get_group_by_id(vip_id)
     if not vip_group or vip_group.get("type", "VIP") != "VIP":
         await update.message.reply_text("❌ El segundo grupo debe ser VIP")
         return
-    settings = dict(free_group.get("settings", {}))
-    settings['linked_vip_group_id'] = vip_id
-    free_group["settings"] = settings
-    await db.update_group_fields(free_id, {'settings': settings})
+    
+    # Guardar en FREE: linked_vip_group_id
+    free_settings = dict(free_group.get("settings", {}))
+    free_settings['linked_vip_group_id'] = vip_id
+    free_group["settings"] = free_settings
+    await db.update_group_fields(free_id, {'settings': free_settings})
+    
+    # Guardar en VIP: linked_free_group_id (NUEVO)
+    vip_settings = dict(vip_group.get("settings", {}))
+    vip_settings['linked_free_group_id'] = free_id
+    vip_group["settings"] = vip_settings
+    await db.update_group_fields(vip_id, {'settings': vip_settings})
+    
     await update.message.reply_text(
-        f"✅ *Vinculación creada*\n\n📋 FREE: {free_group['group_name']}\n👑 VIP: {vip_group['group_name']}\n\n"
-        f"Los usuarios que lleguen desde el FREE verán la info del VIP.",
+        f"✅ *Vinculación completada*\n\n"
+        f"📋 FREE: {free_group['group_name']}\n"
+        f"👑 VIP: {vip_group['group_name']}\n\n"
+        f"🔒 *Ahora el VIP solo acepta usuarios que estén en el FREE.*\n"
+        f"✅ Usuarios en FREE → Trial automático al entrar al VIP\n"
+        f"❌ Usuarios sin FREE → Expulsión + botón para unirse al FREE",
         parse_mode="Markdown"
     )
 
