@@ -2001,6 +2001,17 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         if free_user:
             user_in_free = True
 
+    # PASO 2.5: VERIFICAR si tiene suscripción PAGADA activa en el VIP
+    # Si tiene plan semanal/mensual/anual activo, NO importa si está en FREE
+    vip_user = await db.get_user_by_id(user_id, chat_id)
+    has_paid_subscription = (
+        vip_user 
+        and vip_user.get("status") == "active" 
+        and vip_user.get("end_date") 
+        and vip_user.get("end_date") > datetime.utcnow()
+        and vip_user.get("plan") not in (None, "trial", "FREE")
+    )
+
     # PASO 3: SI NO ESTÁ EN FREE → EXPULSAR Y ENVIAR AL FREE + PAGO
     if not user_in_free:
         logger.info(f"🚫 Usuario {user_id} intentó entrar al VIP sin estar en FREE. Expulsando...")
