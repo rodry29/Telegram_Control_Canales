@@ -1307,16 +1307,13 @@ async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== DESCARGA POR REACCIÓN ====================
 async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # LOG INMEDIATO al entrar al handler
-    logger.info(f"🔥🔥🔥 ENTRANDO A handle_reaction_download: has_reaction={update.message_reaction is not None}")
-    
     reaction = update.message_reaction
     if not reaction or not reaction.chat or not reaction.user:
         logger.info("🔥🔥🔥 Handler abortado: falta reaction/chat/user")
         return
 
     group_id = reaction.chat.id
-    group = get_group_by_id(group_id)
+    user_id = reaction.user.id
     message_id = reaction.message_id
 # LOG DETALLADO
     emojis_recibidos = [getattr(r, 'emoji', None) for r in (reaction.new_reaction or [])]
