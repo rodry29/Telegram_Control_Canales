@@ -20,7 +20,6 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters, ChatMemberHandler,
     MessageReactionHandler
 )
-)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==================== LOGGING ====================
