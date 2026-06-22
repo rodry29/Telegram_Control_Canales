@@ -260,6 +260,7 @@ def get_payment_info_text(group_id: int) -> str:
     bank_data = settings.get("bank_data", "").strip()
     payment_contact = settings.get("payment_contact", "admin").strip()
     paypal_data = settings.get("paypal_data", "").strip()
+    vip_invite_link = settings.get("vip_invite_link", "").strip() 
     group_name = group.get("group_name", "VIP")
     lines = [f"💰 *INFORMACIÓN DE PAGO — {group_name}*", "", "📋 *Planes disponibles:*"]
     lines.append(_build_price_list(group_id))
@@ -1346,6 +1347,9 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
             "🎁 Tu trial te permite *ver* el grupo, pero las descargas están reservadas para suscriptores de pago.\n\n"
             "💳 *Adquiere tu acceso completo:*\n" + _build_price_list(group_id)
         )
+
+        vip_invite_link = group.get("settings", {}).get("vip_invite_link", "").strip()
+        
         await context.bot.send_message(
             user_id,
             pay_text,
@@ -1354,14 +1358,51 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    # ─── VIP PAGADO: reenviar el mensaje al privado ───
-    try:
-        # Intentar copy_message primero (sin firma de reenvío)
-        await context.bot.copy_message(
-            chat_id=user_id,
-            from_chat_id=group_id,
-            message_id=message_id
+    # ─── VIP PAGADO: obtener file_id de la BD y enviar directamente ───
+    media_file = await db.get_media_file(group_id, message_id)
+    
+    if not media_file or not media_file.get('file_id'):
+        await _safe_send(
+            user_id,
+            "❌ *El archivo no está disponible.*\n\n"
+            "Este archivo fue publicado antes de que el sistema de descargas estuviera activo, "
+            "o el bot de publicación no lo indexó correctamente.\n\n"
+            "📌 *Solo los archivos publicados desde ahora son descargables.*",
+            parse_mode="Markdown"
         )
+        return
+
+    file_id = media_file['file_id']
+    media_type = media_file.get('media_type', 'document')
+
+    try:
+        if media_type == 'photo':
+            await context.bot.send_photo(user_id, photo=file_id)
+        elif media_type == 'video':
+            await context.bot.send_video(user_id, video=file_id)
+        elif media_type == 'audio':
+            await context.bot.send_audio(user_id, audio=file_id)
+        elif media_type == 'voice':
+            await context.bot.send_voice(user_id, voice=file_id)
+        elif media_type == 'video_note':
+            await context.bot.send_video_note(user_id, video_note=file_id)
+        else:
+            await context.bot.send_document(user_id, document=file_id)
+        
+        logger.info(f"✅ Archivo enviado a {user_id} desde msg {message_id}")
+        
+    except TelegramError as e:
+        error_str = str(e).lower()
+        if "wrong file_id" in error_str or "file_id_invalid" in error_str:
+            logger.error(f"❌ File ID inválido para msg {message_id}: {e}")
+            await _safe_send(
+                user_id,
+                "❌ *El archivo ya no está disponible.*\nPuede haber sido eliminado de los servidores de Telegram.",
+                parse_mode="Markdown"
+            )
+        else:
+            logger.error(f"❌ Error enviando archivo a {user_id}: {e}")
+            await _safe_send(user_id, "❌ *No se pudo enviar el archivo.* Intenta de nuevo o contacta al admin.", parse_mode="Markdown")
         logger.info(f"✅ Archivo copiado a {user_id} del mensaje {message_id}")
     except TelegramError as e:
         error_str = str(e).lower()
