@@ -1320,8 +1320,9 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    # ─── VIP PAGADO: copiar el mensaje completo al privado ───
+    # ─── VIP PAGADO: reenviar el mensaje al privado ───
     try:
+        # Intentar copy_message primero (sin firma de reenvío)
         await context.bot.copy_message(
             chat_id=user_id,
             from_chat_id=group_id,
@@ -1330,8 +1331,23 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         logger.info(f"✅ Archivo copiado a {user_id} del mensaje {message_id}")
     except TelegramError as e:
         error_str = str(e).lower()
-        if "message to copy not found" in error_str:
-            await _safe_send(user_id, "❌ El mensaje ya no está disponible (pudo haber sido eliminado).")
+        if "message to copy not found" in error_str or "message can't be copied" in error_str:
+            # Fallback: intentar forward_message
+            try:
+                await context.bot.forward_message(
+                    chat_id=user_id,
+                    from_chat_id=group_id,
+                    message_id=message_id
+                )
+                logger.info(f"✅ Archivo reenviado a {user_id} del mensaje {message_id}")
+            except TelegramError as e2:
+                error_str2 = str(e2).lower()
+                if "message to forward not found" in error_str2:
+                    logger.error(f"❌ Mensaje {message_id} no encontrado para {user_id}")
+                    await _safe_send(user_id, "❌ El mensaje ya no está disponible (pudo haber sido eliminado o el bot no tiene acceso).")
+                else:
+                    logger.error(f"❌ Error reenviando mensaje {message_id} para {user_id}: {e2}")
+                    await _safe_send(user_id, "❌ No se pudo enviar el archivo. Verifica que el bot sea administrador del grupo VIP.")
         else:
             logger.error(f"❌ Error copiando mensaje {message_id} para {user_id}: {e}")
             await _safe_send(user_id, "❌ No se pudo enviar el archivo. Intenta de nuevo o contacta al admin.")
