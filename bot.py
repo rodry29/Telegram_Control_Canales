@@ -433,6 +433,17 @@ class Database:
                         updated_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS media_files (
+                        id SERIAL PRIMARY KEY,
+                        group_id BIGINT NOT NULL,
+                        message_id BIGINT NOT NULL,
+                        file_id TEXT NOT NULL,
+                        media_type TEXT DEFAULT 'document',
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(group_id, message_id)
+                    )
+                """)
                 # Índices
                 for idx_sql in [
                     "CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)",
@@ -1002,6 +1013,26 @@ class Database:
                     VALUES (0, 'auto_backup', 'Backup automatico', 0, 0, 0, %s)
                 """, (SUPER_ADMIN_ID,))
         await self._run(_log)
+
+    async def save_media_file(self, group_id: int, message_id: int, file_id: str, media_type: str = 'document'):
+        def _save(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO media_files (group_id, message_id, file_id, media_type)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (group_id, message_id) DO NOTHING
+                """, (group_id, message_id, file_id, media_type))
+        await self._run(_save)
+
+    async def get_media_file(self, group_id: int, message_id: int) -> Optional[dict]:
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT file_id, media_type FROM media_files 
+                    WHERE group_id = %s AND message_id = %s
+                """, (group_id, message_id))
+                return cur.fetchone()
+        return await self._run(_get)
 
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
