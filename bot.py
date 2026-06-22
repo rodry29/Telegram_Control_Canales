@@ -3327,9 +3327,14 @@ async def send_trial_warnings():
                     try:
                         spin_data = spin_batch.get(user_id, {})
                         spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+                        
+                        # Obtener el link VIP del grupo para el teclado
+                        group_obj = get_group_by_id(group_id)
+                        vip_invite_link = group_obj.get("settings", {}).get("vip_invite_link", "") if group_obj else ""
+                        
                         await bot_app.bot.send_message(
                             user_id, message,
-                            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used),
+                            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link),
                             parse_mode="Markdown"
                         )
                         await db.log_warning_sent(user_id, group_id, warning_type)
@@ -3925,11 +3930,11 @@ async def _handle_no_free_link(update: Update, context: ContextTypes.DEFAULT_TYP
 # Routing tables
 CALLBACK_EXACT = {
     "add_user": _handle_add_user_callback,
-    "list_active": list_active_users,
-    "earnings": show_earnings,
-    "export_month": export_report,
-    "list_potential": list_potential_clients,
-    "export_clients": export_clients,
+    "list_active": lambda u, c, d: list_active_users(u, c),
+    "earnings": lambda u, c, d: show_earnings(u, c),
+    "export_month": lambda u, c, d: export_report(u, c),
+    "list_potential": lambda u, c, d: list_potential_clients(u, c),
+    "export_clients": lambda u, c, d: export_clients(u, c),
     "vip_groups": view_vip_groups,
     "view_vip_groups": view_vip_groups,
     "free_groups": view_free_groups,
@@ -3945,7 +3950,7 @@ CALLBACK_EXACT = {
     "menu_delete_group_select": menu_delete_group_select,
     "menu_commands": menu_commands,
     "broadcast_menu": broadcast_menu_callback,
-    "trial_stats": trial_stats,
+    "trial_stats": lambda u, c, d: trial_stats(u, c),
     "no_free_link": _handle_no_free_link,
 }
 
