@@ -17,7 +17,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters, ChatMemberHandler
+    ContextTypes, MessageHandler, filters, ChatMemberHandler,
+    MessageReactionHandler
+)
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -1281,7 +1283,7 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         return
 
     # Filtrar solo el emoji de descarga (puedes cambiarlo)
-    target_emojis = ["⬇️", "💾", "📥"]
+    target_emojis = ["🔥"]
     new_reactions = reaction.new_reaction or []
     has_target = any(
         getattr(r, 'emoji', None) in target_emojis
@@ -4117,7 +4119,9 @@ async def main():
 
     # Detección de miembros
     bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    # Reacciones para descargas (MessageReactionHandler requiere python-telegram-bot v20.7+)
+    
+    # Reacciones para descargas (MessageReactionHandler - python-telegram-bot v20.7+)
+    bot_app.add_handler(MessageReactionHandler(handle_reaction_download))
 
     # Mensajes en grupos (detección de usuarios activos)
     bot_app.add_handler(MessageHandler(
@@ -4142,7 +4146,7 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member", "message_reaction"]
     )
     await asyncio.Event().wait()
 
