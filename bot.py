@@ -17,7 +17,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters, ChatMemberHandler
+    ContextTypes, MessageHandler, filters, ChatMemberHandler,
+    MessageReactionHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -87,6 +88,26 @@ def fmt_dt(dt: datetime, include_time: bool = True) -> str:
         return dt_ec.strftime('%d/%m/%Y %H:%M')
     return dt_ec.strftime('%d/%m/%Y')
 
+# ==================== UTILIDADES DE FECHAS ROBUSTAS ====================
+def normalize_dt(dt: datetime) -> Optional[datetime]:
+    """Normaliza un datetime a aware UTC para comparaciones seguras."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(ZoneInfo("UTC"))
+
+def now_utc() -> datetime:
+    """Retorna datetime aware en UTC."""
+    return datetime.now(ZoneInfo("UTC"))
+
+
+# ==================== CACHE DE PRECIOS ====================
+_price_list_cache: Dict[int, str] = {}
+
+def _invalidate_price_cache(group_id: int):
+    _price_list_cache.pop(group_id, None)
+
 # ==================== UTILIDADES ====================
 def get_group_by_id(group_id: int) -> Optional[dict]:
     with GROUPS_LOCK:
@@ -104,6 +125,22 @@ def can_manage_group(user_id: int, group_id: int) -> bool:
         return True
     group = get_group_by_id(group_id)
     return group is not None and group["admin_id"] == user_id
+
+async def require_group(update: Update, context: ContextTypes.DEFAULT_TYPE, require_admin: bool = True) -> Optional[int]:
+    """Helper para obtener el group_id actual, ya sea desde context o desde el chat."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    current_group = context.user_data.get('current_group')
+    if not current_group:
+        group = get_group_by_id(chat_id)
+        if group and (not require_admin or can_manage_group(user_id, chat_id)):
+            current_group = chat_id
+        else:
+            return None
+    if require_admin and not can_manage_group(user_id, current_group):
+        return None
+    return current_group
+
 
 def get_group_plan_config(group_id: int, plan: str) -> dict:
     base = dict(PLANS.get(plan, {}))
@@ -131,6 +168,14 @@ def get_group_plan_config(group_id: int, plan: str) -> dict:
 def fmt_price(amount) -> str:
     f = float(amount)
     return f"${f:.2f}" if f != int(f) else f"${int(f)}"
+
+def escape_md_v1(text: str) -> str:
+    """Escapa caracteres especiales de Markdown V1 para Telegram."""
+    if not text:
+        return ""
+    for ch in '*_[]()':
+        text = text.replace(ch, '\\' + ch)
+    return text
 
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
@@ -237,9 +282,13 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     if not group:
         return False
     # Rate limiting: máximo 1 notificación cada 5 minutos por usuario/grupo
+    now = datetime.now(ZoneInfo("UTC"))
+    # Limpiar entradas antiguas (>1 hora) para evitar leak de memoria
+    old_keys = [k for k, v in _PAYMENT_COOLDOWN.items() if (now - v).total_seconds() > 3600]
+    for k in old_keys:
+        _PAYMENT_COOLDOWN.pop(k, None)
     cooldown_key = f"pay_{user_id}_{group_id}"
     last_sent = _PAYMENT_COOLDOWN.get(cooldown_key)
-    now = datetime.now(ZoneInfo("UTC"))
     if last_sent and (now - last_sent).total_seconds() < 300:
         logger.info(f"Rate limit: pago info para {user_id} en grupo {group_id} omitido")
         return True  # Silencioso, no spamear al admin
@@ -482,11 +531,12 @@ class Database:
                 cur.execute("UPDATE users SET username=%s, first_name=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s",
                             (username, first_name, user_id, group_id))
                 # Estado activo y vigente → permitir reingreso
-                if existing["status"] == "active" and existing["end_date"] > now:
+                existing_end = normalize_dt(existing["end_date"])
+                if existing["status"] == "active" and existing_end > now_utc():
                     cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
                     return True, "activo", existing["end_date"]
                 # Cualquier estado con end_date vencido → expirado
-                if existing["end_date"] <= now:
+                if existing_end <= now_utc():
                     return False, "expirado", None
                 # Trial ya usado y no expirado → sin trial
                 if existing.get("trial_used"):
@@ -1013,8 +1063,16 @@ async def _show_vip_info(send_func, user_id: int, vip_group: dict):
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    send = (update.callback_query.message.reply_text if update.callback_query
-            else update.message.reply_text if update.message else None)
+    if update.callback_query:
+        async def send(text: str, **kwargs):
+            try:
+                return await update.callback_query.message.reply_text(text, **kwargs)
+            except BadRequest:
+                return await context.bot.send_message(update.effective_user.id, text, **kwargs)
+    elif update.message:
+        send = update.message.reply_text
+    else:
+        send = None
     if not send:
         return
 
@@ -1203,6 +1261,72 @@ async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# ==================== DESCARGA POR REACCIÓN ====================
+async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reaction = update.message_reaction
+    if not reaction or not reaction.chat or not reaction.user:
+        return
+
+    group_id = reaction.chat.id
+    group = get_group_by_id(group_id)
+    if not group or group.get("type", "VIP") != "VIP":
+        return
+
+    # Filtrar solo el emoji de descarga (puedes cambiarlo)
+    target_emojis = ["⬇️", "💾", "📥"]
+    new_reactions = reaction.new_reaction or []
+    has_target = any(
+        getattr(r, 'emoji', None) in target_emojis
+        for r in new_reactions
+    )
+    if not has_target:
+        return
+
+    user_id = reaction.user.id
+    message_id = reaction.message_id
+
+    # Verificar acceso del usuario
+    db_user = await db.get_user_by_id(user_id, group_id)
+    if not db_user or db_user.get('status') != 'active' or (db_user.get('end_date') and db_user['end_date'] < datetime.utcnow()):
+        await _safe_send(user_id, "🚫 *No tienes acceso activo a este grupo.*\n\nUsa /start para registrarte.", parse_mode="Markdown")
+        return
+
+    plan = db_user.get('plan', '')
+
+    # ─── TRIAL: enviar mensaje de pago ───
+    if plan == 'trial':
+        spin_data = await db.get_spin_data(user_id, group_id)
+        spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+        pay_text = (
+            "🔒 *Descarga bloqueada*\n\n"
+            "El contenido multimedia exclusivo solo está disponible para miembros *VIP pagados*.\n\n"
+            "🎁 Tu trial te permite *ver* el grupo, pero las descargas están reservadas para suscriptores de pago.\n\n"
+            "💳 *Adquiere tu acceso completo:*\n" + _build_price_list(group_id)
+        )
+        await context.bot.send_message(
+            user_id,
+            pay_text,
+            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used),
+            parse_mode="Markdown"
+        )
+        return
+
+    # ─── VIP PAGADO: copiar el mensaje completo al privado ───
+    try:
+        await context.bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=group_id,
+            message_id=message_id
+        )
+        logger.info(f"✅ Archivo copiado a {user_id} del mensaje {message_id}")
+    except TelegramError as e:
+        error_str = str(e).lower()
+        if "message to copy not found" in error_str:
+            await _safe_send(user_id, "❌ El mensaje ya no está disponible (pudo haber sido eliminado).")
+        else:
+            logger.error(f"❌ Error copiando mensaje {message_id} para {user_id}: {e}")
+            await _safe_send(user_id, "❌ No se pudo enviar el archivo. Intenta de nuevo o contacta al admin.")
+            
 # ==================== HANDLER PARA REPLY CON /add ====================
 async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message:
@@ -1293,18 +1417,9 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.reply_to_message:
         await handle_reply_add(update, context)
         return
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    current_group = context.user_data.get('current_group')
+    current_group = await require_group(update, context)
     if not current_group:
-        group = get_group_by_id(chat_id)
-        if group and can_manage_group(user_id, chat_id):
-            current_group = chat_id
-        else:
-            await update.message.reply_text("❌ Usa /start primero")
-            return
-    if not can_manage_group(user_id, current_group):
-        await update.message.reply_text("❌ No autorizado")
+        await update.message.reply_text("❌ Usa /start primero o no estás autorizado")
         return
     if len(context.args) < 2:
         cfg_t = get_group_plan_config(current_group, "trial")
@@ -1385,18 +1500,9 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _mark_and_notify(context.bot, user_record['user_id'], current_group, plan, msg)
 
 async def renew_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    current_group = context.user_data.get('current_group')
+    current_group = await require_group(update, context)
     if not current_group:
-        group = get_group_by_id(chat_id)
-        if group and can_manage_group(user_id, chat_id):
-            current_group = chat_id
-        else:
-            await update.message.reply_text("❌ Usa /start primero o ejecuta en un grupo que administres")
-            return
-    if not can_manage_group(user_id, current_group):
-        await update.message.reply_text("❌ No autorizado")
+        await update.message.reply_text("❌ Usa /start primero o no estás autorizado")
         return
     if len(context.args) < 2:
         cfg_t = get_group_plan_config(current_group, "trial")
@@ -1564,8 +1670,17 @@ async def auto_backup():
     if not bot_app:
         return
     last_backup_date = await db.get_last_backup_date()
-    now = datetime.now(EC_TZ)
-    if not last_backup_date or (now - last_backup_date.replace(tzinfo=None)).days >= 15:
+    now = datetime.now(ZoneInfo("UTC"))
+    should_backup = False
+    if not last_backup_date:
+        should_backup = True
+    else:
+        if last_backup_date.tzinfo is None:
+            last_backup_date = last_backup_date.replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            last_backup_date = last_backup_date.astimezone(ZoneInfo("UTC"))
+        should_backup = (now - last_backup_date).days >= 15
+    if should_backup:
         output = StringIO()
         writer = csv.writer(output)
         writer.writerow(['group_id', 'group_name', 'group_type', 'admin_id', 'backup_date'])
@@ -1633,6 +1748,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ CSV inválido: encabezado esperado {expected}, recibido {header[:4]}")
             return
         restored_count = 0
+        to_save_db = []
         with GROUPS_LOCK:
             for row in reader:
                 if len(row) >= 4:
@@ -1651,12 +1767,20 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if g["group_id"] == group_id:
                                 g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
                                 break
-                        await db.update_group_fields(group_id, {'admin': admin_id, 'type': group_type})
+                        to_save_db.append((group_id, {'admin': admin_id, 'type': group_type}, None))
                     else:
                         GROUPS.append({"group_id": group_id, "group_name": group_name, "type": group_type,
                                        "admin_id": admin_id, "settings": {}})
-                        await db.save_group(group_id, group_name, admin_id, group_type)
+                        to_save_db.append((group_id, group_name, admin_id, group_type))
                     restored_count += 1
+        # Aplicar cambios a DB fuera del lock sincrónico
+        for item in to_save_db:
+            if len(item) == 2:
+                group_id, changes = item
+                await db.update_group_fields(group_id, changes)
+            else:
+                group_id, group_name, admin_id, group_type = item
+                await db.save_group(group_id, group_name, admin_id, group_type)
         await update.message.reply_text(f"✅ *Restauración completa*\n\n📊 Grupos restaurados: {restored_count}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error al restaurar: {e}")
@@ -1766,8 +1890,7 @@ async def delete_group_execute(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     group_name = group['group_name']
     with GROUPS_LOCK:
-        global GROUPS
-        GROUPS = [g for g in GROUPS if g["group_id"] != group_id]
+        GROUPS[:] = [g for g in GROUPS if g["group_id"] != group_id]
     await db.delete_group_from_db(group_id)
     await query.edit_message_text(f"✅ *Grupo eliminado*\n\n📌 {group_name}\n🆔 ID: `{group_id}`", parse_mode="Markdown")
     await asyncio.sleep(2)
@@ -2000,17 +2123,6 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         free_user = await db.get_user_by_id(user_id, free_group["group_id"])
         if free_user:
             user_in_free = True
-
-    # PASO 2.5: VERIFICAR si tiene suscripción PAGADA activa en el VIP
-    # Si tiene plan semanal/mensual/anual activo, NO importa si está en FREE
-    vip_user = await db.get_user_by_id(user_id, chat_id)
-    has_paid_subscription = (
-        vip_user 
-        and vip_user.get("status") == "active" 
-        and vip_user.get("end_date") 
-        and vip_user.get("end_date") > datetime.utcnow()
-        and vip_user.get("plan") not in (None, "trial", "FREE")
-    )
 
     # PASO 3: SI NO ESTÁ EN FREE → EXPULSAR Y ENVIAR AL FREE + PAGO
     if not user_in_free:
@@ -2409,6 +2521,7 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings[field] = value
         group["settings"] = settings
     await db.update_group_fields(group_id, {'settings': settings})
+    _invalidate_price_cache(group_id)
     context.user_data.pop('cfg_field', None)
     context.user_data.pop('cfg_group_id', None)
     labels = {
@@ -2719,9 +2832,8 @@ async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    current_group = context.user_data.get('current_group')
-    if not current_group or not can_manage_group(user_id, current_group):
+    current_group = await require_group(update, context)
+    if not current_group:
         await update.message.reply_text("❌ No autorizado. Selecciona un grupo primero con /start")
         return
     if not context.args:
@@ -3013,7 +3125,8 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 # ==================== RULETA VIP ====================
-_SPIN_LOCKS: Dict[str, asyncio.Lock] = {}
+_SPINNING: set = set()
+_SPINNING_LOCK = asyncio.Lock()
 
 async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3030,10 +3143,12 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Bloqueo por usuario para evitar doble clic
-    lock_key = f"spin_{user_id}_{group_id}"
-    if lock_key not in _SPIN_LOCKS:
-        _SPIN_LOCKS[lock_key] = asyncio.Lock()
-    async with _SPIN_LOCKS[lock_key]:
+    async with _SPINNING_LOCK:
+        if (user_id, group_id) in _SPINNING:
+            await query.answer("⏳ Procesando...", show_alert=True)
+            return
+        _SPINNING.add((user_id, group_id))
+    try:
         spin_data = await db.get_spin_data(user_id, group_id)
         if spin_data.get("spin_count", 0) >= 1:
             best = spin_data.get("best_discount", 0)
@@ -3099,7 +3214,7 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer("🚫 Ya usaste tu ruleta. Si tienes dudas, contacta al admin.", show_alert=True)
     parts = query.data.split("_")
-    if len(parts) >= 3:
+    if len(parts) >= 4:
         group_id = int(parts[2])
         group = get_group_by_id(group_id)
         if group:
@@ -3141,33 +3256,39 @@ async def send_trial_warnings():
             # Precargar spin_data batch para eficiencia
             user_ids = [u['user_id'] for u in users]
             spin_batch = await db.get_spin_data_batch(group_id, user_ids) if user_ids else {}
-            for user in users:
-                user_id = user['user_id']
-                end_date = user['end_date']
-                remaining = end_date - datetime.utcnow()
-                mins_left = max(0, int(remaining.total_seconds() / 60))
-                if mins_left <= 0:
-                    continue
-                expiry_str = fmt_dt(end_date)
-                expiry_time = expiry_str.split(' ')[1] if ' ' in expiry_str else expiry_str
-                message = (message_template
-                           .replace("{minutes_left}", str(mins_left))
-                           .replace("{expiry_time}", expiry_time)
-                           .replace("{expiry_datetime}", expiry_str)
-                           .replace("{group_name}", group.get("group_name", "VIP"))
-                           .replace("{user_name}", user.get("first_name", "Usuario") or "Usuario"))
-                try:
-                    spin_data = spin_batch.get(user_id, {})
-                    spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
-                    await bot_app.bot.send_message(
-                        user_id, message,
-                        reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used),
-                        parse_mode="Markdown"
-                    )
-                    await db.log_warning_sent(user_id, group_id, warning_type)
-                    logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes")
-                except Exception as e:
-                    logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
+
+            # Paralelizar envíos con semáforo (respetar rate limit ~25 msg/s)
+            semaphore = asyncio.Semaphore(25)
+            async def _send_warning(user):
+                async with semaphore:
+                    user_id = user['user_id']
+                    end_date = normalize_dt(user['end_date'])
+                    remaining = end_date - now_utc()
+                    mins_left = max(0, int(remaining.total_seconds() / 60))
+                    if mins_left <= 0:
+                        return
+                    expiry_str = fmt_dt(user['end_date'])
+                    expiry_time = expiry_str.split(' ')[1] if ' ' in expiry_str else expiry_str
+                    message = (message_template
+                               .replace("{minutes_left}", str(mins_left))
+                               .replace("{expiry_time}", expiry_time)
+                               .replace("{expiry_datetime}", expiry_str)
+                               .replace("{group_name}", group.get("group_name", "VIP"))
+                               .replace("{user_name}", user.get("first_name", "Usuario") or "Usuario"))
+                    try:
+                        spin_data = spin_batch.get(user_id, {})
+                        spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+                        await bot_app.bot.send_message(
+                            user_id, message,
+                            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used),
+                            parse_mode="Markdown"
+                        )
+                        await db.log_warning_sent(user_id, group_id, warning_type)
+                        logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes")
+                    except Exception as e:
+                        logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
+
+            await asyncio.gather(*[_send_warning(u) for u in users])
 
 async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
@@ -3367,6 +3488,7 @@ async def handle_warning_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif step in ('message', 'edit_message'):
         if text.lower() == 'saltar' and step == 'edit_message':
+            # No modificar mensaje, mantener el anterior
             pass
         else:
             msg_text = update.message.text.strip()
@@ -3376,8 +3498,8 @@ async def handle_warning_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 minutes = context.user_data.get('warning_minutes', 15)
                 warnings.append({"minutes_before": minutes, "message": msg_text})
                 warnings.sort(key=lambda w: w.get("minutes_before", 0), reverse=True)
-            warning_config["warnings"] = warnings
-            await db.save_warning_config(group_id, warning_config)
+        warning_config["warnings"] = warnings
+        await db.save_warning_config(group_id, warning_config)
         for k in ('warning_step', 'warning_group_id', 'warning_index', 'warning_minutes'):
             context.user_data.pop(k, None)
         keyboard = [_back_button(f"cfg_warnings_{group_id}")]
@@ -3607,12 +3729,14 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
     last_update = datetime.utcnow()
     for i, user in enumerate(targets, 1):
         user_id = user['user_id']
-        first_name = user.get('first_name', 'Usuario') or 'Usuario'
+        first_name = escape_md_v1(user.get('first_name', 'Usuario') or 'Usuario')
         username = user.get('username', '') or ''
+        safe_group_name = escape_md_v1(group_name)
+        safe_username = escape_md_v1(f"@{username}" if username and not username.startswith('user_') else first_name)
         personalized = (message_text
                         .replace("{user_name}", first_name)
-                        .replace("{group_name}", group_name)
-                        .replace("{username}", f"@{username}" if username and not username.startswith('user_') else first_name))
+                        .replace("{group_name}", safe_group_name)
+                        .replace("{username}", safe_username))
         try:
             await bot.send_message(user_id, personalized, parse_mode="Markdown", disable_web_page_preview=True)
             success_count += 1
@@ -3711,160 +3835,112 @@ async def check_expired_subscriptions():
             logger.error(f"❌ Error procesando grupo {group['group_name']}: {result}", exc_info=result)
 
 # ==================== CALLBACK HANDLER ====================
+
+async def _handle_back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await start(update, context)
+
+async def _handle_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    await query.answer("💳 Enviando datos de pago...")
+    parts = data.split("_")
+    if len(parts) >= 3:
+        pay_group_id = int(parts[1])
+        pay_user_id = int(parts[2])
+        if query.from_user.id == pay_user_id:
+            await send_payment_info(context.bot, pay_user_id, pay_group_id, triggered_by="botón Pagar")
+        else:
+            await query.answer("❌ Este botón no es para ti", show_alert=True)
+    else:
+        await query.answer("❌ Error en datos de pago", show_alert=True)
+
+# Routing tables
+CALLBACK_EXACT = {
+    "add_user": lambda u, c, d: u.callback_query.message.reply_text("📝 Usa: `/add @username plan` o `/add ID plan`", parse_mode="Markdown"),
+    "list_active": list_active_users,
+    "earnings": show_earnings,
+    "export_month": export_report,
+    "list_potential": list_potential_clients,
+    "export_clients": export_clients,
+    "vip_groups": view_vip_groups,
+    "view_vip_groups": view_vip_groups,
+    "free_groups": view_free_groups,
+    "view_free_groups": view_free_groups,
+    "total_earnings": total_earnings,
+    "all_groups": list_groups,
+    "groups": list_groups,
+    "add_group": lambda u, c, d: u.callback_query.message.reply_text("📝 Usa: `/addgroup group_id TIPO \"nombre\" admin_id`", parse_mode="Markdown"),
+    "back_to_admin": _handle_back_to_admin,
+    "menu_groups": menu_groups,
+    "menu_view_groups": menu_view_groups,
+    "menu_edit_group_select": menu_edit_group_select,
+    "menu_delete_group_select": menu_delete_group_select,
+    "menu_commands": menu_commands,
+    "broadcast_menu": broadcast_menu_callback,
+    "trial_stats": trial_stats,
+    "no_free_link": lambda u, c, d: u.callback_query.answer("❌ El admin no ha configurado el link del canal", show_alert=True),
+}
+
+CALLBACK_PREFIXES = [
+    ("select_group_", lambda u, c, d: select_group(u, c, int(d.replace("select_group_", "")))),
+    ("delete_confirm_", lambda u, c, d: delete_group_confirm(u, c, int(d.replace("delete_confirm_", "")))),
+    ("delete_yes_", lambda u, c, d: delete_group_execute(u, c, int(d.replace("delete_yes_", "")))),
+    ("multi_apply_", lambda u, c, d: multi_apply_changes(u, c, int(d.replace("multi_apply_", "")))),
+    ("multi_name_", lambda u, c, d: multi_name_request(u, c, int(d.replace("multi_name_", "")))),
+    ("multi_admin_", lambda u, c, d: multi_admin_request(u, c, int(d.replace("multi_admin_", "")))),
+    ("multi_type_", lambda u, c, d: multi_type_request(u, c, int(d.replace("multi_type_", "")))),
+    ("multi_set_type_", lambda u, c, d: multi_set_type(u, c, int(d.split("_")[3]), d.split("_")[4])),
+    ("edit_multiple_", lambda u, c, d: edit_group_multiple(u, c, int(d.replace("edit_multiple_", "")))),
+    ("cfg_group_", lambda u, c, d: menu_group_settings(u, c, int(d.replace("cfg_group_", "")))),
+    ("cfg_trial_", lambda u, c, d: cfg_trial_request(u, c, int(d.replace("cfg_trial_", "")))),
+    ("cfg_price_semanal_", lambda u, c, d: cfg_price_request(u, c, int(d.replace("cfg_price_semanal_", "")), "semanal")),
+    ("cfg_price_mensual_", lambda u, c, d: cfg_price_request(u, c, int(d.replace("cfg_price_mensual_", "")), "mensual")),
+    ("cfg_dur_semanal_", lambda u, c, d: cfg_duration_request(u, c, int(d.replace("cfg_dur_semanal_", "")), "semanal")),
+    ("cfg_dur_mensual_", lambda u, c, d: cfg_duration_request(u, c, int(d.replace("cfg_dur_mensual_", "")), "mensual")),
+    ("cfg_price_anual_", lambda u, c, d: cfg_price_request(u, c, int(d.replace("cfg_price_anual_", "")), "anual")),
+    ("cfg_dur_anual_", lambda u, c, d: cfg_duration_request(u, c, int(d.replace("cfg_dur_anual_", "")), "anual")),
+    ("cfg_payment_", lambda u, c, d: config_payment_callback(u, c, int(d.replace("cfg_payment_", "")))),
+    ("cfg_warnings_", lambda u, c, d: menu_warning_settings(u, c, int(d.replace("cfg_warnings_", "")))),
+    ("cfg_messages_", lambda u, c, d: config_messages_callback(u, c, int(d.replace("cfg_messages_", "")))),
+    ("cfg_msg_edit_", lambda u, c, d: _start_message_config(u, c, int(d.split("_")[3]), d.split("_")[4])),
+    ("warn_toggle_", lambda u, c, d: toggle_warnings(u, c, int(d.replace("warn_toggle_", "")))),
+    ("warn_add_", lambda u, c, d: add_warning_step1(u, c, int(d.replace("warn_add_", "")))),
+    ("warn_edit_", lambda u, c, d: edit_warning_step1(u, c, int(d.split("_")[2]), int(d.split("_")[3]))),
+    ("warn_delete_", lambda u, c, d: delete_warning(u, c, int(d.split("_")[2]), int(d.split("_")[3]))),
+    ("warn_test_", lambda u, c, d: test_warning(u, c, int(d.replace("warn_test_", "")))),
+    ("pay_", _handle_pay_callback),
+    ("spin_used_", lambda u, c, d: spin_used_callback(u, c)),
+    ("spin_", lambda u, c, d: spin_discount(u, c)),
+    ("bc|", lambda u, c, d: broadcast_callback_handler(u, c)),
+]
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     logger.info(f"🔔 CALLBACK: {data}")
     try:
-        if data == "add_user":
-            await query.answer()
-            await query.edit_message_text("📝 Usa: `/add @username plan` o `/add ID plan`", parse_mode="Markdown")
-        elif data == "list_active":
-            await query.answer()
-            await list_active_users(update, context)
-        elif data == "earnings":
-            await query.answer()
-            await show_earnings(update, context)
-        elif data == "export_month":
-            await query.answer()
-            await export_report(update, context)
-        elif data == "list_potential":
-            await list_potential_clients(update, context)
-        elif data == "export_clients":
-            await export_clients(update, context)
-        elif data in ("vip_groups", "view_vip_groups"):
-            await query.answer()
-            await view_vip_groups(update, context)
-        elif data in ("free_groups", "view_free_groups"):
-            await query.answer()
-            await view_free_groups(update, context)
-        elif data == "total_earnings":
-            await query.answer()
-            await total_earnings(update, context)
-        elif data in ("all_groups", "groups"):
-            await query.answer()
-            await list_groups(update, context)
-        elif data == "add_group":
-            await query.answer()
-            await query.edit_message_text("📝 Usa: `/addgroup group_id TIPO \"nombre\" admin_id`", parse_mode="Markdown")
-        elif data.startswith("select_group_"):
-            await select_group(update, context, int(data.replace("select_group_", "")))
-        elif data == "back_to_admin":
-            await query.answer()
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            await start(update, context)
-        elif data == "menu_groups":
-            await menu_groups(update, context)
-        elif data == "menu_view_groups":
-            await menu_view_groups(update, context)
-        elif data == "menu_edit_group_select":
-            await menu_edit_group_select(update, context)
-        elif data == "menu_delete_group_select":
-            await menu_delete_group_select(update, context)
-        elif data.startswith("delete_confirm_"):
-            await delete_group_confirm(update, context, int(data.replace("delete_confirm_", "")))
-        elif data.startswith("delete_yes_"):
-            await delete_group_execute(update, context, int(data.replace("delete_yes_", "")))
-        elif data == "menu_commands":
-            await menu_commands(update, context)
-        elif data.startswith("multi_apply_"):
-            await multi_apply_changes(update, context, int(data.replace("multi_apply_", "")))
-        elif data.startswith("multi_name_"):
-            await multi_name_request(update, context, int(data.replace("multi_name_", "")))
-        elif data.startswith("multi_admin_"):
-            await multi_admin_request(update, context, int(data.replace("multi_admin_", "")))
-        elif data.startswith("multi_type_"):
-            await multi_type_request(update, context, int(data.replace("multi_type_", "")))
-        elif data.startswith("multi_set_type_"):
-            parts = data.split("_")
-            if len(parts) >= 5:
-                await multi_set_type(update, context, int(parts[3]), parts[4])
-            else:
-                await query.answer("❌ Datos incompletos", show_alert=True)
-        elif data.startswith("edit_multiple_"):
-            await edit_group_multiple(update, context, int(data.replace("edit_multiple_", "")))
-        elif data.startswith("cfg_group_"):
-            await menu_group_settings(update, context, int(data.replace("cfg_group_", "")))
-        elif data.startswith("cfg_trial_"):
-            await cfg_trial_request(update, context, int(data.replace("cfg_trial_", "")))
-        elif data.startswith("cfg_price_semanal_"):
-            await cfg_price_request(update, context, int(data.replace("cfg_price_semanal_", "")), "semanal")
-        elif data.startswith("cfg_price_mensual_"):
-            await cfg_price_request(update, context, int(data.replace("cfg_price_mensual_", "")), "mensual")
-        elif data.startswith("cfg_dur_semanal_"):
-            await cfg_duration_request(update, context, int(data.replace("cfg_dur_semanal_", "")), "semanal")
-        elif data.startswith("cfg_dur_mensual_"):
-            await cfg_duration_request(update, context, int(data.replace("cfg_dur_mensual_", "")), "mensual")
-        elif data.startswith("cfg_price_anual_"):
-            await cfg_price_request(update, context, int(data.replace("cfg_price_anual_", "")), "anual")
-        elif data.startswith("cfg_dur_anual_"):
-            await cfg_duration_request(update, context, int(data.replace("cfg_dur_anual_", "")), "anual")
-        elif data == "trial_stats":
-            await trial_stats(update, context)
-        elif data.startswith("pay_"):
-            await query.answer("💳 Enviando datos de pago...")
-            parts = data.split("_")
-            if len(parts) >= 3:
-                pay_group_id = int(parts[1])
-                pay_user_id = int(parts[2])
-                if query.from_user.id == pay_user_id:
-                    await send_payment_info(context.bot, pay_user_id, pay_group_id, triggered_by="botón Pagar")
-                else:
-                    await query.answer("❌ Este botón no es para ti", show_alert=True)
-            else:
-                await query.answer("❌ Error en datos de pago", show_alert=True)
-        elif data.startswith("cfg_payment_"):
-            await config_payment_callback(update, context, int(data.replace("cfg_payment_", "")))
-        elif data.startswith("cfg_warnings_"):
-            await menu_warning_settings(update, context, int(data.replace("cfg_warnings_", "")))
-        elif data.startswith("cfg_messages_"):
-            await config_messages_callback(update, context, int(data.replace("cfg_messages_", "")))
-        elif data.startswith("cfg_msg_edit_"):
-            parts = data.split("_")
-            if len(parts) >= 5:
-                group_id = int(parts[3])
-                msg_type = parts[4]
-                await _start_message_config(update, context, group_id, msg_type)
-            else:
-                await query.answer("❌ Datos incompletos", show_alert=True)
-        elif data.startswith("warn_toggle_"):
-            await toggle_warnings(update, context, int(data.replace("warn_toggle_", "")))
-        elif data.startswith("warn_add_"):
-            await add_warning_step1(update, context, int(data.replace("warn_add_", "")))
-        elif data.startswith("warn_edit_"):
-            parts = data.split("_")
-            if len(parts) >= 4:
-                await edit_warning_step1(update, context, int(parts[2]), int(parts[3]))
-            else:
-                await query.answer("❌ Datos incompletos", show_alert=True)
-        elif data.startswith("warn_delete_"):
-            parts = data.split("_")
-            if len(parts) >= 4:
-                await delete_warning(update, context, int(parts[2]), int(parts[3]))
-            else:
-                await query.answer("❌ Datos incompletos", show_alert=True)
-        elif data.startswith("warn_test_"):
-            await test_warning(update, context, int(data.replace("warn_test_", "")))
-        elif data == "broadcast_menu":
-            await broadcast_menu_callback(update, context)
-        elif data.startswith("bc|"):
-            await broadcast_callback_handler(update, context)
-        elif data.startswith("spin_used_"):
-            await spin_used_callback(update, context)
-        elif data.startswith("spin_"):
-            parts = data.split("_")
-            if len(parts) >= 3:
-                await spin_discount(update, context)
-            else:
-                await query.answer("❌ Error en datos", show_alert=True)
-        elif data == "no_free_link":
-            await query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
-        else:
-            await query.answer()
-            logger.warning(f"Callback desconocido: {data}")
+        # 1. Exact matches
+        handler = CALLBACK_EXACT.get(data)
+        if handler:
+            if data not in ("back_to_admin", "no_free_link"):
+                await query.answer()
+            await handler(update, context, data)
+            return
+
+        # 2. Prefix matches (más específicos primero)
+        for prefix, handler in CALLBACK_PREFIXES:
+            if data.startswith(prefix):
+                await handler(update, context, data)
+                return
+
+        # 3. Unknown
+        await query.answer()
+        logger.warning(f"Callback desconocido: {data}")
     except Exception as e:
         logger.error(f"❌ Error en callback '{data}': {e}", exc_info=True)
         try:
@@ -3979,6 +4055,8 @@ async def main():
 
     # Detección de miembros
     bot_app.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    # Reacciones para descargas (funciona con archivos antiguos y nuevos)
+    bot_app.add_handler(MessageReactionHandler(handle_reaction_download))
 
     # Mensajes en grupos (detección de usuarios activos)
     bot_app.add_handler(MessageHandler(
@@ -4003,7 +4081,7 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member", "message_reaction"]
     )
     await asyncio.Event().wait()
 
