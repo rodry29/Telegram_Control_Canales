@@ -1611,11 +1611,14 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             expiry_text = f"{days_left} días restantes"
         expiry_date = fmt_dt(end_date, include_time=(total_mins < 1440))
-        first_name = user.get('first_name', '') or 'Sin nombre'
+        first_name = escape_md_v1(user.get('first_name', '') or 'Sin nombre')
         username = user.get('username', '')
-        display = f"{first_name} (@{username})" if username and not username.startswith('user_') else f"{first_name} (ID: `{user['user_id']}`)"
+        # Escapar username para Markdown
+        safe_username = escape_md_v1(username) if username and not username.startswith('user_') else ''
+        display = f"{first_name} (@{safe_username})" if safe_username else f"{first_name} (ID: `{user['user_id']}`)"
         chat_link = f"tg://user?id={user['user_id']}"
-        msg += f"{emoji} {display}\n   📅 Expira: {expiry_date} ({expiry_text})\n   📋 Plan: {user['plan']}\n   🔗 [Abrir chat]({chat_link})\n\n"
+        plan = escape_md_v1(user.get('plan', 'desconocido'))
+        msg += f"{emoji} {display}\n   📅 Expira: {expiry_date} ({expiry_text})\n   📋 Plan: {plan}\n   🔗 [Abrir chat]({chat_link})\n\n"
     if len(users) > 30:
         msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.* Usa el panel para ver más detalles."
     await message.reply_text(msg, parse_mode="Markdown")
