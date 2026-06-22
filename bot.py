@@ -173,9 +173,8 @@ def escape_md_v1(text: str) -> str:
     """Escapa caracteres especiales de Markdown V1 para Telegram."""
     if not text:
         return ""
-    for ch in '*_[]()':
+    for ch in '*_[]()~`':
         text = text.replace(ch, '\\' + ch)
-    return text
 
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
@@ -3209,6 +3208,9 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]),
             parse_mode="Markdown"
         )
+    finally:
+        async with _SPINNING_LOCK:
+            _SPINNING.discard((user_id, group_id))
 
 async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3487,19 +3489,24 @@ async def handle_warning_input(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
     elif step in ('message', 'edit_message'):
+        changed = False
         if text.lower() == 'saltar' and step == 'edit_message':
             # No modificar mensaje, mantener el anterior
             pass
         else:
             msg_text = update.message.text.strip()
             if step == 'edit_message' and warning_index is not None and warning_index < len(warnings):
-                warnings[warning_index]["message"] = msg_text
+                if warnings[warning_index].get("message") != msg_text:
+                    warnings[warning_index]["message"] = msg_text
+                    changed = True
             else:
                 minutes = context.user_data.get('warning_minutes', 15)
                 warnings.append({"minutes_before": minutes, "message": msg_text})
                 warnings.sort(key=lambda w: w.get("minutes_before", 0), reverse=True)
-        warning_config["warnings"] = warnings
-        await db.save_warning_config(group_id, warning_config)
+                changed = True
+        if changed:
+            warning_config["warnings"] = warnings
+            await db.save_warning_config(group_id, warning_config)
         for k in ('warning_step', 'warning_group_id', 'warning_index', 'warning_minutes'):
             context.user_data.pop(k, None)
         keyboard = [_back_button(f"cfg_warnings_{group_id}")]
@@ -3859,9 +3866,15 @@ async def _handle_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await query.answer("❌ Error en datos de pago", show_alert=True)
 
+async def _handle_add_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    await update.callback_query.message.reply_text("📝 Usa: `/add @username plan` o `/add ID plan`", parse_mode="Markdown")
+
+async def _handle_add_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    await update.callback_query.message.reply_text('📝 Usa: `/addgroup group_id TIPO "nombre" admin_id`', parse_mode="Markdown")
+
 # Routing tables
 CALLBACK_EXACT = {
-    "add_user": lambda u, c, d: u.callback_query.message.reply_text("📝 Usa: `/add @username plan` o `/add ID plan`", parse_mode="Markdown"),
+    "add_user": _handle_add_user_callback,
     "list_active": list_active_users,
     "earnings": show_earnings,
     "export_month": export_report,
@@ -3874,7 +3887,7 @@ CALLBACK_EXACT = {
     "total_earnings": total_earnings,
     "all_groups": list_groups,
     "groups": list_groups,
-    "add_group": lambda u, c, d: u.callback_query.message.reply_text("📝 Usa: `/addgroup group_id TIPO \"nombre\" admin_id`", parse_mode="Markdown"),
+    "add_group": _handle_add_group_callback,
     "back_to_admin": _handle_back_to_admin,
     "menu_groups": menu_groups,
     "menu_view_groups": menu_view_groups,
