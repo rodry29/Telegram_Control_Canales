@@ -174,6 +174,7 @@ def escape_md_v1(text: str) -> str:
         return ""
     for ch in '*_[]()~`':
         text = text.replace(ch, '\\' + ch)
+    return text
 
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
@@ -1285,7 +1286,7 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
 
     # Verificar acceso del usuario
     db_user = await db.get_user_by_id(user_id, group_id)
-    if not db_user or db_user.get('status') != 'active' or (db_user.get('end_date') and db_user['end_date'] < datetime.utcnow()):
+    if not db_user or db_user.get('status') != 'active' or (db_user.get('end_date') and normalize_dt(db_user['end_date']) < now_utc()):
         await _safe_send(user_id, "🚫 *No tienes acceso activo a este grupo.*\n\nUsa /start para registrarte.", parse_mode="Markdown")
         return
 
@@ -1765,7 +1766,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if g["group_id"] == group_id:
                                 g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
                                 break
-                        to_save_db.append((group_id, {'admin': admin_id, 'type': group_type}, None))
+                        to_save_db.append((group_id, {'admin': admin_id, 'type': group_type}))
                     else:
                         GROUPS.append({"group_id": group_id, "group_name": group_name, "type": group_type,
                                        "admin_id": admin_id, "settings": {}})
@@ -2673,10 +2674,11 @@ async def sync_all_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = "📊 *Estado actual de grupos*\n\n"
     with GROUPS_LOCK:
-        for group in GROUPS:
-            users = await db.get_all_active_users(group["group_id"])
-            emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
-            msg += f"{emoji} *{group['group_name']}*: {len(users)} usuarios activos\n"
+        groups_snapshot = list(GROUPS)
+    for group in groups_snapshot:
+        users = await db.get_all_active_users(group["group_id"])
+        emoji = "👑" if group.get("type", "VIP") == "VIP" else "📋"
+        msg += f"{emoji} *{group['group_name']}*: {len(users)} usuarios activos\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def diagnose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3871,6 +3873,9 @@ async def _handle_add_user_callback(update: Update, context: ContextTypes.DEFAUL
 async def _handle_add_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     await update.callback_query.message.reply_text('📝 Usa: `/addgroup group_id TIPO "nombre" admin_id`', parse_mode="Markdown")
 
+async def _handle_no_free_link(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    await update.callback_query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
+
 # Routing tables
 CALLBACK_EXACT = {
     "add_user": _handle_add_user_callback,
@@ -3895,7 +3900,7 @@ CALLBACK_EXACT = {
     "menu_commands": menu_commands,
     "broadcast_menu": broadcast_menu_callback,
     "trial_stats": trial_stats,
-    "no_free_link": lambda u, c, d: u.callback_query.answer("❌ El admin no ha configurado el link del canal", show_alert=True),
+    "no_free_link": _handle_no_free_link,
 }
 
 CALLBACK_PREFIXES = [
