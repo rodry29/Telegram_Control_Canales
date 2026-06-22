@@ -243,6 +243,8 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False) -
         keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
     else:
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
+    if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
+        keyboard.append([InlineKeyboardButton("🔥 Únete al VIP (Trial)", url=vip_invite_link)])
     keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -264,6 +266,9 @@ def get_payment_info_text(group_id: int) -> str:
         lines += ["🅿️ *PayPal:*", paypal_data, ""]
     if not bank_data and not paypal_data:
         lines += ["⚠️ *Métodos de pago no configurados aún.*", "Contacta al administrador para más información.", ""]
+    # Nota sobre el botón de unirse al VIP
+    if vip_invite_link:
+        lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
     lines += [
         f"📤 *Después de pagar:*",
         f"Envía el comprobante a @{payment_contact}", "",
@@ -280,6 +285,8 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     group = get_group_by_id(group_id)
     if not group:
         return False
+    # Obtener el link de invitación VIP de los settings
+    vip_invite_link = group.get("settings", {}).get("vip_invite_link", "").strip()
     # Rate limiting: máximo 1 notificación cada 5 minutos por usuario/grupo
     now = datetime.now(ZoneInfo("UTC"))
     # Limpiar entradas antiguas (>1 hora) para evitar leak de memoria
@@ -299,7 +306,7 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
             user_id,
             get_payment_info_text(group_id),
             parse_mode="Markdown",
-            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used)
+            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link)
         )
         chat_link = f"tg://user?id={user_id}"
         group_name = group.get("group_name", "VIP")
@@ -1049,6 +1056,8 @@ async def _show_vip_info(send_func, user_id: int, vip_group: dict):
     await db.register_free_user(group_id, user_id, f"user_{user_id}", "")
     spin_data = await db.get_spin_data(user_id, group_id)
     spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+    vip_invite_link = vip_group.get("settings", {}).get("vip_invite_link", "").strip()
+    
     lines = [f"🔥 *Bienvenido a {vip_group['group_name']}*", ""]
     for p in ["trial", "semanal", "mensual", "anual"]:
         cfg = get_group_plan_config(group_id, p)
@@ -1057,7 +1066,7 @@ async def _show_vip_info(send_func, user_id: int, vip_group: dict):
         else:
             lines.append(f"{_plan_emoji(p)} *{p.capitalize()}:* {fmt_price(cfg['price'])}")
     lines += ["", "🎰 *Gira la ruleta y gana hasta 50% de descuento* en tu primera suscripción.", "", "⏳ *El descuento es permanente* — úsalo cuando quieras."]
-    await send_func("\n".join(lines), reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used), parse_mode="Markdown")
+    await send_func("\n".join(lines), reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link), parse_mode="Markdown")
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2963,6 +2972,9 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group or group.get("type") != "VIP":
         await update.message.reply_text("❌ Grupo no encontrado o no es VIP")
         return
+    
+    vip_invite_link = group.get("settings", {}).get("vip_invite_link", "").strip()
+    
     success = await send_payment_info(context.bot, user_id, target_group, triggered_by="comando /pagar")
     if success and update.effective_chat.type in ("group", "supergroup"):
         await update.message.reply_text("💳 *Te he enviado los datos de pago por privado.*\nRevisa tu chat conmigo.", parse_mode="Markdown")
@@ -2992,7 +3004,7 @@ async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_T
     current_bank = settings.get("bank_data", "")
     await update.message.reply_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/3: *Datos bancarios*\nEnvía los datos de transferencia bancaria.\n\n"
+        f"Paso 1/4: *Datos bancarios*\nEnvía los datos de transferencia bancaria.\n\n"
         f"📋 *Actual:*\n`{current_bank or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
@@ -3092,16 +3104,49 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         with GROUPS_LOCK:
             group["settings"] = settings
         await db.update_group_fields(group_id, {'settings': settings})
+        context.user_data['config_payment_step'] = 'vip_invite_link'
+        current_vip_link = settings.get("vip_invite_link", "")
+        await update.message.reply_text(
+            f"✅ *PayPal guardado.*\n\nPaso 4/4: *Link de invitación al VIP*\n"
+            f"Envía el link de invitación al grupo VIP (para el botón 'Únete al VIP').\n\n"
+            f"📋 *Actual:* `{current_vip_link or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual, 'eliminar' para borrarlo, o pega el link de invitación.*\n\n"
+            f"💡 *Para obtener el link:* Ve al grupo VIP → Administradores → Invitar por link → Copiar",
+            parse_mode="Markdown"
+        )
+    
+    elif step == 'vip_invite_link':
+        if text.lower() not in ('saltar',):
+            if text.lower() == 'eliminar':
+                settings.pop('vip_invite_link', None)
+            else:
+                # Validar que sea un link válido
+                if not text.startswith(("https://", "http://")):
+                    await update.message.reply_text(
+                        "❌ *Link inválido.*\nEl link debe empezar con `https://` o `http://`\n\n"
+                        f"📋 *Actual:* `{settings.get('vip_invite_link', 'No configurado')}`\n\n"
+                        f"Envía el link de invitación o 'saltar' / 'eliminar'.",
+                        parse_mode="Markdown"
+                    )
+                    return
+                settings['vip_invite_link'] = text
+        with GROUPS_LOCK:
+            group["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
         context.user_data.pop('config_payment_step', None)
         context.user_data.pop('config_payment_group_id', None)
+        
+        vip_link_status = settings.get('vip_invite_link', 'No configurado')
         await update.message.reply_text(
             f"✅ *Configuración de pago completada*\n\n📌 *Grupo:* {group['group_name']}\n\n"
             f"🏦 *Bancaria:*\n`{settings.get('bank_data', 'No configurado')}`\n\n"
             f"📤 *Contacto:* @{settings.get('payment_contact', 'No configurado')}\n\n"
-            f"🅿️ *PayPal:* `{settings.get('paypal_data', 'No configurado')}`",
+            f"🅿️ *PayPal:* `{settings.get('paypal_data', 'No configurado')}`\n\n"
+            f"🔥 *Link VIP:* `{vip_link_status}`\n\n"
+            f"Los usuarios verán el botón 'Únete al VIP (Trial)' en la información de pago.",
             parse_mode="Markdown"
         )
-
+       
 async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
     await query.answer()
@@ -3118,7 +3163,7 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     current_bank = settings.get("bank_data", "")
     await query.edit_message_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/3: *Datos bancarios*\nEnvía los datos de transferencia bancaria.\n\n"
+        f"Paso 1/4: *Datos bancarios*\nEnvía los datos de transferencia bancaria.\n\n"
         f"📋 *Actual:*\n`{current_bank or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
