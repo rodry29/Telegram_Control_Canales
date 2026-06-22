@@ -1312,11 +1312,19 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
     
     reaction = update.message_reaction
     if not reaction or not reaction.chat or not reaction.user:
+         logger.info("🔥🔥🔥 Handler abortado: falta reaction/chat/user")
         return
 
     group_id = reaction.chat.id
     group = get_group_by_id(group_id)
+    message_id = reaction.message_id
+# LOG DETALLADO
+    emojis_recibidos = [getattr(r, 'emoji', None) for r in (reaction.new_reaction or [])]
+    logger.info(f"🔥🔥🔨 REACCIÓN: user={user_id}, msg={message_id}, group={group_id}, emojis={emojis_recibidos}")
+
+    group = get_group_by_id(group_id)
     if not group or group.get("type", "VIP") != "VIP":
+        logger.info(f"🔥🔥🔨 Grupo no VIP o no encontrado: group={group}")
         return
 
     # Filtrar solo el emoji de descarga (puedes cambiarlo)
@@ -1326,7 +1334,9 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         getattr(r, 'emoji', None) in target_emojis
         for r in new_reactions
     )
+    logger.info(f"🔥🔥🔨 has_target={has_target}, target_emojis={target_emojis}")
     if not has_target:
+        logger.info(f"🔥🔥🔨 Emoji no coincide, ignorando")
         return
 
     user_id = reaction.user.id
@@ -1334,14 +1344,19 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
 
     # Verificar acceso del usuario
     db_user = await db.get_user_by_id(user_id, group_id)
+    logger.info(f"🔥🔥🔨 Usuario DB: status={db_user.get('status') if db_user else 'None'}, plan={db_user.get('plan') if db_user else 'None'}, end_date={db_user.get('end_date') if db_user else 'None'}")
+    
     if not db_user or db_user.get('status') != 'active' or (db_user.get('end_date') and normalize_dt(db_user['end_date']) < now_utc()):
+        logger.info(f"🔥🔥🔨 Usuario sin acceso activo, enviando mensaje de error")
         await _safe_send(user_id, "🚫 *No tienes acceso activo a este grupo.*\n\nUsa /start para registrarte.", parse_mode="Markdown")
         return
 
     plan = db_user.get('plan', '')
+    logger.info(f"🔥🔥🔨 Plan del usuario: {plan}")
 
     # ─── TRIAL: enviar mensaje de pago ───
     if plan == 'trial':
+        logger.info(f"🔥🔥🔨 Usuario es TRIAL, enviando mensaje de pago")
         spin_data = await db.get_spin_data(user_id, group_id)
         spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
         pay_text = (
@@ -1361,10 +1376,13 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    # ─── VIP PAGADO: obtener file_id de la BD y enviar directamente ───
+ # ─── VIP PAGADO: obtener file_id de la BD ───
+    logger.info(f"🔥🔥🔨 Usuario es VIP pagado, buscando file_id para msg={message_id}")
     media_file = await db.get_media_file(group_id, message_id)
-    
+    logger.info(f"🔥🔥🔨 Resultado get_media_file: {media_file}")
+
     if not media_file or not media_file.get('file_id'):
+        logger.info(f"🔥🔥🔨 File ID no encontrado en BD")
         await _safe_send(
             user_id,
             "❌ *El archivo no está disponible.*\n\n"
@@ -1377,6 +1395,7 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
 
     file_id = media_file['file_id']
     media_type = media_file.get('media_type', 'document')
+    logger.info(f"🔥🔥🔨 Enviando archivo: file_id={file_id[:20]}..., type={media_type}")
 
     try:
         if media_type == 'photo':
@@ -1392,44 +1411,11 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
         else:
             await context.bot.send_document(user_id, document=file_id)
         
-        logger.info(f"✅ Archivo enviado a {user_id} desde msg {message_id}")
+        logger.info(f"✅ Archivo enviado exitosamente a {user_id}")
         
     except TelegramError as e:
-        error_str = str(e).lower()
-        if "wrong file_id" in error_str or "file_id_invalid" in error_str:
-            logger.error(f"❌ File ID inválido para msg {message_id}: {e}")
-            await _safe_send(
-                user_id,
-                "❌ *El archivo ya no está disponible.*\nPuede haber sido eliminado de los servidores de Telegram.",
-                parse_mode="Markdown"
-            )
-        else:
-            logger.error(f"❌ Error enviando archivo a {user_id}: {e}")
-            await _safe_send(user_id, "❌ *No se pudo enviar el archivo.* Intenta de nuevo o contacta al admin.", parse_mode="Markdown")
-        logger.info(f"✅ Archivo copiado a {user_id} del mensaje {message_id}")
-    except TelegramError as e:
-        error_str = str(e).lower()
-        if "message to copy not found" in error_str or "message can't be copied" in error_str:
-            # Fallback: intentar forward_message
-            try:
-                await context.bot.forward_message(
-                    chat_id=user_id,
-                    from_chat_id=group_id,
-                    message_id=message_id
-                )
-                logger.info(f"✅ Archivo reenviado a {user_id} del mensaje {message_id}")
-            except TelegramError as e2:
-                error_str2 = str(e2).lower()
-                if "message to forward not found" in error_str2:
-                    logger.error(f"❌ Mensaje {message_id} no encontrado para {user_id}")
-                    await _safe_send(user_id, "❌ El mensaje ya no está disponible (pudo haber sido eliminado o el bot no tiene acceso).")
-                else:
-                    logger.error(f"❌ Error reenviando mensaje {message_id} para {user_id}: {e2}")
-                    await _safe_send(user_id, "❌ No se pudo enviar el archivo. Verifica que el bot sea administrador del grupo VIP.")
-        else:
-            logger.error(f"❌ Error copiando mensaje {message_id} para {user_id}: {e}")
-            await _safe_send(user_id, "❌ No se pudo enviar el archivo. Intenta de nuevo o contacta al admin.")
-            
+        logger.error(f"❌ Error enviando archivo: {e}")
+        await _safe_send(user_id, "❌ *No se pudo enviar el archivo.*", parse_mode="Markdown")
 # ==================== HANDLER PARA REPLY CON /add ====================
 async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message:
