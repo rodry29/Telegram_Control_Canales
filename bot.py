@@ -1312,7 +1312,7 @@ async def handle_reaction_download(update: Update, context: ContextTypes.DEFAULT
     
     reaction = update.message_reaction
     if not reaction or not reaction.chat or not reaction.user:
-         logger.info("🔥🔥🔥 Handler abortado: falta reaction/chat/user")
+        logger.info("🔥🔥🔥 Handler abortado: falta reaction/chat/user")
         return
 
     group_id = reaction.chat.id
