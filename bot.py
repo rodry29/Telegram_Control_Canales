@@ -238,14 +238,17 @@ def format_message(template: str, variables: dict) -> str:
     return result
 
 # ==================== HELPERS DE PAGO ====================
-def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False) -> InlineKeyboardMarkup:
+def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, vip_invite_link: str = None) -> InlineKeyboardMarkup:
     keyboard = []
     if not spin_used:
         keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
     else:
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
+    
+    # BOTÓN: Únete al VIP (con link de invitación configurable)
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("🔥 Únete al VIP (Trial)", url=vip_invite_link)])
+    
     keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     return InlineKeyboardMarkup(keyboard)
 
