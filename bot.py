@@ -1289,7 +1289,7 @@ async def vip_enter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await query.edit_message_text(
         f"🔥 *Enlace de invitación al VIP*\n\n"
         f"Únete ahora: [Click aquí]({vip_link})\n\n"
-        f"⚠️ *Recuerda:* Debes estar en el grupo Free primero o serás expulsado.",
+        f"⚠️ *Recuerda:* Para activar tu trial debes estar en el grupo Free primero o serás expulsado.",
         parse_mode="Markdown",
         disable_web_page_preview=True
     )
