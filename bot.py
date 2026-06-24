@@ -3376,14 +3376,22 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 _SPINNING: set = set()
 _SPINNING_LOCK = asyncio.Lock()
 
-async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int = None):
     query = update.callback_query
     await query.answer()
-    parts = query.data.split("_")
-    if len(parts) < 3:
-        await query.answer("❌ Error en datos", show_alert=True)
-        return
-    group_id = int(parts[1])
+
+    # Si no recibimos group_id, lo extraemos de query.data (flujo normal con callback "spin_<gid>_<uid>")
+    if group_id is None:
+        parts = query.data.split("_")
+        if len(parts) < 3:
+            await query.answer("❌ Error en datos", show_alert=True)
+            return
+        try:
+            group_id = int(parts[1])
+        except ValueError:
+            await query.answer("❌ Error en datos", show_alert=True)
+            return
+
     user_id = query.from_user.id
     group = get_group_by_id(group_id)
     if not group or group.get("type", "VIP") != "VIP":
@@ -3440,7 +3448,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await query.edit_message_text(msg)
                 await asyncio.sleep(0.8)
-            except:
+            except Exception:
                 pass
 
         price_lines = _build_price_list(group_id, discounted_pct=discount)
