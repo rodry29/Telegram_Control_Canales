@@ -1301,10 +1301,8 @@ async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, v
     await send_payment_info(context.bot, user_id, vip_group_id, triggered_by="botón Información de Pago")
 
 async def vip_spin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
-    # Wrapper para spin_discount con callback diferente
-    query = update.callback_query
-    query.data = f"spin_{vip_group_id}_{query.from_user.id}"
-    await spin_discount(update, context)
+    """Wrapper para spin_discount usando vip_group_id directamente (sin mutar query.data)."""
+    await spin_discount(update, context, group_id=vip_group_id)
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
