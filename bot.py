@@ -287,7 +287,7 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, v
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
     
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
-        keyboard.append([InlineKeyboardButton("🔥 Únete al VIP", url=vip_invite_link)])
+        keyboard.append([InlineKeyboardButton("🔥 Únete al VIP (Trial)", url=vip_invite_link)])
     
     keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     return InlineKeyboardMarkup(keyboard)
@@ -312,7 +312,7 @@ def get_payment_info_text(group_id: int) -> str:
     if not bank_data and not paypal_data:
         lines += ["⚠️ *Métodos de pago no configurados aún.*", "Contacta al administrador para más información.", ""]
     if vip_invite_link:
-        lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito. (Solo puedes usarlo una vez)", ""]
+        lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
     lines += [
         f"📤 *Después de pagar:*",
         f"Envía el comprobante a @{payment_contact}", "",
@@ -497,8 +497,7 @@ class Database:
                     cur.execute(idx_sql)
                 # Migraciones seguras
                 cur.execute("""
-                    DO $$
-                    BEGIN
+                    DO $$                     BEGIN
                         IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payments' AND column_name='amount' AND data_type='integer')
                             THEN ALTER TABLE payments ALTER COLUMN amount TYPE NUMERIC(10,2); END IF;
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payments' AND column_name='duration_minutes')
@@ -1289,7 +1288,7 @@ async def vip_enter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await query.edit_message_text(
         f"🔥 *Enlace de invitación al VIP*\n\n"
         f"Únete ahora: [Click aquí]({vip_link})\n\n"
-        f"⚠️ *Recuerda:* Para activar tu trial debes estar en el grupo Free primero o serás expulsado.",
+        f"⚠️ *Recuerda:* Al entrar al grupo VIP, el bot te otorgará tu prueba de 1 hora automáticamente.",
         parse_mode="Markdown",
         disable_web_page_preview=True
     )
@@ -1301,8 +1300,10 @@ async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, v
     await send_payment_info(context.bot, user_id, vip_group_id, triggered_by="botón Información de Pago")
 
 async def vip_spin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
-    """Wrapper para spin_discount usando vip_group_id directamente (sin mutar query.data)."""
-    await spin_discount(update, context, group_id=vip_group_id)
+    # Wrapper para spin_discount con callback diferente
+    query = update.callback_query
+    query.data = f"spin_{vip_group_id}_{query.from_user.id}"
+    await spin_discount(update, context)
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2322,7 +2323,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
 
-    # PASO 1: VERIFICAR si el usuario está registrado en el FREE del mismo admin
+    # Buscamos el grupo FREE para incluir el link en la bienvenida (opcional, no obligatorio)
     free_group = None
     with GROUPS_LOCK:
         for g in GROUPS.values():
@@ -2336,49 +2337,12 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         if free_id:
             free_group = get_group_by_id(free_id)
 
-    # PASO 2: VERIFICAR si el usuario está en el FREE
-    user_in_free = False
+    free_link = None
     if free_group:
-        free_user = await db.get_user_by_id(user_id, free_group["group_id"])
-        if free_user:
-            user_in_free = True
+        free_link = free_group.get("settings", {}).get("invite_link")
 
-    # PASO 3: SI NO ESTÁ EN FREE → EXPULSAR Y ENVIAR AL FREE + PAGO
-    if not user_in_free:
-        logger.info(f"🚫 Usuario {user_id} intentó entrar al VIP sin estar en FREE. Expulsando...")
-        kick_success = await _kick_user_with_retry(chat_id, user_id)
-        if kick_success:
-            spin_data = await db.get_spin_data(user_id, chat_id)
-            spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
-            free_link = None
-            if free_group:
-                free_link = free_group.get("settings", {}).get("invite_link")
-            keyboard = []
-            if free_link:
-                keyboard.append([InlineKeyboardButton("📢 Unirme al canal FREE", url=free_link)])
-            keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
-            if not spin_used:
-                keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")])
-            else:
-                keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{chat_id}_{user_id}")])
-
-            price_lines = _build_price_list(chat_id)
-            custom_messages = await db.get_group_messages(chat_id)
-            if custom_messages and custom_messages.get('rejection_message'):
-                rejection_msg = format_message(custom_messages['rejection_message'], {
-                    'group_name': group['group_name'], 'user_name': first_name or username, 'price_list': price_lines
-                })
-            else:
-                rejection_msg = format_message(DEFAULT_REJECTION_MESSAGE, {
-                    'group_name': group['group_name'], 'price_list': price_lines
-                })
-
-            await _safe_send(user_id, rejection_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-            await _safe_send(group["admin_id"], f"🚫 *Acceso directo bloqueado*\n\n👤 Usuario: [{display}]({chat_link})\n🆔 ID: `{user_id}`\n📌 Grupo: {group['group_name']}\n\n❌ No estaba en el FREE. Expulsado automáticamente.", parse_mode="Markdown")
-        return False
-
-    # PASO 4: SI ESTÁ EN FREE → OTORGAR TRIAL O VERIFICAR SUSCRIPCIÓN
-    logger.info(f"✅ Usuario {user_id} está en FREE. Procesando acceso VIP...")
+    # OTORGAR TRIAL O VERIFICAR SUSCRIPCIÓN DIRECTAMENTE
+    logger.info(f"✅ Usuario {user_id} ingresando al VIP. Procesando acceso...")
     allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
     logger.info(f"register_user_auto → allow={allow_access}, code={result_code}, end_date={end_date}")
 
@@ -2394,26 +2358,22 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 })
             else:
                 welcome_msg = format_message(DEFAULT_WELCOME_MESSAGE, {'trial_duration': trial_str, 'expiry_time': expiry_str})
-            if custom_messages and custom_messages.get('welcome_buttons'):
-                buttons = json.loads(custom_messages['welcome_buttons'])
-                keyboard = []
-                for btn in buttons:
-                    if btn.get('url'):
-                        keyboard.append([InlineKeyboardButton(btn['text'], url=btn['url'])])
-                    else:
-                        keyboard.append([InlineKeyboardButton(btn['text'], callback_data=btn.get('callback_data', 'no_action'))])
-            else:
-                keyboard = [
-                    [InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")],
-                    [InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")]
-                ]
+            
+            keyboard = []
+            # Agregamos el link al FREE si existe, como recomendación
+            if free_link:
+                keyboard.append([InlineKeyboardButton("📢 Únete al canal FREE", url=free_link)])
+                
+            keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{chat_id}_{user_id}")])
+            keyboard.append([InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
+            
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-            await _safe_send(group["admin_id"], f"🆕 *Nuevo usuario VIP (vino desde FREE)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n⏱ *Trial:* {trial_str}\n📅 *Expira:* {expiry_str} (EC)\n\n💡 *Para activar pago:* Responde con `/add {user_id} mensual`", parse_mode="Markdown")
+            await _safe_send(group["admin_id"], f"🆕 *Nuevo usuario VIP (Acceso Directo)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n⏱ *Trial:* {trial_str}\n📅 *Expira:* {expiry_str} (EC)\n\n💡 *Para activar pago:* Responde con `/add {user_id} mensual`", parse_mode="Markdown")
         elif result_code == "activo":
             logger.info(f"✅ Reingreso permitido: {display} en {group['group_name']} — expira {end_date}")
         return True
 
-    # PASO 5: SI NO PUEDE ACCEDER (trial usado, expirado, etc.)
+    # SI NO PUEDE ACCEDER (trial usado, expirado, etc.)
     if result_code == "expirado":
         motivo_usuario = "Tu prueba o suscripción ha expirado."
         motivo_admin = "Plan vencido"
@@ -2431,7 +2391,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
         await _safe_send(group["admin_id"], f"🚫 *Reingreso denegado*\n\n👤 *Usuario:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n⚠️ *Motivo:* {motivo_admin}", parse_mode="Markdown")
     else:
-        await _safe_send(group["admin_id"], f"⚠️ *Expulsión fallida*\n\n👤 [{display}]({chat_link})\n📌 {group['group_name']}\n⚠️ {motivo_admin}\n\n🔧 *Acción manual requerida.*", parse_mode="Markdown")
+        await _safe_send(group["admin_id"], f"⚠️ *Expulsión fallida*\n\n👤 [{display}]({chat_link})\n📌 {group['group_name']}\n⚠️ {motivo_admin}\n\n🔧 *Acción manual requerido.*", parse_mode="Markdown")
     return False
 
 async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
@@ -2937,9 +2897,9 @@ async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ *Vinculación completada*\n\n"
         f"📋 FREE: {free_group['group_name']}\n"
         f"👑 VIP: {vip_group['group_name']}\n\n"
-        f"🔒 *Ahora el VIP solo acepta usuarios que estén en el FREE.*\n"
-        f"✅ Usuarios en FREE → Trial automático al entrar al VIP\n"
-        f"❌ Usuarios sin FREE → Expulsión + botón para unirse al FREE",
+        f"🔥 *Ahora el VIP da acceso directo al Trial.*\n"
+        f"✅ Usuarios entran al VIP → Trial automático\n"
+        f"📢 Se les invita al FREE en el mensaje de bienvenida",
         parse_mode="Markdown"
     )
 
@@ -3374,22 +3334,14 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 _SPINNING: set = set()
 _SPINNING_LOCK = asyncio.Lock()
 
-async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int = None):
+async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    # Si no recibimos group_id, lo extraemos de query.data (flujo normal con callback "spin_<gid>_<uid>")
-    if group_id is None:
-        parts = query.data.split("_")
-        if len(parts) < 3:
-            await query.answer("❌ Error en datos", show_alert=True)
-            return
-        try:
-            group_id = int(parts[1])
-        except ValueError:
-            await query.answer("❌ Error en datos", show_alert=True)
-            return
-
+    parts = query.data.split("_")
+    if len(parts) < 3:
+        await query.answer("❌ Error en datos", show_alert=True)
+        return
+    group_id = int(parts[1])
     user_id = query.from_user.id
     group = get_group_by_id(group_id)
     if not group or group.get("type", "VIP") != "VIP":
@@ -3446,7 +3398,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE, grou
             try:
                 await query.edit_message_text(msg)
                 await asyncio.sleep(0.8)
-            except Exception:
+            except:
                 pass
 
         price_lines = _build_price_list(group_id, discounted_pct=discount)
