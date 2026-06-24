@@ -287,7 +287,7 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, v
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
     
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
-        keyboard.append([InlineKeyboardButton("🔥 Únete al VIP (Trial)", url=vip_invite_link)])
+        keyboard.append([InlineKeyboardButton("🔥 Únete al VIP", url=vip_invite_link)])
     
     keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     return InlineKeyboardMarkup(keyboard)
@@ -312,7 +312,7 @@ def get_payment_info_text(group_id: int) -> str:
     if not bank_data and not paypal_data:
         lines += ["⚠️ *Métodos de pago no configurados aún.*", "Contacta al administrador para más información.", ""]
     if vip_invite_link:
-        lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
+        lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito. (Solo puedes usarlo una vez)", ""]
     lines += [
         f"📤 *Después de pagar:*",
         f"Envía el comprobante a @{payment_contact}", "",
