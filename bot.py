@@ -2105,8 +2105,7 @@ async def renew_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     message = query.message if query else update.message
-    if query:
-        await query.answer()
+    if query: await query.answer()
     group_id = context.user_data.get('current_group')
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
@@ -2116,30 +2115,25 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("📭 No hay usuarios activos")
         return
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
-    now = datetime.now(ZoneInfo("UTC"))
+    
+    now = normalize_dt(datetime.now(ZoneInfo("UTC")))
+        
     for user in users[:30]:
-        end_date = user['end_date']
+        end_date = normalize_dt(user['end_date'])
+            
         remaining = end_date - now
         total_mins = max(0, int(remaining.total_seconds() / 60))
         days_left = total_mins // 1440
         emoji = "🟢" if days_left > 7 else "🟡" if days_left > 1 else "🔴"
-        if total_mins < 60:
-            expiry_text = f"{total_mins} min restantes"
-        elif total_mins < 1440:
-            h = total_mins // 60; m = total_mins % 60
-            expiry_text = f"{h}h {m}m restantes" if m else f"{h}h restantes"
-        else:
-            expiry_text = f"{days_left} días restantes"
-        expiry_date = fmt_dt(end_date, include_time=(total_mins < 1440))
+        expiry_text = f"{total_mins} min" if total_mins < 60 else f"{days_left} días"
         first_name = escape_md_v2(user.get('first_name', '') or 'Sin nombre')
         username = user.get('username', '')
         safe_username = escape_md_v2(username) if username and not username.startswith('user_') else ''
         display = f"{first_name} (@{safe_username})" if safe_username else f"{first_name} (ID: `{user['user_id']}`)"
         chat_link = f"tg://user?id={user['user_id']}"
-        plan = escape_md_v2(user.get('plan', 'desconocido'))
-        msg += f"{emoji} {display}\n   📅 Expira: {expiry_date} ({expiry_text})\n   📋 Plan: {plan}\n   🔗 [Abrir chat]({chat_link})\n\n"
+        msg += f"{emoji} {display}\n   📅 Expira: {fmt_dt(end_date)} ({expiry_text})\n   🔗 [Abrir chat]({chat_link})\n\n"
     if len(users) > 30:
-        msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.* Usa el panel para ver más detalles."
+        msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.*"
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
