@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any, Callable
 from zoneinfo import ZoneInfo
 
 import psycopg2
-from psycopg2 import poolf
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError, BadRequest
