@@ -2541,26 +2541,30 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     cfg_semanal = get_group_plan_config(group_id, "semanal")
     cfg_mensual = get_group_plan_config(group_id, "mensual")
     cfg_anual = get_group_plan_config(group_id, "anual")
-    trial_str = fmt_minutes(cfg_trial.get('minutes', 1440))
+    trial_str = fmt_minutes(cfg_trial.get('minutes', 60))
+    
+    deuna_status = "✅" if group.get("settings", {}).get("deuna_link") else "❌"
+    cart_mins = group.get("settings", {}).get("cart_delay_minutes", 30)
+    
     keyboard = [
         [InlineKeyboardButton(f"⏱ Trial: {trial_str}", callback_data=f"cfg_trial_{group_id}")],
-        [InlineKeyboardButton(f"📅 Días semanal: {cfg_semanal['days']}d", callback_data=f"cfg_dur_semanal_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio semanal: {fmt_price(cfg_semanal['price'])}", callback_data=f"cfg_price_semanal_{group_id}")],
-        [InlineKeyboardButton(f"📆 Días mensual: {cfg_mensual['days']}d", callback_data=f"cfg_dur_mensual_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio mensual: {fmt_price(cfg_mensual['price'])}", callback_data=f"cfg_price_mensual_{group_id}")],
-        [InlineKeyboardButton(f"🏆 Días anual: {cfg_anual['days']}d", callback_data=f"cfg_dur_anual_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio anual: {fmt_price(cfg_anual['price'])}", callback_data=f"cfg_price_anual_{group_id}")],
-        [InlineKeyboardButton("💳 Configurar Pago", callback_data=f"cfg_payment_{group_id}")],
+        [InlineKeyboardButton(f"💳 Datos Bancarios y PayPal", callback_data=f"cfg_payment_{group_id}")],
+        [InlineKeyboardButton(f"⚡ Link Deuna ({deuna_status})", callback_data=f"cfg_deuna_{group_id}")],
+        [InlineKeyboardButton(f"🛒 Carrito Abandonado ({cart_mins} min)", callback_data=f"cfg_cart_{group_id}")],
         [InlineKeyboardButton("🔔 Configurar Avisos", callback_data=f"cfg_warnings_{group_id}")],
+        [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
         _back_button(f"select_group_{group_id}"),
     ]
     await query.edit_message_text(
         f"⚙️ *Configuración - {group['group_name']}*\n\n"
         f"• ⏱ *Trial:* {trial_str}\n"
-        f"• 📅 *Semanal:* {cfg_semanal['days']} días | {fmt_price(cfg_semanal['price'])}\n"
-        f"• 📆 *Mensual:* {cfg_mensual['days']} días | {fmt_price(cfg_mensual['price'])}\n"
-        f"• 🏆 *Anual:* {cfg_anual['days']} días | {fmt_price(cfg_anual['price'])}\n\n"
-        f"_Con `/add` puedes sobreescribir precio y días por usuario._",
+        f"• 📅 *Semanal:* {fmt_price(cfg_semanal['price'])}\n"
+        f"• 📆 *Mensual:* {fmt_price(cfg_mensual['price'])}\n"
+        f"• 🏆 *Anual:* {fmt_price(cfg_anual['price'])}\n\n"
+        f"_Selecciona una opción para configurar:_",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
 
@@ -2603,6 +2607,30 @@ async def cfg_duration_request(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown"
     )
 
+async def cfg_deuna_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['cfg_field'] = 'deuna_link'
+    context.user_data['cfg_group_id'] = group_id
+    group = get_group_by_id(group_id)
+    current_link = group.get("settings", {}).get("deuna_link", "")
+    await query.edit_message_text(
+        f"⚡ *Configurar Link Deuna*\n\nActual: `{current_link or 'No configurado'}`\n\nEnvía el nuevo link (debe empezar con https://).\n\n*Escribe 'cancelar' para salir.*",
+        parse_mode="Markdown"
+    )
+
+async def cfg_cart_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['cfg_field'] = 'cart_delay_minutes'
+    context.user_data['cfg_group_id'] = group_id
+    group = get_group_by_id(group_id)
+    current_mins = group.get("settings", {}).get("cart_delay_minutes", 30)
+    await query.edit_message_text(
+        f"🛒 *Configurar Carrito Abandonado*\n\nActual: *{current_mins} minutos*\n\nEnvía el número de minutos (ej. `30`).\n\n*Escribe 'cancelar' para salir.*",
+        parse_mode="Markdown"
+    )
+
 async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -2612,48 +2640,76 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not can_manage_group(update.effective_user.id, group_id):
         return
+        
     text = update.message.text.strip().replace(",", ".")
     if text.lower() == 'cancelar':
         context.user_data.pop('cfg_field', None)
         context.user_data.pop('cfg_group_id', None)
         await update.message.reply_text("❌ Configuración cancelada")
         return
+
+    # Lógica para Deuna
+    if field == 'deuna_link':
+        if not text.startswith("https://"):
+            await update.message.reply_text("❌ El link debe empezar con `https://`")
+            return
+        with GROUPS_LOCK:
+            group = GROUPS.get(group_id)
+            if group:
+                settings = dict(group.get("settings", {}))
+                settings['deuna_link'] = text
+                group["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
+        context.user_data.pop('cfg_field', None)
+        context.user_data.pop('cfg_group_id', None)
+        await update.message.reply_text("✅ *Link Deuna guardado correctamente.*", parse_mode="Markdown")
+        return
+
+    # Lógica para Carrito Abandonado
+    if field == 'cart_delay_minutes':
+        try:
+            minutes = int(text)
+            if minutes <= 0: raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Debe ser un número entero positivo (ej. `30`).")
+            return
+        with GROUPS_LOCK:
+            group = GROUPS.get(group_id)
+            if group:
+                settings = dict(group.get("settings", {}))
+                settings['cart_delay_minutes'] = minutes
+                group["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
+        context.user_data.pop('cfg_field', None)
+        context.user_data.pop('cfg_group_id', None)
+        await update.message.reply_text(f"✅ *Carrito abandonado configurado a {minutes} minutos.*", parse_mode="Markdown")
+        return
+
+    # Lógica original para Precios y Días
     is_price = field.startswith("price_")
     is_minutes = field == "trial_minutes"
     try:
         if is_price:
             value = round(float(text), 2)
-            if value < 0:
-                raise ValueError
+            if value < 0: raise ValueError
         else:
             value = int(float(text))
-            if value <= 0:
-                raise ValueError
+            if value <= 0: raise ValueError
     except ValueError:
-        if is_price:
-            await update.message.reply_text("❌ Precio inválido. Ej: `5.99` o `10`", parse_mode="Markdown")
-        elif is_minutes:
-            await update.message.reply_text("❌ Ingresa los minutos como entero. Ej: `1440`", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❌ Ingresa los días como entero positivo. Ej: `7`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Valor inválido.")
         return
-    group_name = None
+
     with GROUPS_LOCK:
         group = GROUPS.get(group_id)
         if group:
-            group_name = group['group_name']
             settings = dict(group.get("settings", {}))
             settings[field] = value
             group["settings"] = settings
-    if not group_name:
-        await update.message.reply_text("❌ Grupo no encontrado")
-        context.user_data.pop('cfg_field', None)
-        context.user_data.pop('cfg_group_id', None)
-        return
     await db.update_group_fields(group_id, {'settings': settings})
     _invalidate_price_cache(group_id)
     context.user_data.pop('cfg_field', None)
     context.user_data.pop('cfg_group_id', None)
+    
     labels = {
         "trial_minutes": f"Trial: *{fmt_minutes(value)}*",
         "price_semanal": f"Precio semanal base: *{fmt_price(value)}*",
@@ -2664,10 +2720,7 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "duration_anual": f"Duración anual: *{value} días*",
     }
     label = labels.get(field, f"{field}: *{value}*")
-    await update.message.reply_text(
-        f"✅ *Configuración actualizada*\n\n• {label}\n\nAplica en *{group_name}*.",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"✅ *Configuración actualizada*\n\n• {label}", parse_mode="Markdown")
 
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
@@ -4195,6 +4248,8 @@ CALLBACK_PREFIXES = [
     ("vip_enter_", lambda u, c, d: vip_enter_callback(u, c, int(d.replace("vip_enter_", "")))),
     ("vip_pay_", lambda u, c, d: vip_pay_callback(u, c, int(d.replace("vip_pay_", "")))),
     ("vip_spin_", lambda u, c, d: vip_spin_callback(u, c, int(d.replace("vip_spin_", "")))),
+    ("cfg_deuna_", lambda u, c, d: cfg_deuna_request(u, c, int(d.replace("cfg_deuna_", "")))),
+    ("cfg_cart_", lambda u, c, d: cfg_cart_request(u, c, int(d.replace("cfg_cart_", "")))),
 ]
 
 async def show_channel_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
