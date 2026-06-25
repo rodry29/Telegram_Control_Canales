@@ -280,6 +280,8 @@ def format_message(template: str, variables: dict) -> str:
 
 # ==================== HELPERS DE PAGO ====================
 def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, vip_invite_link: str = None) -> InlineKeyboardMarkup:
+    group = get_group_by_id(group_id)
+    deuna_link = group.get("settings", {}).get("deuna_link") if group else None
     keyboard = []
     if not spin_used:
         keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
@@ -289,7 +291,10 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, v
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("🔥 Únete al VIP (Trial)", url=vip_invite_link)])
     
-    keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
+    if deuna_link and deuna_link.startswith(("https://", "http://")):
+        keyboard.append([InlineKeyboardButton("⚡ PAGAR CON DEUNA", url=deuna_link)])
+    
+    keyboard.append([InlineKeyboardButton("💳 Info de Pago Completa", callback_data=f"pay_{group_id}_{user_id}")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_payment_info_text(group_id: int) -> str:
@@ -336,37 +341,25 @@ async def _cleanup_payment_cooldown():
 
 async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str = "comando"):
     group = get_group_by_id(group_id)
-    if not group:
-        return False
+    if not group: return False
     vip_invite_link = group.get("settings", {}).get("vip_invite_link", "").strip()
     now = datetime.now(ZoneInfo("UTC"))
     cooldown_key = f"pay_{user_id}_{group_id}"
     last_sent = _PAYMENT_COOLDOWN.get(cooldown_key)
-    if last_sent and (now - last_sent).total_seconds() < 300:
-        logger.info(f"Rate limit: pago info para {user_id} en grupo {group_id} omitido")
-        return True
+    if last_sent and (now - last_sent).total_seconds() < 300: return True
     _PAYMENT_COOLDOWN[cooldown_key] = now
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
         spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
-        await bot.send_message(
-            user_id,
-            get_payment_info_text(group_id),
-            parse_mode="Markdown",
-            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link)
-        )
+        await bot.send_message(user_id, get_payment_info_text(group_id), parse_mode="Markdown", reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link))
         chat_link = f"tg://user?id={user_id}"
         group_name = group.get("group_name", "VIP")
-        await _safe_send(
-            group["admin_id"],
-            f"💳 *Nuevo lead de pago*\n\n"
-            f"👤 Usuario: [Usuario {user_id}]({chat_link})\n"
-            f"🆔 ID: `{user_id}`\n"
-            f"📌 Grupo: {group_name}\n"
-            f"🔔 Acción: *{triggered_by}*\n\n"
-            f"_Esperando comprobante en el contacto configurado._",
-            parse_mode="Markdown"
-        )
+        await _safe_send(group["admin_id"], f"💳 *Nuevo lead de pago*\n\n👤 Usuario: [Usuario {user_id}]({chat_link})\n🆔 ID: `{user_id}`\n📌 Grupo: {group_name}\n🔔 Acción: *{triggered_by}*\n\n_Esperando comprobante._", parse_mode="Markdown")
+        
+        # Programar Carrito Abandonado
+        cart_delay = group.get("settings", {}).get("cart_delay_minutes", 30)
+        run_date = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=cart_delay)
+        scheduler.add_job(check_abandoned_cart, 'date', run_date=run_date, args=[user_id, group_id], id=f"cart_{user_id}_{group_id}", replace_existing=True)
         return True
     except Exception as e:
         logger.warning(f"No se pudo enviar info de pago a {user_id}: {e}")
@@ -1120,6 +1113,39 @@ async def _safe_send(chat_id: int, text: str, **kwargs):
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
         return None
 
+async def check_abandoned_cart(user_id: int, group_id: int):
+    user = await db.get_user_by_id(user_id, group_id)
+    if not user: return
+    if user.get('status') == 'active' and user.get('plan') != 'trial': return
+    group = get_group_by_id(group_id)
+    if not group: return
+    custom = await db.get_group_messages(group_id)
+    cart_msg = custom.get('abandoned_cart_message') if custom else "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra a tu suscripción. ¡Escríbeme para ayudarte!"
+    cart_msg = format_message(cart_msg, {'group_name': group.get('group_name', 'VIP')})
+    try: await bot_app.bot.send_message(user_id, cart_msg, reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
+    except Exception as e: logger.warning(f"Cart msg failed to {user_id}: {e}")
+
+async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2: await update.message.reply_text("❌ Uso: `/configdeuna group_id link`", parse_mode="Markdown"); return
+    group_id = int(context.args[0]); link = context.args[1].strip()
+    if not link.startswith("https://"): await update.message.reply_text("❌ El link debe empezar con https://"); return
+    with GROUPS_LOCK:
+        group = GROUPS.get(group_id)
+        if group:
+            settings = dict(group.get("settings", {})); settings['deuna_link'] = link; group["settings"] = settings
+    await db.update_group_fields(group_id, {'settings': settings})
+    await update.message.reply_text("✅ Link Deuna guardado.")
+
+async def config_cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2: await update.message.reply_text("❌ Uso: `/configcart group_id minutos`", parse_mode="Markdown"); return
+    group_id = int(context.args[0]); minutes = int(context.args[1])
+    with GROUPS_LOCK:
+        group = GROUPS.get(group_id)
+        if group:
+            settings = dict(group.get("settings", {})); settings['cart_delay_minutes'] = minutes; group["settings"] = settings
+    await db.update_group_fields(group_id, {'settings': settings})
+    await update.message.reply_text(f"✅ Carrito abandonado configurado a {minutes} minutos.")
+
 async def _kick_user_with_retry(group_id: int, user_id: int, retries: int = 3) -> bool:
     for attempt in range(retries):
         try:
@@ -1710,6 +1736,50 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_record = await db.get_user_by_username(username, current_group)
         if user_record:
             await _mark_and_notify(context.bot, user_record['user_id'], current_group, plan, msg)
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_manage_group(update.effective_user.id, context.user_data.get('current_group', 0)) and update.effective_user.id != SUPER_ADMIN_ID: return
+    target_id = None
+    if update.message.reply_to_message:
+        text = update.message.reply_to_message.text or ""
+        match = re.search(r'ID:?\s*`?(\d+)`?', text)
+        if match: target_id = int(match.group(1))
+    if not target_id and context.args:
+        if context.args[0].isdigit(): target_id = int(context.args[0])
+        else:
+            user_rec = await db.get_user_by_username(context.args[0], context.user_data.get('current_group'))
+            if user_rec: target_id = user_rec['user_id']
+    if not target_id:
+        await update.message.reply_text("❌ Responde a un mensaje de alerta del bot o usa `/info ID`.", parse_mode="Markdown"); return
+    group_id = context.user_data.get('current_group')
+    if not group_id: await update.message.reply_text("❌ Selecciona un grupo primero con /start"); return
+
+    user = await db.get_user_by_id_full(target_id, group_id)
+    if not user:
+        await update.message.reply_text("❌ Usuario no encontrado en este grupo."); return
+    spin_data = await db.get_spin_data(target_id, group_id)
+    best_discount = spin_data.get("best_discount", 0)
+    spin_used = spin_data.get("used", False)
+    msg = f"📊 *EXPEDIENTE DE CLIENTE*\n\n"
+    msg += f"👤 *Nombre:* {user.get('first_name', 'N/A')}\n"
+    msg += f"🆔 *ID:* `{user['user_id']}`\n"
+    username = user.get('username')
+    if username and not username.startswith('user_'): msg += f"🔗 *Username:* @{username}\n"
+    msg += f"🌍 *Origen:* {user.get('source', 'Directo')}\n"
+    msg += f"📋 *Estado:* {user.get('status', 'N/A').upper()}\n"
+    msg += f"📦 *Plan:* {user.get('plan', 'N/A').upper()}\n"
+    msg += f"📅 *Expira:* {fmt_dt(user.get('end_date'))}\n"
+    msg += f"🎰 *Ruleta:* {'✅ Usado' if spin_used else '⏳ Pendiente'}\n"
+    if best_discount > 0:
+        msg += f"🏆 *Descuento:* {best_discount}% OFF\n\n*💰 Precios con descuento:*\n"
+        msg += _build_price_list(group_id, discounted_pct=best_discount) + "\n\n💡 *Comandos:*\n"
+        for p in ["semanal", "mensual", "anual"]:
+            cfg = get_group_plan_config(group_id, p); price = cfg['price'] * (1 - best_discount/100)
+            msg += f"`/add {target_id} {p} {price:.2f}`\n"
+    else:
+        msg += "\n*💰 Precios normales:*\n" + _build_price_list(group_id) + "\n\n💡 *Comandos:*\n"
+        for p in ["semanal", "mensual", "anual"]: msg += f"`/add {target_id} {p}`\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def renew_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_group = await require_group(update, context)
@@ -2319,7 +2389,7 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
     await menu_edit_group_select(update, context)
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
-async def _process_new_vip_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
+async def _process_new_vip_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
     display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
 
@@ -2343,7 +2413,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
 
     # OTORGAR TRIAL O VERIFICAR SUSCRIPCIÓN DIRECTAMENTE
     logger.info(f"✅ Usuario {user_id} ingresando al VIP. Procesando acceso...")
-    allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name)
+    allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name, source)
     logger.info(f"register_user_auto → allow={allow_access}, code={result_code}, end_date={end_date}")
 
     if allow_access:
@@ -2394,10 +2464,10 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         await _safe_send(group["admin_id"], f"⚠️ *Expulsión fallida*\n\n👤 [{display}]({chat_link})\n📌 {group['group_name']}\n⚠️ {motivo_admin}\n\n🔧 *Acción manual requerido.*", parse_mode="Markdown")
     return False
 
-async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict):
+async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
     display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
     chat_link = f"tg://user?id={user_id}"
-    is_new = await db.register_free_user(chat_id, user_id, username, first_name)
+    is_new = await db.register_free_user(chat_id, user_id, username, first_name, source)
     if is_new:
         await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})", parse_mode="Markdown")
     return is_new
@@ -2418,13 +2488,17 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = get_group_by_id(chat_id)
     if not group:
         return
+    source = "Directo"
+    if result.invite_link and result.invite_link.name:
+        source = result.invite_link.name
+        
     user_id = new_member.id
     username = new_member.username or f"user_{user_id}"
     first_name = new_member.first_name or ""
-    if group["type"] == "VIP":
-        await _process_new_vip_member(chat_id, user_id, username, first_name, group)
-    else:
-        await _process_new_free_member(chat_id, user_id, username, first_name, group)
+    if group["type"] == "VIP": 
+        await _process_new_vip_member(chat_id, user_id, username, first_name, group, source)
+    else: 
+        await _process_new_free_member(chat_id, user_id, username, first_name, group, source)
 
 async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_chat.type not in ("group", "supergroup"):
@@ -3414,6 +3488,16 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]),
             parse_mode="Markdown"
         )
+                # Alerta al Admin
+        await _safe_send(
+            group["admin_id"],
+            f"🎰 *ALERTA DE RULETA VIP*\n\n"
+            f"👤 Usuario: {query.from_user.first_name}\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"🏆 Descuento: *{discount}% OFF*\n\n"
+            f"💡 *Responde a este mensaje con /info para ver detalles.*",
+            parse_mode="Markdown"
+        )
     finally:
         async with _SPINNING_LOCK:
             _SPINNING.discard((user_id, group_id))
@@ -3922,84 +4006,38 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
 
 async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: str, sent_by: int):
     targets = await db.get_broadcast_targets(group_id, filter_type)
-    logger.info(f"DEBUG execute_broadcast START: targets={len(targets)}, filter={filter_type}")
     if not targets:
         await bot.send_message(sent_by, "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.", parse_mode="Markdown")
         return
     group = get_group_by_id(group_id)
     group_name = group.get('group_name', 'VIP') if group else 'VIP'
-    total = len(targets)
-    success_count = 0
-    fail_count = 0
-    delay = 0.12
+    total = len(targets); success_count = 0; fail_count = 0; delay = 0.12
     try:
-        progress_msg = await bot.send_message(
-            sent_by,
-            f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0\n• Fallidos: 0",
-            parse_mode="Markdown"
-        )
+        progress_msg = await bot.send_message(sent_by, f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0", parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"❌ No se pudo enviar mensaje de progreso: {e}")
-        progress_msg = None
-    last_update = datetime.now(ZoneInfo("UTC"))
+        logger.error(f"❌ No se pudo enviar mensaje de progreso: {e}"); progress_msg = None
+        
     for i, user in enumerate(targets, 1):
         user_id = user['user_id']
-        first_name = escape_md_v2(user.get('first_name', 'Usuario') or 'Usuario')
-        username = user.get('username', '') or ''
-        safe_group_name = escape_md_v2(group_name)
-        safe_username = escape_md_v2(f"@{username}" if username and not username.startswith('user_') else first_name)
-        personalized = (message_text
-                        .replace("{user_name}", first_name)
-                        .replace("{group_name}", safe_group_name)
-                        .replace("{username}", safe_username))
+        safe_name = escape_md_v2(user.get('first_name', 'Usuario') or 'Usuario')
+        personalized = message_text.replace("{user_name}", safe_name).replace("{group_name}", group_name)
         try:
             await bot.send_message(user_id, personalized, parse_mode="Markdown", disable_web_page_preview=True)
             success_count += 1
-        except Exception as e:
-            fail_count += 1
-            logger.warning(f"❌ Fallo broadcast a {user_id}: {e}")
-        await asyncio.sleep(delay)
-        now = datetime.now(ZoneInfo("UTC"))
-        if progress_msg and ((now - last_update).seconds >= 5 or i % 10 == 0):
+        except Exception:
             try:
-                await bot.edit_message_text(
-                    f"🚀 *Broadcast en progreso...*\n\n• Total: {total}\n• Enviados: {success_count}\n• Fallidos: {fail_count}\n• Progreso: {int(i/total*100)}%",
-                    chat_id=sent_by, message_id=progress_msg.message_id, parse_mode="Markdown"
-                )
-                last_update = now
-            except Exception as e:
-                logger.warning(f"⚠️ No se pudo actualizar progreso: {e}")
-                try:
-                    progress_msg = await bot.send_message(
-                        sent_by,
-                        f"🚀 *Broadcast en progreso...* {int(i/total*100)}%\n• Enviados: {success_count} | Fallidos: {fail_count}",
-                        parse_mode="Markdown"
-                    )
-                    last_update = now
-                except Exception:
-                    pass
+                await bot.send_message(user_id, personalized, disable_web_page_preview=True) # Fallback texto plano
+                success_count += 1
+            except Exception:
+                fail_count += 1
+        await asyncio.sleep(delay)
+        if progress_msg and i % 10 == 0:
+            try:
+                await bot.edit_message_text(f"🚀 *Broadcast...*\n• Enviados: {success_count}\n• Fallidos: {fail_count}\n• Progreso: {int(i/total*100)}%", chat_id=sent_by, message_id=progress_msg.message_id, parse_mode="Markdown")
+            except: pass
+            
     await db.log_broadcast_sent(group_id, filter_type, message_text, total, success_count, fail_count, sent_by)
-    try:
-        if progress_msg:
-            await bot.edit_message_text(
-                f"✅ *Broadcast completado*\n\n• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}\n"
-                f"• 📈 Éxito: {(success_count/total*100):.1f}%\n\nFiltro: {filter_type} | Grupo: {group_name}",
-                chat_id=sent_by, message_id=progress_msg.message_id, parse_mode="Markdown"
-            )
-        else:
-            await bot.send_message(
-                sent_by,
-                f"✅ *Broadcast completado*\n\n• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}\n"
-                f"• 📈 Éxito: {(success_count/total*100):.1f}%\n\nFiltro: {filter_type} | Grupo: {group_name}",
-                parse_mode="Markdown"
-            )
-    except Exception as e:
-        logger.error(f"❌ Error enviando mensaje final: {e}")
-        try:
-            await bot.send_message(sent_by, f"✅ *Broadcast completado* — {success_count}/{total} enviados", parse_mode="Markdown")
-        except Exception as e2:
-            logger.error(f"❌ Fallback también falló: {e2}")
-
+    await bot.send_message(sent_by, f"✅ *Broadcast completado*\n\n• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}", parse_mode="Markdown")
 # ==================== TAREAS PROGRAMADAS ====================
 async def check_expired_subscriptions():
     logger.info("🔍 Verificando suscripciones expiradas...")
@@ -4319,6 +4357,9 @@ async def main():
     bot_app.add_handler(CommandHandler("configfreelink", config_free_link_command))
     bot_app.add_handler(CommandHandler("configmsg", config_messages_command))
     bot_app.add_handler(CommandHandler("configfuego", config_fuego_command))
+    bot_app.add_handler(CommandHandler("info", info_command))
+    bot_app.add_handler(CommandHandler("configdeuna", config_deuna_command))
+    bot_app.add_handler(CommandHandler("configcart", config_cart_command))
 
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
