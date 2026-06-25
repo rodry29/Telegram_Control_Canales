@@ -1338,10 +1338,15 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("📭 No hay usuarios activos")
         return
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
-    now = datetime.utcnow() # Usamos UTC naive para evitar el error
+    
+    # Obtenemos la fecha actual SIN zona horaria para evitar el conflicto
+    now = datetime.utcnow()
+        
     for user in users[:30]:
         end_date = user['end_date']
-        if end_date.tzinfo is not None: # Si viene con zona horaria, se la quitamos
+        
+        # Si la fecha de la BD trae zona horaria, se la quitamos
+        if end_date.tzinfo is not None:
             end_date = end_date.replace(tzinfo=None)
             
         remaining = end_date - now
