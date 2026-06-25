@@ -1314,10 +1314,21 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
         cfg = get_group_plan_config(group_id, "trial")
         cfg_s = get_group_plan_config(group_id, "semanal")
         cfg_m = get_group_plan_config(group_id, "mensual")
-        keyboard = [[InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")], [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")], [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")], [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")], [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group_id}")], [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")], [InlineKeyboardButton("📢 Broadcast Trial", callback_data="broadcast_menu")]]
+        keyboard = [
+            [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+            [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+            [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+            [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")],
+            [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group_id}")],
+            [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
+            [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast_menu")]
+        ]
         await query.edit_message_text(f"👑 *Panel VIP - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n• ⏱ Trial: {fmt_minutes(cfg.get('minutes', 60))}\n• 📅 Semanal: ${cfg_s['price']}\n• 📆 Mensual: ${cfg_m['price']}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
-        keyboard = [[InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")], [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]]
+        keyboard = [
+            [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
+            [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]
+        ]
         await query.edit_message_text(f"📋 *Panel FREE - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2778,18 +2789,15 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     trial_str = fmt_minutes(cfg_trial.get('minutes', 60))
     
     deuna_status = "✅" if group.get("settings", {}).get("deuna_link") else "❌"
-    cart_mins = group.get("settings", {}).get("cart_delay_minutes", 30)
     
     keyboard = [
         [InlineKeyboardButton(f"⏱ Trial: {trial_str}", callback_data=f"cfg_trial_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio semanal: {fmt_price(cfg_semanal['price'])}", callback_data=f"cfg_price_semanal_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio mensual: {fmt_price(cfg_mensual['price'])}", callback_data=f"cfg_price_mensual_{group_id}")],
         [InlineKeyboardButton(f"💲 Precio anual: {fmt_price(cfg_anual['price'])}", callback_data=f"cfg_price_anual_{group_id}")],
-        [InlineKeyboardButton(f"💳 Datos Bancarios y PayPal", callback_data=f"cfg_payment_{group_id}")],
+        [InlineKeyboardButton("💳 Datos Bancarios y PayPal", callback_data=f"cfg_payment_{group_id}")],
         [InlineKeyboardButton(f"⚡ Link Deuna ({deuna_status})", callback_data=f"cfg_deuna_{group_id}")],
-        [InlineKeyboardButton(f"🛒 Carrito Abandonado ({cart_mins} min)", callback_data=f"cfg_cart_{group_id}")],
         [InlineKeyboardButton("🔔 Configurar Avisos", callback_data=f"cfg_warnings_{group_id}")],
-        [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
         _back_button(f"select_group_{group_id}"),
     ]
     await query.edit_message_text(
@@ -2798,7 +2806,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• 📅 *Semanal:* {fmt_price(cfg_semanal['price'])}\n"
         f"• 📆 *Mensual:* {fmt_price(cfg_mensual['price'])}\n"
         f"• 🏆 *Anual:* {fmt_price(cfg_anual['price'])}\n\n"
-        f"_Selecciona una opción para configurar:_",
+        f"_Selecciona una opción:_",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
 
