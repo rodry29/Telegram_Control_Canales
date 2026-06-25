@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any, Callable
 from zoneinfo import ZoneInfo
 
 import psycopg2
-from psycopg2 import pool
+from psycopg2 import poolf
 from psycopg2.extras import RealDictCursor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError, BadRequest
@@ -572,54 +572,44 @@ class Database:
     async def get_user_by_id_full(self, user_id: int, group_id: int):
         return await self.get_user(user_id, group_id, "*")
 
-    async def register_user_auto(self, group_id: int, user_id: int, username: str, first_name: str):
+    async def register_user_auto(self, group_id: int, user_id: int, username: str, first_name: str, source: str = "Directo"):
         now = now_utc()
         trial_cfg = get_group_plan_config(group_id, "trial")
-        trial_minutes = trial_cfg.get("minutes", 1440)
+        trial_minutes = trial_cfg.get("minutes", 60)
         def _register(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id, trial_used, status, end_date, plan FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (user_id, group_id))
+                cur.execute("SELECT user_id, trial_used, status, end_date, plan, source FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (user_id, group_id))
                 existing = cur.fetchone()
                 if not existing:
                     end_date = now + timedelta(minutes=trial_minutes)
-                    cur.execute("""
-                        INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, trial_used, status)
-                        VALUES (%s,%s,%s,%s,'trial',%s,%s,TRUE,'active')
-                    """, (user_id, group_id, username, first_name, now, end_date))
-                    cur.execute("""
-                        INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
-                        VALUES (%s,%s,%s,%s,'trial',0,%s,%s)
-                    """, (user_id, group_id, username, first_name, trial_minutes, now))
+                    cur.execute("""INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, trial_used, status, source) VALUES (%s,%s,%s,%s,'trial',%s,%s,TRUE,'active',%s)""", (user_id, group_id, username, first_name, now, end_date, source))
+                    cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
                     return True, "trial_nuevo", end_date
-                cur.execute("UPDATE users SET username=%s, first_name=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s",
-                            (username, first_name, user_id, group_id))
+                cur.execute("UPDATE users SET username=%s, first_name=%s, source=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (username, first_name, source, user_id, group_id))
                 existing_end = normalize_dt(existing["end_date"])
                 if existing["status"] == "active" and existing_end > now:
                     cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
                     return True, "activo", existing["end_date"]
-                if existing_end <= now:
-                    return False, "expirado", None
-                if existing.get("trial_used"):
-                    return False, "sin_trial", None
+                if existing_end <= now: return False, "expirado", None
+                if existing.get("trial_used"): return False, "sin_trial", None
                 end_date = now + timedelta(minutes=trial_minutes)
-                cur.execute("""
-                    UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW()
-                    WHERE user_id=%s AND group_id=%s
-                """, (now, end_date, user_id, group_id))
-                cur.execute("""
-                    INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
-                    VALUES (%s,%s,%s,%s,'trial',0,%s,%s)
-                """, (user_id, group_id, username, first_name, trial_minutes, now))
+                cur.execute("""UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s""", (now, end_date, user_id, group_id))
+                cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
                 return True, "trial_nuevo", end_date
         return await self._run(_register)
 
-    async def register_free_user(self, chat_id: int, user_id: int, username: str, first_name: str) -> bool:
+    async def register_free_user(self, chat_id: int, user_id: int, username: str, first_name: str, source: str = "Directo") -> bool:
         def _reg(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM users WHERE user_id=%s AND group_id=%s", (user_id, chat_id))
-                if cur.fetchone():
-                    return False
-                self._insert_free_user_sync(conn, user_id, chat_id, username, first_name)
+                if cur.fetchone(): return False
+                # Insertamos con el source
+                cur.execute("""
+                    INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used, source)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (user_id, group_id) DO NOTHING
+                """, (user_id, chat_id, username, first_name, "FREE",
+                      datetime.now(ZoneInfo("UTC")), datetime.now(ZoneInfo("UTC")) + timedelta(days=365), "potencial", False, source))
                 return True
         return await self._run(_reg)
 
