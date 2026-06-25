@@ -1326,17 +1326,27 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
         await query.edit_message_text(f"📋 *Panel FREE - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; message = query.message if query else update.message
+    query = update.callback_query
+    message = query.message if query else update.message
     if query: await query.answer()
     group_id = context.user_data.get('current_group')
-    if not group_id: await message.reply_text("❌ Selecciona un grupo con /start"); return
+    if not group_id:
+        await message.reply_text("❌ Selecciona un grupo con /start")
+        return
     users = await db.get_all_active_users(group_id)
-    if not users: await message.reply_text("📭 No hay usuarios activos"); return
+    if not users:
+        await message.reply_text("📭 No hay usuarios activos")
+        return
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
-    now = datetime.now(ZoneInfo("UTC"))
+    now = datetime.utcnow() # Usamos UTC naive para evitar el error
     for user in users[:30]:
-        end_date = user['end_date']; remaining = end_date - now
-        total_mins = max(0, int(remaining.total_seconds() / 60)); days_left = total_mins // 1440
+        end_date = user['end_date']
+        if end_date.tzinfo is not None: # Si viene con zona horaria, se la quitamos
+            end_date = end_date.replace(tzinfo=None)
+            
+        remaining = end_date - now
+        total_mins = max(0, int(remaining.total_seconds() / 60))
+        days_left = total_mins // 1440
         emoji = "🟢" if days_left > 7 else "🟡" if days_left > 1 else "🔴"
         expiry_text = f"{total_mins} min" if total_mins < 60 else f"{days_left} días"
         first_name = escape_md_v2(user.get('first_name', '') or 'Sin nombre')
@@ -1345,7 +1355,8 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display = f"{first_name} (@{safe_username})" if safe_username else f"{first_name} (ID: `{user['user_id']}`)"
         chat_link = f"tg://user?id={user['user_id']}"
         msg += f"{emoji} {display}\n   📅 Expira: {fmt_dt(end_date)} ({expiry_text})\n   🔗 [Abrir chat]({chat_link})\n\n"
-    if len(users) > 30: msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.*"
+    if len(users) > 30:
+        msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.*"
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
