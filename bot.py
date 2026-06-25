@@ -4095,7 +4095,6 @@ async def _handle_add_group_callback(update: Update, context: ContextTypes.DEFAU
 async def _handle_no_free_link(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     await update.callback_query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
 
-# Routing tables
 CALLBACK_EXACT = {
     "add_user": _handle_add_user_callback,
     "list_active": lambda u, c, d: list_active_users(u, c),
@@ -4103,21 +4102,21 @@ CALLBACK_EXACT = {
     "export_month": lambda u, c, d: export_report(u, c),
     "list_potential": lambda u, c, d: list_potential_clients(u, c),
     "export_clients": lambda u, c, d: export_clients(u, c),
-    "vip_groups": view_vip_groups,
-    "view_vip_groups": view_vip_groups,
-    "free_groups": view_free_groups,
-    "view_free_groups": view_free_groups,
-    "total_earnings": total_earnings,
-    "all_groups": list_groups,
-    "groups": list_groups,
+    "vip_groups": lambda u, c, d: view_vip_groups(u, c),
+    "view_vip_groups": lambda u, c, d: view_vip_groups(u, c),
+    "free_groups": lambda u, c, d: view_free_groups(u, c),
+    "view_free_groups": lambda u, c, d: view_free_groups(u, c),
+    "total_earnings": lambda u, c, d: total_earnings(u, c),
+    "all_groups": lambda u, c, d: list_groups(u, c),
+    "groups": lambda u, c, d: list_groups(u, c),
     "add_group": _handle_add_group_callback,
     "back_to_admin": _handle_back_to_admin,
-    "menu_groups": menu_groups,
-    "menu_view_groups": menu_view_groups,
-    "menu_edit_group_select": menu_edit_group_select,
-    "menu_delete_group_select": menu_delete_group_select,
-    "menu_commands": menu_commands,
-    "broadcast_menu": broadcast_menu_callback,
+    "menu_groups": lambda u, c, d: menu_groups(u, c),
+    "menu_view_groups": lambda u, c, d: menu_view_groups(u, c),
+    "menu_edit_group_select": lambda u, c, d: menu_edit_group_select(u, c),
+    "menu_delete_group_select": lambda u, c, d: menu_delete_group_select(u, c),
+    "menu_commands": lambda u, c, d: menu_commands(u, c),
+    "broadcast_menu": lambda u, c, d: broadcast_menu_callback(u, c),
     "trial_stats": lambda u, c, d: trial_stats(u, c),
     "no_free_link": _handle_no_free_link,
 }
