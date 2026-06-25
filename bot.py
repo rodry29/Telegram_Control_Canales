@@ -1475,12 +1475,14 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
     if not can_manage_group(query.from_user.id, group_id): return
     group = get_group_by_id(group_id)
     if not group: return
+    cart_mins = group.get("settings", {}).get("cart_delay_minutes", 30)
     keyboard = [
         [InlineKeyboardButton("🎉 Bienvenida", callback_data=f"cfg_msg_edit_{group_id}_welcome")],
         [InlineKeyboardButton("🚫 Rechazo", callback_data=f"cfg_msg_edit_{group_id}_rejection")],
         [InlineKeyboardButton("🤖 Aviso Fuego", callback_data=f"cfg_msg_edit_{group_id}_fuego_notice")],
         [InlineKeyboardButton("⏰ Expiración", callback_data=f"cfg_msg_edit_{group_id}_expired")],
-        [InlineKeyboardButton("🛒 Carrito Abandonado", callback_data=f"cfg_msg_edit_{group_id}_abandoned")],
+        [InlineKeyboardButton("🛒 Msg. Carrito Abandonado", callback_data=f"cfg_msg_edit_{group_id}_abandoned")],
+        [InlineKeyboardButton(f"⏱ Tiempo Carrito ({cart_mins} min)", callback_data=f"cfg_cart_{group_id}")],
         _back_button(f"select_group_{group_id}"),
     ]
     await query.edit_message_text(f"📝 *Configurar Mensajes — {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
