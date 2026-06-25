@@ -1272,6 +1272,235 @@ async def show_channel_menu(send_func, user_id: int, channel: dict):
     keyboard.append([InlineKeyboardButton("🔥 Grupo VIP", callback_data=f"channel_vip_{group_id}")])
     await send_func(desc, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+# ==================== FUNCIONES DEL PANEL DE ADMINISTRACIÓN ====================
+async def _handle_back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    await query.answer()
+    try: await query.message.delete()
+    except: pass
+    await start(update, context)
+
+async def _handle_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    await query.answer("💳 Enviando datos de pago...")
+    parts = data.split("_")
+    if len(parts) >= 3:
+        pay_group_id = int(parts[1]); pay_user_id = int(parts[2])
+        if query.from_user.id == pay_user_id: await send_payment_info(context.bot, pay_user_id, pay_group_id, triggered_by="botón Pagar")
+        else: await query.answer("❌ Este botón no es para ti", show_alert=True)
+
+async def _handle_add_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query; await query.answer()
+    await query.message.reply_text("📝 Usa: `/add @username plan` o `/add ID plan`", parse_mode="Markdown")
+
+async def _handle_add_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query; await query.answer()
+    await query.message.reply_text('📝 Usa: `/addgroup group_id TIPO "nombre" admin_id`', parse_mode="Markdown")
+
+async def _handle_no_free_link(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    await update.callback_query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
+
+async def menu_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    keyboard = [[InlineKeyboardButton("➕ Agregar grupo", callback_data="add_group")], [InlineKeyboardButton("👁️ Ver grupos", callback_data="menu_view_groups")], [InlineKeyboardButton("✏️ Editar grupo", callback_data="menu_edit_group_select")], [InlineKeyboardButton("❌ Eliminar grupo", callback_data="menu_delete_group_select")], _back_button("back_to_admin")]
+    await query.edit_message_text("📋 *Gestión de Grupos*\n\nSelecciona una opción:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def menu_view_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    keyboard = [[InlineKeyboardButton("👑 Grupos VIP", callback_data="view_vip_groups")], [InlineKeyboardButton("📋 Grupos FREE", callback_data="view_free_groups")], _back_button("menu_groups")]
+    await query.edit_message_text("👁️ *Ver Grupos*\n\nSelecciona el tipo de grupo:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query; await query.answer()
+    group = get_group_by_id(group_id)
+    if not group: await query.edit_message_text("❌ Grupo no encontrado"); return
+    context.user_data['current_group'] = group_id
+    if group.get("type", "VIP") == "VIP":
+        cfg = get_group_plan_config(group_id, "trial")
+        cfg_s = get_group_plan_config(group_id, "semanal")
+        cfg_m = get_group_plan_config(group_id, "mensual")
+        keyboard = [[InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")], [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")], [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")], [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")], [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group_id}")], [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")], [InlineKeyboardButton("📢 Broadcast Trial", callback_data="broadcast_menu")]]
+        await query.edit_message_text(f"👑 *Panel VIP - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n• ⏱ Trial: {fmt_minutes(cfg.get('minutes', 60))}\n• 📅 Semanal: ${cfg_s['price']}\n• 📆 Mensual: ${cfg_m['price']}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        keyboard = [[InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")], [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]]
+        await query.edit_message_text(f"📋 *Panel FREE - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; message = query.message if query else update.message
+    if query: await query.answer()
+    group_id = context.user_data.get('current_group')
+    if not group_id: await message.reply_text("❌ Selecciona un grupo con /start"); return
+    users = await db.get_all_active_users(group_id)
+    if not users: await message.reply_text("📭 No hay usuarios activos"); return
+    msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
+    now = datetime.now(ZoneInfo("UTC"))
+    for user in users[:30]:
+        end_date = user['end_date']; remaining = end_date - now
+        total_mins = max(0, int(remaining.total_seconds() / 60)); days_left = total_mins // 1440
+        emoji = "🟢" if days_left > 7 else "🟡" if days_left > 1 else "🔴"
+        expiry_text = f"{total_mins} min" if total_mins < 60 else f"{days_left} días"
+        first_name = escape_md_v2(user.get('first_name', '') or 'Sin nombre')
+        username = user.get('username', '')
+        safe_username = escape_md_v2(username) if username and not username.startswith('user_') else ''
+        display = f"{first_name} (@{safe_username})" if safe_username else f"{first_name} (ID: `{user['user_id']}`)"
+        chat_link = f"tg://user?id={user['user_id']}"
+        msg += f"{emoji} {display}\n   📅 Expira: {fmt_dt(end_date)} ({expiry_text})\n   🔗 [Abrir chat]({chat_link})\n\n"
+    if len(users) > 30: msg += f"\n📌 *Mostrando 30 de {len(users)} usuarios.*"
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; message = query.message if query else update.message
+    if query: await query.answer()
+    group_id = context.user_data.get('current_group')
+    if not group_id: await message.reply_text("❌ Selecciona un grupo con /start"); return
+    earnings = await db.get_monthly_earnings(group_id)
+    now = datetime.now(EC_TZ)
+    msg = f"💰 *GANANCIAS DE {now.strftime('%B %Y').upper()}*\n\n"
+    if not earnings['summary']: msg += "📭 No hay ventas"
+    else:
+        for plan in earnings['summary']:
+            plan_name = PLANS.get(plan['plan'], {}).get('name', plan['plan'])
+            msg += f"• {plan_name}: {plan['count']} ventas - {fmt_price(plan['total'])}\n"
+        msg += f"\n💵 *TOTAL*: {fmt_price(earnings['total'])}\n👥 *Nuevos*: {earnings['new_users']}"
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; message = query.message if query else update.message
+    if query: await query.answer()
+    group_id = context.user_data.get('current_group')
+    if not group_id: return
+    transactions = await db.get_export_data(group_id)
+    if not transactions: await message.reply_text("📭 No hay transacciones"); return
+    output = StringIO()
+    try:
+        writer = csv.writer(output)
+        writer.writerow(['Fecha', 'User ID', 'Username', 'Nombre', 'Plan', 'Monto USD'])
+        for t in transactions:
+            writer.writerow([fmt_dt(t['payment_date']), t['user_id'], t['username'] or '', t['first_name'] or '', t['plan'].upper(), f"{float(t['amount']):.2f}"])
+        output.seek(0)
+        await message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"reporte_{datetime.now(EC_TZ).strftime('%Y%m%d')}.csv", caption="📊 Reporte de ventas")
+    finally: output.close()
+
+async def list_potential_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    group_id = context.user_data.get('current_group')
+    if not group_id: return
+    count_month, count_last_month, total_all = await db.get_potential_clients_stats(group_id)
+    msg = (f"📋 *CLIENTES POTENCIALES*\n\n📅 *Este mes:* {count_month}\n📆 *Mes anterior:* {count_last_month}\n📊 *Total histórico:* {total_all}")
+    await query.edit_message_text(msg, parse_mode="Markdown")
+
+async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    group_id = context.user_data.get('current_group')
+    if not group_id: return
+    clients = await db.get_potential_clients_list(group_id)
+    if not clients: await query.edit_message_text("📭 No hay clientes"); return
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['User ID', 'Username', 'Nombre', 'Fecha Registro'])
+    for c in clients: writer.writerow([c['user_id'], c['username'] or '', c['first_name'] or '', fmt_dt(c['created_at'])])
+    output.seek(0)
+    await query.message.reply_document(document=output.getvalue().encode('utf-8-sig'), filename=f"clientes_{datetime.now(EC_TZ).strftime('%Y%m%d')}.csv", caption="📋 Clientes potenciales")
+    output.close()
+
+async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; message = query.message if query else update.message
+    if query: await query.answer()
+    with GROUPS_LOCK:
+        if not GROUPS: await message.reply_text("📭 No hay grupos"); return
+        msg = "📊 *GRUPOS CONFIGURADOS*\n\n"
+        for group in GROUPS.values():
+            msg += f"📌 *{group['group_name']}*\n   🆔 ID: `{group['group_id']}`\n   📋 Tipo: {group.get('type', 'VIP')}\n\n"
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 4: await update.message.reply_text('❌ Uso: `/addgroup group_id TIPO "nombre" admin_id`', parse_mode="Markdown"); return
+    try:
+        group_id = int(context.args[0]); group_type = context.args[1].upper(); group_name = " ".join(context.args[2:-1]).strip('"'); admin_id = int(context.args[-1])
+        if group_type not in ["VIP", "FREE"]: return
+        with GROUPS_LOCK: GROUPS[group_id] = {"group_id": group_id, "type": group_type, "group_name": group_name, "admin_id": admin_id, "settings": {}}
+        await db.save_group(group_id, group_name, admin_id, group_type)
+        await update.message.reply_text(f"✅ Grupo {group_name} agregado")
+    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+
+async def view_vip_groups(update: Update, context: ContextTypes.DEFAULT_TYPE): await show_groups_by_type(update, context, "VIP", True)
+async def view_free_groups(update: Update, context: ContextTypes.DEFAULT_TYPE): await show_groups_by_type(update, context, "FREE", True)
+
+async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_type: str, select_mode: bool = False):
+    query = update.callback_query; await query.answer()
+    with GROUPS_LOCK: groups = [g for g in GROUPS.values() if g.get("type", "VIP") == group_type]
+    if not groups: await query.edit_message_text(f"📭 No hay grupos {group_type}"); return
+    keyboard = [[InlineKeyboardButton(f"📌 {g['group_name']}", callback_data=f"select_group_{g['group_id']}")] for g in groups]
+    if select_mode: keyboard.append(_back_button("menu_view_groups"))
+    await query.edit_message_text(f"📋 *Grupos {group_type}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    await query.edit_message_text("📟 *Comandos:*\n• `/add @usuario plan`\n• `/info ID`\n• `/configdeuna ID link`\n• `/configcart ID minutos`", reply_markup=InlineKeyboardMarkup([_back_button("back_to_admin")]), parse_mode="Markdown")
+
+async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; message = query.message if query else update.message
+    if query: await query.answer()
+    group_id = context.user_data.get('current_group')
+    if not group_id: return
+    stats = await db.get_trial_stats(group_id)
+    msg = (f"📊 *ESTADÍSTICAS DE TRIAL*\n\n• 🆓 *Usaron trial:* {stats['total_trial_users']}\n• 🟢 *Trial activos:* {stats['active_count']}\n• 🔴 *Expirados:* {stats['expired_from_trial']}\n• 💰 *Convertidos:* {stats['converted_users']}\n")
+    if stats['total_trial_users'] > 0: msg += f"\n📈 *Tasa de conversión:* {(stats['converted_users'] / stats['total_trial_users']) * 100:.1f}%"
+    await message.reply_text(msg, parse_mode="Markdown")
+
+async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query; await query.answer()
+    if not can_manage_group(query.from_user.id, group_id): return
+    group = get_group_by_id(group_id)
+    if not group: return
+    keyboard = [
+        [InlineKeyboardButton("🎉 Bienvenida", callback_data=f"cfg_msg_edit_{group_id}_welcome")],
+        [InlineKeyboardButton("🚫 Rechazo", callback_data=f"cfg_msg_edit_{group_id}_rejection")],
+        [InlineKeyboardButton("🤖 Aviso Fuego", callback_data=f"cfg_msg_edit_{group_id}_fuego_notice")],
+        [InlineKeyboardButton("⏰ Expiración", callback_data=f"cfg_msg_edit_{group_id}_expired")],
+        [InlineKeyboardButton("🛒 Carrito Abandonado", callback_data=f"cfg_msg_edit_{group_id}_abandoned")],
+        _back_button(f"select_group_{group_id}"),
+    ]
+    await query.edit_message_text(f"📝 *Configurar Mensajes — {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, msg_type: str):
+    query = update.callback_query; await query.answer()
+    if msg_type != "channel_select" and not can_manage_group(query.from_user.id, group_id): return
+    context.user_data['config_msg_group_id'] = group_id; context.user_data['config_msg_type'] = msg_type; context.user_data['config_msg_step'] = 'text'
+    defaults = {"welcome": DEFAULT_WELCOME_MESSAGE, "rejection": DEFAULT_REJECTION_MESSAGE, "fuego_notice": DEFAULT_FUEGO_NOTICE, "expired": DEFAULT_EXPIRED_MESSAGE, "abandoned": DEFAULT_ABANDONED_CART_MESSAGE}
+    await query.edit_message_text(f"✏️ *Configurar mensaje de {msg_type}*\n\nEnvía el nuevo mensaje. Usa las variables entre `{{}}`.\n\n*Escribe 'default' para restaurar.*\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
+
+async def handle_message_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get('config_msg_step'); group_id = context.user_data.get('config_msg_group_id'); msg_type = context.user_data.get('config_msg_type')
+    if not step or not group_id or not msg_type: return
+    text = update.message.text.strip()
+    if text.lower() == 'cancelar':
+        for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
+        await update.message.reply_text("❌ Configuración cancelada"); return
+    if text.lower() == 'default': text = None
+    if msg_type == "welcome": await db.save_group_messages(group_id, welcome_msg=text)
+    elif msg_type == "rejection": await db.save_group_messages(group_id, rejection_msg=text)
+    elif msg_type == "fuego_notice": await db.save_group_messages(group_id, fuego_notice_msg=text)
+    elif msg_type == "expired": await db.save_group_messages(group_id, expired_msg=text)
+    elif msg_type == "abandoned": await db.save_group_messages(group_id, abandoned_cart_msg=text)
+    for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
+    await update.message.reply_text(f"✅ *Mensaje de {msg_type} actualizado*", parse_mode="Markdown")
+
+async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query; await query.answer()
+    warning_config = await db.get_warning_config(group_id)
+    enabled = warning_config.get("enabled", False)
+    status_emoji = "🟢" if enabled else "🔴"
+    keyboard = [[InlineKeyboardButton(f"{status_emoji} {'Desactivar' if enabled else 'Activar'} avisos", callback_data=f"warn_toggle_{group_id}")], _back_button(f"cfg_group_{group_id}")]
+    await query.edit_message_text(f"🔔 *Avisos de Trial*\n\nEstado: {status_emoji} *{'ACTIVADOS' if enabled else 'DESACTIVADOS'}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def toggle_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query; await query.answer()
+    warning_config = await db.get_warning_config(group_id)
+    warning_config["enabled"] = not warning_config.get("enabled", False)
+    await db.save_warning_config(group_id, warning_config)
+    await menu_warning_settings(update, context, group_id)
+
 async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
     await query.answer()
