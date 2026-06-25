@@ -283,20 +283,25 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, v
     group = get_group_by_id(group_id)
     deuna_link = group.get("settings", {}).get("deuna_link") if group else None
     keyboard = []
+    
+    # Botón 1: Ruleta
     if not spin_used:
         keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
     else:
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
     
+    # Botón 2: Link al VIP (sin la palabra Trial)
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
-        keyboard.append([InlineKeyboardButton("🔥 Únete al VIP (Trial)", url=vip_invite_link)])
+        keyboard.append([InlineKeyboardButton("🔥 Entrada al VIP", url=vip_invite_link)])
     
+    # Botón 3: Deuna
     if deuna_link and deuna_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("⚡ PAGAR CON DEUNA", url=deuna_link)])
     
-    keyboard.append([InlineKeyboardButton("💳 Info de Pago Completa", callback_data=f"pay_{group_id}_{user_id}")])
+    # Botón 4: Volver
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_start")])
+    
     return InlineKeyboardMarkup(keyboard)
-
 def get_payment_info_text(group_id: int) -> str:
     group = get_group_by_id(group_id)
     if not group:
@@ -4439,6 +4444,7 @@ CALLBACK_EXACT = {
     "broadcast_menu": lambda u, c, d: broadcast_menu_callback(u, c),
     "trial_stats": lambda u, c, d: trial_stats(u, c),
     "no_free_link": _handle_no_free_link,
+    "back_to_start": lambda u, c, d: start(u, c),
 }
 
 CALLBACK_PREFIXES = [
