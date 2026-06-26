@@ -2587,7 +2587,7 @@ async def _process_new_free_member(chat_id: int, user_id: int, username: str, fi
     chat_link = f"tg://user?id={user_id}"
     is_new = await db.register_free_user(chat_id, user_id, username, first_name, source)
     if is_new:
-        await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})", parse_mode="Markdown")
+                await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🌍 *Origen:* {source}\n🔗 [Abrir chat]({chat_link})", parse_mode="Markdown")
     return is_new
 
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
