@@ -2572,7 +2572,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 keyboard.append([InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
             
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-                        await _safe_send(group["admin_id"], f"🆕 *Nuevo usuario VIP (Acceso Directo)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🌍 *Origen:* {source}\n⏱ *Trial:* {trial_str}\n📅 *Expira:* {expiry_str} (EC)\n\n💡 *Para activar pago:* Responde con `/add {user_id} mensual`", parse_mode="Markdown")
+                    await _safe_send(group["admin_id"], f"🆕 *Nuevo usuario VIP (Acceso Directo)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🌍 *Origen:* {source}\n⏱ *Trial:* {trial_str}\n📅 *Expira:* {expiry_str} (EC)\n\n💡 *Para activar pago:* Responde con `/add {user_id} mensual`", parse_mode="Markdown")
         elif result_code == "activo":
             logger.info(f"✅ Reingreso permitido: {display} en {group['group_name']} — expira {end_date}")
         return True
