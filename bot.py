@@ -1116,13 +1116,20 @@ async def check_abandoned_cart(user_id: int, group_id: int):
     user = await db.get_user_by_id(user_id, group_id)
     if not user: return
     if user.get('status') == 'active' and user.get('plan') != 'trial': return
+    
     group = get_group_by_id(group_id)
     if not group: return
-    custom = await db.get_group_messages(group_id)
-    cart_msg = custom.get('abandoned_cart_message') if custom else "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra a tu suscripción. ¡Escríbeme para ayudarte!"
+    
+    # Leemos el mensaje directamente de la configuración del grupo
+    cart_msg = group.get("settings", {}).get("abandoned_cart_message")
+    if not cart_msg:
+        cart_msg = "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra a tu suscripción. ¡Escríbeme para ayudarte!"
+        
     cart_msg = format_message(cart_msg, {'group_name': group.get('group_name', 'VIP')})
-    try: await bot_app.bot.send_message(user_id, cart_msg, reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
-    except Exception as e: logger.warning(f"Cart msg failed to {user_id}: {e}")
+    try: 
+        await bot_app.bot.send_message(user_id, cart_msg, reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
+    except Exception as e: 
+        logger.warning(f"Cart msg failed to {user_id}: {e}")
 
 async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2: await update.message.reply_text("❌ Uso: `/configdeuna group_id link`", parse_mode="Markdown"); return
@@ -4381,9 +4388,7 @@ CALLBACK_PREFIXES = [
     ("multi_name_", lambda u, c, d: multi_name_request(u, c, int(d.replace("multi_name_", "")))),
     ("multi_admin_", lambda u, c, d: multi_admin_request(u, c, int(d.replace("multi_admin_", "")))),
     ("multi_type_", lambda u, c, d: multi_type_request(u, c, int(d.replace("multi_type_", "")))),
-    ("multi_set_type_", lambda u, c, d: ( 
-        lambda parts: multi_set_type(u, c, int(parts[0]), parts[1])
-    )(d.replace("multi_set_type_", "").rsplit("_", 1)))
+    ("multi_set_type_", lambda u, c, d: multi_set_type(u, c, int(d.split("_")[3]), d.split("_")[4])),
     ("edit_multiple_", lambda u, c, d: edit_group_multiple(u, c, int(d.replace("edit_multiple_", "")))),
     ("cfg_group_", lambda u, c, d: menu_group_settings(u, c, int(d.replace("cfg_group_", "")))),
     ("cfg_trial_", lambda u, c, d: cfg_trial_request(u, c, int(d.replace("cfg_trial_", "")))),
@@ -4414,7 +4419,6 @@ CALLBACK_PREFIXES = [
     ("cfg_deuna_", lambda u, c, d: cfg_deuna_request(u, c, int(d.replace("cfg_deuna_", "")))),
     ("cfg_cart_", lambda u, c, d: cfg_cart_request(u, c, int(d.replace("cfg_cart_", "")))),
 ]
-
 async def show_channel_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
     await query.answer()
