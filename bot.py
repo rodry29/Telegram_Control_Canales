@@ -1290,33 +1290,6 @@ async def show_channel_menu(send_func, user_id: int, channel: dict):
     await send_func(desc, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # ==================== FUNCIONES DEL PANEL DE ADMINISTRACIÓN ====================
-async def _handle_back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query
-    await query.answer()
-    try: await query.message.delete()
-    except: pass
-    await start(update, context)
-
-async def _handle_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query
-    await query.answer("💳 Enviando datos de pago...")
-    parts = data.split("_")
-    if len(parts) >= 3:
-        pay_group_id = int(parts[1]); pay_user_id = int(parts[2])
-        if query.from_user.id == pay_user_id: await send_payment_info(context.bot, pay_user_id, pay_group_id, triggered_by="botón Pagar")
-        else: await query.answer("❌ Este botón no es para ti", show_alert=True)
-
-async def _handle_add_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query; await query.answer()
-    await query.message.reply_text("📝 Usa: `/add @username plan` o `/add ID plan`", parse_mode="Markdown")
-
-async def _handle_add_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query; await query.answer()
-    await query.message.reply_text('📝 Usa: `/addgroup group_id TIPO "nombre" admin_id`', parse_mode="Markdown")
-
-async def _handle_no_free_link(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    await update.callback_query.answer("❌ El admin no ha configurado el link del canal", show_alert=True)
-
 async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query; await query.answer()
     if not can_manage_group(query.from_user.id, group_id): return
@@ -1335,59 +1308,6 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
         _back_button(f"select_group_{group_id}"),
     ]
     await query.edit_message_text(f"📝 *Configurar Mensajes — {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, msg_type: str):
-    query = update.callback_query; await query.answer()
-    if msg_type != "channel_select" and not can_manage_group(query.from_user.id, group_id): return
-    context.user_data['config_msg_group_id'] = group_id; context.user_data['config_msg_type'] = msg_type; context.user_data['config_msg_step'] = 'text'
-    defaults = {
-        "welcome": DEFAULT_WELCOME_MESSAGE,
-        "rejection": DEFAULT_REJECTION_MESSAGE,
-        "fuego_notice": DEFAULT_FUEGO_NOTICE,
-        "expired": DEFAULT_EXPIRED_MESSAGE,
-        "abandoned": "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra."
-    }
-    await query.edit_message_text(f"✏️ *Configurar mensaje de {msg_type}*\n\nEnvía el nuevo mensaje. Usa las variables entre `{{}}`.\n\n*Escribe 'default' para restaurar.*\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
-
-async def handle_message_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get('config_msg_step'); group_id = context.user_data.get('config_msg_group_id'); msg_type = context.user_data.get('config_msg_type')
-    if not step or not group_id or not msg_type: return
-    text = update.message.text.strip()
-    if text.lower() == 'cancelar':
-        for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
-        await update.message.reply_text("❌ Configuración cancelada"); return
-    if text.lower() == 'default': text = None
-    if msg_type == "welcome": await db.save_group_messages(group_id, welcome_msg=text)
-    elif msg_type == "rejection": await db.save_group_messages(group_id, rejection_msg=text)
-    elif msg_type == "fuego_notice": await db.save_group_messages(group_id, fuego_notice_msg=text)
-    elif msg_type == "expired": await db.save_group_messages(group_id, expired_msg=text)
-    elif msg_type == "abandoned":
-        group = get_group_by_id(group_id)
-        if group:
-            settings = dict(group.get("settings", {}))
-            settings['abandoned_cart_message'] = text
-            with GROUPS_LOCK:
-                g = GROUPS.get(group_id)
-                if g:
-                    g["settings"] = settings
-            await db.update_group_fields(group_id, {'settings': settings})
-        for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
-        await update.message.reply_text(f"✅ *Mensaje de {msg_type} actualizado*", parse_mode="Markdown")
-
-async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    query = update.callback_query; await query.answer()
-    warning_config = await db.get_warning_config(group_id)
-    enabled = warning_config.get("enabled", False)
-    status_emoji = "🟢" if enabled else "🔴"
-    keyboard = [[InlineKeyboardButton(f"{status_emoji} {'Desactivar' if enabled else 'Activar'} avisos", callback_data=f"warn_toggle_{group_id}")], _back_button(f"cfg_group_{group_id}")]
-    await query.edit_message_text(f"🔔 *Avisos de Trial*\n\nEstado: {status_emoji} *{'ACTIVADOS' if enabled else 'DESACTIVADOS'}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-async def toggle_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    query = update.callback_query; await query.answer()
-    warning_config = await db.get_warning_config(group_id)
-    warning_config["enabled"] = not warning_config.get("enabled", False)
-    await db.save_warning_config(group_id, warning_config)
-    await menu_warning_settings(update, context, group_id)
 
 async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
@@ -2904,6 +2824,9 @@ async def handle_message_config_input(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("❌ Configuración cancelada")
         return
 
+    # Delegamos la lógica de guardado a la nueva función
+    await save_configured_message(update, context, text, msg_type, group_id)
+
     if text.lower() == 'default':
         text = None
 
@@ -2922,12 +2845,78 @@ async def handle_message_config_input(update: Update, context: ContextTypes.DEFA
         await db.save_group_messages(group_id, fuego_notice_msg=text)
     elif msg_type == "expired":
         await db.save_group_messages(group_id, expired_msg=text)
+    elif msg_type == "abandoned":
+        # Guardar en settings del grupo (no en group_messages)
+        group = get_group_by_id(group_id)
+        if group:
+            settings = dict(group.get("settings", {}))
+            settings['abandoned_cart_message'] = text
+            with GROUPS_LOCK:
+                g = GROUPS.get(group_id)
+                if g:
+                    g["settings"] = settings
+            await db.update_group_fields(group_id, {'settings': settings})
 
     for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'):
         context.user_data.pop(k, None)
 
     await update.message.reply_text(
         f"✅ *Mensaje de {msg_type} actualizado*\n\n📋 Grupo: `{group_id}`\n\nEl mensaje se usará a partir de ahora.",
+        parse_mode="Markdown"
+    )
+
+async def save_configured_message(update, context, text, msg_type, group_id):
+    # Normalizar
+    text = None if text and text.lower().strip() == 'default' else text
+
+    # Función helper asíncrona específica para el carrito abandonado
+    async def save_abandoned():
+        group = get_group_by_id(group_id)
+        if group:
+            settings = dict(group.get("settings", {}))
+            settings['abandoned_cart_message'] = text
+            with GROUPS_LOCK:
+                g = GROUPS.get(group_id)
+                if g:
+                    g["settings"] = settings
+            await db.update_group_fields(group_id, {'settings': settings})
+
+    # Mapeo unificado
+    handlers = {
+        "welcome": lambda: db.save_group_messages(group_id, welcome_msg=text),
+        "rejection": lambda: db.save_group_messages(group_id, rejection_msg=text),
+        "channel_select": lambda: db.save_global_message('channel_select_message', text),
+        "channel_description": lambda: db.save_group_messages(group_id, channel_desc=text),
+        "vip_menu": lambda: db.save_group_messages(group_id, vip_menu_msg=text),
+        "fuego_notice": lambda: db.save_group_messages(group_id, fuego_notice_msg=text),
+        "expired": lambda: db.save_group_messages(group_id, expired_msg=text),
+        "abandoned": save_abandoned,  # ← Usamos la función helper asíncrona
+    }
+
+    handler = handlers.get(msg_type)
+    if not handler:
+        await update.message.reply_text("❌ Tipo de mensaje no reconocido.")
+        return
+
+    try:
+        await handler()
+    except Exception as e:
+        logger.error(f"Error guardando mensaje {msg_type} para grupo {group_id}: {e}")
+        await update.message.reply_text(
+            "❌ No se pudo guardar el mensaje. Intenta de nuevo más tarde."
+        )
+        return
+
+    # Limpiar estado solo si todo salió bien
+    for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'):
+        context.user_data.pop(k, None)
+
+    # Escapar para Markdown
+    safe_type = msg_type.replace('_', r'\_')
+    await update.message.reply_text(
+        f"✅ *Mensaje de {safe_type} actualizado*\n\n"
+        f"📋 Grupo: `{group_id}`\n\n"
+        f"El mensaje se usará a partir de ahora.",
         parse_mode="Markdown"
     )
 
@@ -4487,9 +4476,16 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     group = get_group_by_id(group_id) if group_id != 0 else None
-    if group_id != 0 and not group:
-        await query.edit_message_text("❌ Grupo no encontrado")
-        return
+    # Verificación de permisos
+    if group_id == 0:
+        # Mensajes globales: solo Super Admin o Extra Admins
+        if query.from_user.id not in [SUPER_ADMIN_ID] + EXTRA_ADMINS:
+            await query.edit_message_text("❌ Solo Super Admin puede editar mensajes globales")
+            return
+    elif msg_type != "channel_select":
+        if not can_manage_group(query.from_user.id, group_id):
+            await query.edit_message_text("❌ No autorizado")
+            return
     _clear_input_states(context)
     context.user_data['config_msg_group_id'] = group_id
     context.user_data['config_msg_type'] = msg_type
