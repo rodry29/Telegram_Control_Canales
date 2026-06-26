@@ -2016,28 +2016,34 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     message = query.message if query else update.message
-    if query:
-        await query.answer()
+    if query: await query.answer()
     group_id = context.user_data.get('current_group')
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
         return
-    earnings = await db.get_monthly_earnings(group_id)
-    now = datetime.now(EC_TZ)
-    msg = f"💰 *GANANCIAS DE {now.strftime('%B %Y').upper()}*\n\n"
-    if not earnings['summary']:
-        msg += "📭 No hay ventas"
-    else:
-        for plan in earnings['summary']:
-            plan_name = PLANS.get(plan['plan'], {}).get('name', plan['plan'])
-            msg += f"• {plan_name}: {plan['count']} ventas - {fmt_price(plan['total'])}\n"
-        msg += f"\n💵 *TOTAL*: {fmt_price(earnings['total'])}\n👥 *Nuevos*: {earnings['new_users']}"
-    if earnings.get('recent'):
-        msg += "\n\n📋 *Últimos pagos:*\n"
-        for p in earnings['recent']:
-            name = p['first_name'] or p['username'] or f"ID:{p['user_id']}"
-            dur_str = f" ({fmt_minutes(p['duration_minutes'])})" if p.get('duration_minutes') else ""
-            msg += f"• {name} - {p['plan']}{dur_str} - {fmt_price(p['amount'])}\n"
+
+    now = datetime.now(ZoneInfo("UTC"))
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    def _get_stats(conn):
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s", (group_id, start_today))
+            today = cur.fetchone()
+            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s", (group_id, start_week))
+            week = cur.fetchone()
+            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s", (group_id, start_month))
+            month = cur.fetchone()
+            return today, week, month
+
+    today, week, month = await db._run(_get_stats)
+
+    msg = f"💰 *RESUMEN DE GANANCIAS*\n\n"
+    msg += f"📅 *Hoy:*\n• Ventas: {today['count']}\n• Total: *{fmt_price(today['total'])}*\n\n"
+    msg += f"📆 *Esta Semana:*\n• Ventas: {week['count']}\n• Total: *{fmt_price(week['total'])}*\n\n"
+    msg += f"🗓 *Este Mes:*\n• Ventas: {month['count']}\n• Total: *{fmt_price(month['total'])}*\n"
+
     await message.reply_text(msg, parse_mode="Markdown")
 
 async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2377,8 +2383,7 @@ async def export_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     message = query.message if query else update.message
-    if query:
-        await query.answer()
+    if query: await query.answer()
     group_id = context.user_data.get('current_group')
     if not group_id:
         await message.reply_text("❌ Selecciona un grupo con /start")
@@ -2387,28 +2392,40 @@ async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group or group.get("type") != "VIP":
         await message.reply_text("❌ Solo disponible en grupos VIP")
         return
-    stats = await db.get_trial_stats(group_id)
-    msg = (f"📊 *ESTADÍSTICAS DE TRIAL — {group['group_name']}*\n\n"
-           f"• 🆓 *Usaron trial:* {stats['total_trial_users']} personas\n"
-           f"• 🟢 *Trial activos ahora:* {stats['active_count']} personas\n"
-           f"• 🔴 *Expirados desde trial:* {stats['expired_from_trial']} personas\n"
-           f"• 💰 *Convertidos a pago:* {stats['converted_users']} personas\n")
-    if stats['active_trials']:
-        msg += "\n⏳ *TIEMPO RESTANTE POR USUARIO:*\n"
-        for trial in stats['active_trials']:
-            total_hours = float(trial['hours_left']) if trial['hours_left'] else 0
-            days = int(total_hours // 24)
-            hours = int(total_hours % 24)
-            mins = int((total_hours * 60) % 60)
-            name = trial['first_name'] or trial['username'] or f"ID:{trial['user_id']}"
-            username_str = f"@{trial['username']}" if trial['username'] and not str(trial['username']).startswith('user_') else f"ID:{trial['user_id']}"
-            time_left = f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
-            expiry_str = fmt_dt(trial['end_date'])
-            chat_link = f"tg://user?id={trial['user_id']}"
-            msg += f"\n👤 [{name}]({chat_link}) ({username_str})\n   ⏳ Tiempo restante: *{time_left}*\n   📅 Expira: {expiry_str}\n"
-    if stats['total_trial_users'] > 0:
-        conversion = (stats['converted_users'] / stats['total_trial_users']) * 100
-        msg += f"\n\n📈 *Tasa de conversión:* {conversion:.1f}%"
+
+    now = datetime.now(ZoneInfo("UTC"))
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    def _get_trial_stats(conn):
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_today))
+            t_today = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_week))
+            t_week = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_month))
+            t_month = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(DISTINCT u.user_id) as count FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0", (group_id,))
+            converted = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW()", (group_id,))
+            active = cur.fetchone()['count']
+            return t_today, t_week, t_month, converted, active
+
+    t_today, t_week, t_month, converted, active = await db._run(_get_trial_stats)
+
+    msg = f"📊 *ESTADÍSTICAS DE TRIAL — {group['group_name']}*\n\n"
+    msg += f"🆓 *Nuevos Trials (Ingresos)*\n"
+    msg += f"• 📅 Hoy: *{t_today}* personas\n"
+    msg += f"• 📆 Esta Semana: *{t_week}* personas\n"
+    msg += f"• 🗓 Este Mes: *{t_month}* personas\n\n"
+    msg += f"🔥 *Activos ahora:* {active} personas\n"
+    msg += f"💰 *Convertidos a pago (Histórico):* {converted} personas\n"
+    
+    if t_month > 0:
+        conversion = (converted / t_month) * 100
+        msg += f"\n📈 *Tasa de conversión (aprox mensual):* {conversion:.1f}%"
+
     keyboard = [_back_button(f"select_group_{group_id}")]
     if query:
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
