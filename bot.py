@@ -4471,12 +4471,7 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    if msg_type != "channel_select" and not can_manage_group(query.from_user.id, group_id):
-        await query.edit_message_text("❌ No autorizado")
-        return
-
-    group = get_group_by_id(group_id) if group_id != 0 else None
-    # Verificación de permisos
+    # 1. Verificación de permisos unificada (eliminamos el check viejo de arriba)
     if group_id == 0:
         # Mensajes globales: solo Super Admin o Extra Admins
         if query.from_user.id not in [SUPER_ADMIN_ID] + EXTRA_ADMINS:
@@ -4486,6 +4481,9 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         if not can_manage_group(query.from_user.id, group_id):
             await query.edit_message_text("❌ No autorizado")
             return
+
+    group = get_group_by_id(group_id) if group_id != 0 else None
+    
     _clear_input_states(context)
     context.user_data['config_msg_group_id'] = group_id
     context.user_data['config_msg_type'] = msg_type
@@ -4493,15 +4491,19 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
 
     current = await db.get_group_messages(group_id) if group_id != 0 else None
     current_msg = ""
+    
+    # 2. Agregamos 'abandoned' a los defaults
     defaults = {
         "welcome": DEFAULT_WELCOME_MESSAGE,
         "rejection": DEFAULT_REJECTION_MESSAGE,
         "channel_description": DEFAULT_CHANNEL_DESCRIPTION,
         "vip_menu": DEFAULT_VIP_MENU_MESSAGE,
         "fuego_notice": DEFAULT_FUEGO_NOTICE,
-        "expired": DEFAULT_EXPIRED_MESSAGE
+        "expired": DEFAULT_EXPIRED_MESSAGE,
+        "abandoned": "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra."
     }
     default_msg = defaults.get(msg_type, "")
+    
     key_map = {
         "welcome": "welcome_message",
         "rejection": "rejection_message",
@@ -4510,7 +4512,11 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         "fuego_notice": "fuego_notice_message",
         "expired": "expired_message"
     }
-    if current:
+
+    # 3. Lógica para leer el current_msg (manejando 'abandoned' que vive en settings)
+    if msg_type == "abandoned" and group:
+        current_msg = group.get("settings", {}).get("abandoned_cart_message", "") or ""
+    elif current:
         current_msg = current.get(key_map.get(msg_type, ''), '') or ''
 
     group_name = group['group_name'] if group else "Global"
@@ -4523,7 +4529,6 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         f"*Escribe 'cancelar' para cancelar.*",
         parse_mode="Markdown"
     )
-
 # ==================== MAIN ====================
 async def main():
     global bot_app
