@@ -4508,45 +4508,6 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="Markdown"
     )
 
-async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    query = update.callback_query
-    await query.answer()
-
-    if not can_manage_group(query.from_user.id, group_id):
-        await query.edit_message_text("❌ No autorizado")
-        return
-
-    group = get_group_by_id(group_id)
-    if not group:
-        await query.edit_message_text("❌ Grupo no encontrado")
-        return
-
-    current = await db.get_group_messages(group_id)
-
-    welcome_status = "✅ Configurado" if current and current.get('welcome_message') else "📋 Default"
-    rejection_status = "✅ Configurado" if current and current.get('rejection_message') else "📋 Default"
-    channel_desc_status = "✅ Configurado" if current and current.get('channel_description') else "📋 Default"
-    vip_menu_status = "✅ Configurado" if current and current.get('vip_menu_message') else "📋 Default"
-    fuego_status = "✅ Configurado" if current and current.get('fuego_notice_message') else "📋 Default"
-    expired_status = "✅ Configurado" if current and current.get('expired_message') else "📋 Default"
-
-    keyboard = [
-        [InlineKeyboardButton(f"🎉 Bienvenida ({welcome_status})", callback_data=f"cfg_msg_edit_{group_id}_welcome")],
-        [InlineKeyboardButton(f"🚫 Rechazo ({rejection_status})", callback_data=f"cfg_msg_edit_{group_id}_rejection")],
-        [InlineKeyboardButton(f"📌 Descripción Canal ({channel_desc_status})", callback_data=f"cfg_msg_edit_{group_id}_channel_description")],
-        [InlineKeyboardButton(f"🔥 Menú VIP ({vip_menu_status})", callback_data=f"cfg_msg_edit_{group_id}_vip_menu")],
-        [InlineKeyboardButton(f"🤖 Aviso Fuego ({fuego_status})", callback_data=f"cfg_msg_edit_{group_id}_fuego_notice")],
-        [InlineKeyboardButton(f"⏰ Expiración ({expired_status})", callback_data=f"cfg_msg_edit_{group_id}_expired")],
-        _back_button(f"select_group_{group_id}"),
-    ]
-
-    await query.edit_message_text(
-        f"📝 *Configurar Mensajes — {group['group_name']}*\n\n"
-        f"Selecciona qué mensaje editar:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
 # ==================== MAIN ====================
 async def main():
     global bot_app
