@@ -4398,7 +4398,9 @@ CALLBACK_PREFIXES = [
     ("multi_name_", lambda u, c, d: multi_name_request(u, c, int(d.replace("multi_name_", "")))),
     ("multi_admin_", lambda u, c, d: multi_admin_request(u, c, int(d.replace("multi_admin_", "")))),
     ("multi_type_", lambda u, c, d: multi_type_request(u, c, int(d.replace("multi_type_", "")))),
-    ("multi_set_type_", lambda u, c, d: multi_set_type(u, c, int(d.split("_")[3]), d.split("_")[4])),
+    ("multi_set_type_", lambda u, c, d: (
+        lambda suffix: multi_set_type(u, c, int(suffix.rsplit("_", 1)[0]), suffix.rsplit("_", 1)[1])
+    )(d.replace("multi_set_type_", ""))),
     ("edit_multiple_", lambda u, c, d: edit_group_multiple(u, c, int(d.replace("edit_multiple_", "")))),
     ("cfg_group_", lambda u, c, d: menu_group_settings(u, c, int(d.replace("cfg_group_", "")))),
     ("cfg_trial_", lambda u, c, d: cfg_trial_request(u, c, int(d.replace("cfg_trial_", "")))),
