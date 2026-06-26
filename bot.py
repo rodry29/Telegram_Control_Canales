@@ -5,6 +5,7 @@ import logging
 import re
 import json
 import threading
+import random
 from io import StringIO
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Callable
@@ -3596,12 +3597,17 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Grupo no válido", show_alert=True)
         return
 
+    # Verificar si ya está procesando
     async with _SPINNING_LOCK:
         if (user_id, group_id) in _SPINNING:
             await query.answer("⏳ Procesando...", show_alert=True)
             return
         _SPINNING.add((user_id, group_id))
-   
+
+    # Obtener datos de spin FUERA del lock para no bloquear
+    try:
+        spin_data = await db.get_spin_data(user_id, group_id)
+
         if spin_data.get("spin_count", 0) >= 1:
             best = spin_data.get("best_discount", 0)
             chat_link = f"tg://user?id={user_id}"
@@ -3637,15 +3643,15 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        import random
         discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
         discount = random.choice(discounts)
         await db.record_spin(user_id, group_id, discount)
+
         for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
             try:
                 await query.edit_message_text(msg)
                 await asyncio.sleep(0.8)
-            except:
+            except Exception:
                 pass
 
         price_lines = _build_price_list(group_id, discounted_pct=discount)
@@ -3671,6 +3677,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💡 *Responde a este mensaje con /info para ver detalles.*",
             parse_mode="Markdown"
         )
+
     finally:
         async with _SPINNING_LOCK:
             _SPINNING.discard((user_id, group_id))
