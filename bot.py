@@ -1356,8 +1356,11 @@ async def handle_message_config_input(update: Update, context: ContextTypes.DEFA
     if group:
         settings = dict(group.get("settings", {}))
         settings['abandoned_cart_message'] = text
-        group["settings"] = settings
-    await db.update_group_fields(group_id, {'settings': settings})
+        with GROUPS_LOCK:
+            g = GROUPS.get(group_id)
+            if g:
+                g["settings"] = settings
+        await db.update_group_fields(group_id, {'settings': settings})
     for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
     await update.message.reply_text(f"✅ *Mensaje de {msg_type} actualizado*", parse_mode="Markdown")
 
