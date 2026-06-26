@@ -3264,7 +3264,7 @@ async def config_messages_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ Grupo no encontrado")
         return
 
-    valid_types = ["welcome", "rejection", "channel_description", "vip_menu", "fuego_notice", "expired"]
+    valid_types = ["welcome", "rejection", "channel_description", "vip_menu", "fuego_notice", "expired", "abandoned"]
     if msg_type not in valid_types:
         await update.message.reply_text(f"❌ Tipo inválido. Usa: {', '.join(valid_types)}")
         return
@@ -3281,7 +3281,8 @@ async def config_messages_command(update: Update, context: ContextTypes.DEFAULT_
         "channel_description": DEFAULT_CHANNEL_DESCRIPTION,
         "vip_menu": DEFAULT_VIP_MENU_MESSAGE,
         "fuego_notice": DEFAULT_FUEGO_NOTICE,
-        "expired": DEFAULT_EXPIRED_MESSAGE
+        "expired": DEFAULT_EXPIRED_MESSAGE,
+        "abandoned": "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra."
     }
     default_msg = defaults.get(msg_type, "")
 
