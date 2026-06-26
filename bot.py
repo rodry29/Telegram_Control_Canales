@@ -1352,17 +1352,17 @@ async def handle_message_config_input(update: Update, context: ContextTypes.DEFA
     elif msg_type == "fuego_notice": await db.save_group_messages(group_id, fuego_notice_msg=text)
     elif msg_type == "expired": await db.save_group_messages(group_id, expired_msg=text)
     elif msg_type == "abandoned":
-    group = get_group_by_id(group_id)
-    if group:
-        settings = dict(group.get("settings", {}))
-        settings['abandoned_cart_message'] = text
-        with GROUPS_LOCK:
-            g = GROUPS.get(group_id)
-            if g:
-                g["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
-    for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
-    await update.message.reply_text(f"✅ *Mensaje de {msg_type} actualizado*", parse_mode="Markdown")
+        group = get_group_by_id(group_id)
+        if group:
+            settings = dict(group.get("settings", {}))
+            settings['abandoned_cart_message'] = text
+            with GROUPS_LOCK:
+                g = GROUPS.get(group_id)
+                if g:
+                    g["settings"] = settings
+            await db.update_group_fields(group_id, {'settings': settings})
+        for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'): context.user_data.pop(k, None)
+        await update.message.reply_text(f"✅ *Mensaje de {msg_type} actualizado*", parse_mode="Markdown")
 
 async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query; await query.answer()
