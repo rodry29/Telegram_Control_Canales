@@ -3819,7 +3819,7 @@ async def toggle_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE, gr
 async def add_warning_step1(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
     await query.answer()
-     _clear_input_states(context)
+    _clear_input_states(context)
     if not can_manage_group(query.from_user.id, group_id):
         await query.answer("❌ No autorizado", show_alert=True)
         return
