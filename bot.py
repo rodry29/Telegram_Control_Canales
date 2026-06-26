@@ -434,7 +434,7 @@ class Database:
                         kicked_at TIMESTAMP DEFAULT NULL,
                         fuego_notice_sent BOOLEAN DEFAULT FALSE,
                         UNIQUE(user_id, group_id),
-                        source TEXT DEFAULT 'Directo',
+                        source TEXT DEFAULT 'Directo'
                     )
                 """)
                 cur.execute("""
