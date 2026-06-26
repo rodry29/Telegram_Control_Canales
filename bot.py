@@ -1326,6 +1326,8 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
     keyboard = [
         [InlineKeyboardButton("🎉 Bienvenida", callback_data=f"cfg_msg_edit_{group_id}_welcome")],
         [InlineKeyboardButton("🚫 Rechazo", callback_data=f"cfg_msg_edit_{group_id}_rejection")],
+        [InlineKeyboardButton("📌 Descripción Canal", callback_data=f"cfg_msg_edit_{group_id}_channel_description")],
+        [InlineKeyboardButton("🔥 Menú VIP", callback_data=f"cfg_msg_edit_{group_id}_vip_menu")],
         [InlineKeyboardButton("🤖 Aviso Fuego", callback_data=f"cfg_msg_edit_{group_id}_fuego_notice")],
         [InlineKeyboardButton("⏰ Expiración", callback_data=f"cfg_msg_edit_{group_id}_expired")],
         [InlineKeyboardButton("🛒 Msg. Carrito Abandonado", callback_data=f"cfg_msg_edit_{group_id}_abandoned")],
