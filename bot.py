@@ -2029,11 +2029,12 @@ async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _get_stats(conn):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s", (group_id, start_today))
+            # Usamos "amount > 0" para ignorar los trials gratuitos
+            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0", (group_id, start_today))
             today = cur.fetchone()
-            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s", (group_id, start_week))
+            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0", (group_id, start_week))
             week = cur.fetchone()
-            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s", (group_id, start_month))
+            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0", (group_id, start_month))
             month = cur.fetchone()
             return today, week, month
 
