@@ -4273,53 +4273,68 @@ async def check_expired_subscriptions():
     logger.info("🔍 Verificando suscripciones expiradas...")
     with GROUPS_LOCK:
         vip_groups = [g for g in GROUPS.values() if g.get("type", "VIP") == "VIP"]
+
+    # FIX-16: Limitar concurrencia para no agotar el pool de DB (max 5 grupos en paralelo)
+    sem = asyncio.Semaphore(5)
+
     async def _process_group(group: dict):
-        group_id = group["group_id"]
-        expired_users = await db.get_expired_users(group_id)
-        if not expired_users:
-            return
-        logger.info(f"Usuarios expirados en {group['group_name']}: {len(expired_users)}")
-        # UPDATE masivo primero para reducir N+1
-        user_ids = [u['user_id'] for u in expired_users]
-        updated_ids = await db.expire_users_batch(user_ids, group_id)
-        updated_ids_set = set(updated_ids)
-        if not updated_ids:
-            return
-        for user in expired_users:
-            if user['user_id'] not in updated_ids_set:
-                continue
-            user_id = user['user_id']
-            username = user.get('username') or ''
-            first_name = user.get('first_name') or ''
-            display = (first_name or (f"@{username}" if username and not username.startswith('user_') else f"ID:{user_id}"))
-            plan = user.get('plan', 'desconocido')
-            end_date = user.get('end_date')
-            expiry_str = fmt_dt(end_date) if end_date else "N/A"
-            chat_link = f"tg://user?id={user_id}"
-            kick_success = await _kick_user_with_retry(group_id, user_id)
-            status_emoji = "🚫" if kick_success else "⚠️"
-            action_text = ("expulsado del grupo" if kick_success
-                           else "marcado como expirado (expulsión fallida — acción manual requerida)")
-            await _safe_send(
-                group["admin_id"],
-                f"{status_emoji} *Suscripción expirada*\n\n"
-                f"👤 *Usuario:* [{display}]({chat_link})\n"
-                f"📋 *Plan:* {plan}\n"
-                f"📅 *Expiró:* {expiry_str} (hora Ecuador)\n"
-                f"📌 *Grupo:* {group['group_name']}\n\n"
-                f"✅ Usuario {action_text}.",
-                parse_mode="Markdown"
-            )
+        async with sem:
+            group_id = group["group_id"]
+            expired_users = await db.get_expired_users(group_id)
+            if not expired_users:
+                return
+            logger.info(f"Usuarios expirados en {group['group_name']}: {len(expired_users)}")
+            
+            # FIX-6: Una sola consulta de mensajes para todo el grupo
             custom = await db.get_group_messages(group_id)
-            expired_msg = DEFAULT_EXPIRED_MESSAGE
+            expired_msg_template = DEFAULT_EXPIRED_MESSAGE
             if custom and custom.get('expired_message'):
-                expired_msg = custom['expired_message']
-            expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
-            await _safe_send(
-                user_id,
-                expired_msg,
-                reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown"
-            )
+                expired_msg_template = custom['expired_message']
+            
+            # UPDATE masivo primero para reducir N+1
+            user_ids = [u['user_id'] for u in expired_users]
+            updated_ids = await db.expire_users_batch(user_ids, group_id)
+            updated_ids_set = set(updated_ids)
+            if not updated_ids:
+                return
+            
+            for user in expired_users:
+                if user['user_id'] not in updated_ids_set:
+                    continue
+                user_id = user['user_id']
+                username = user.get('username') or ''
+                first_name = user.get('first_name') or ''
+                display = (first_name or (f"@{username}" if username and not username.startswith('user_') else f"ID:{user_id}"))
+                plan = user.get('plan', 'desconocido')
+                end_date = user.get('end_date')
+                expiry_str = fmt_dt(end_date) if end_date else "N/A"
+                chat_link = f"tg://user?id={user_id}"
+                
+                kick_success = await _kick_user_with_retry(group_id, user_id)
+                status_emoji = "🚫" if kick_success else "⚠️"
+                action_text = ("expulsado del grupo" if kick_success
+                               else "marcado como expirado (expulsión fallida — acción manual requerida)")
+                
+                await _safe_send(
+                    group["admin_id"],
+                    f"{status_emoji} *Suscripción expirada*\n\n"
+                    f"👤 *Usuario:* [{display}]({chat_link})\n"
+                    f"📋 *Plan:* {plan}\n"
+                    f"📅 *Expiró:* {expiry_str} (hora Ecuador)\n"
+                    f"📌 *Grupo:* {group['group_name']}\n\n"
+                    f"✅ Usuario {action_text}.",
+                    parse_mode="Markdown"
+                )
+                
+                # Usamos directamente el template calculado fuera del loop
+                expired_msg = format_message(expired_msg_template, {'group_name': group['group_name']})
+                await _safe_send(
+                    user_id,
+                    expired_msg,
+                    reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown"
+                )
+
+    # Usamos return_exceptions=True para que un grupo fallido no detenga a los demás
     results = await asyncio.gather(*[_process_group(g) for g in vip_groups], return_exceptions=True)
     for group, result in zip(vip_groups, results):
         if isinstance(result, Exception):
