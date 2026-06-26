@@ -3661,7 +3661,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]),
             parse_mode="Markdown"
         )
-                # Alerta al Admin
+        # Alerta al Admin
         await _safe_send(
             group["admin_id"],
             f"🎰 *ALERTA DE RULETA VIP*\n\n"
