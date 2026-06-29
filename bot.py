@@ -188,6 +188,12 @@ def escape_md_v2(text: str) -> str:
         text = text.replace(ch, '\\' + ch)
     return text
 
+def safe_name(text: str) -> str:
+    """Sanitiza texto para Markdown v1 (parse_mode='Markdown')."""
+    if not text:
+        return ""
+    return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
+
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
     if h >= 24:
@@ -369,6 +375,20 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
         return True
     except Exception as e:
         logger.warning(f"No se pudo enviar info de pago a {user_id}: {e}")
+
+        # Programar Carrito Abandonado
+        cart_delay = group.get("settings", {}).get("cart_delay_minutes", 30)
+        run_date = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=cart_delay)
+        try:
+            scheduler.add_job(
+                check_abandoned_cart, 'date',
+                run_date=run_date,
+                args=[user_id, group_id],
+                id=f"cart_{user_id}_{group_id}",
+                replace_existing=True
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo programar carrito abandonado para {user_id}: {e}")
         return False
 
 # ==================== BASE DE DATOS ====================
@@ -383,19 +403,31 @@ class Database:
             logger.info("✅ Connection pool creado (min=2, max=15)")
         return self._pool
 
-    def _execute(self, func):
+    def _execute(self, func, retries=2):
         p = self._get_pool()
-        conn = p.getconn()
-        try:
-            conn.autocommit = False
-            result = func(conn)
-            conn.commit()
-            return result
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            p.putconn(conn)
+        last_error = None
+        for attempt in range(retries + 1):
+            conn = p.getconn()
+            try:
+                conn.autocommit = False
+                result = func(conn)
+                conn.commit()
+                p.putconn(conn)
+                return result
+            except psycopg2.OperationalError as e:
+                conn.rollback()
+                p.putconn(conn, close=True)  # ← descartar conexión corrupta
+                last_error = e
+                if attempt < retries:
+                    import time
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise last_error
+            except Exception as e:
+                conn.rollback()
+                p.putconn(conn)  # ← devolver conexión sana
+                raise
+        raise last_error
 
     async def _run(self, func):
         return await asyncio.to_thread(self._execute, func)
@@ -596,11 +628,18 @@ class Database:
                     return True, "trial_nuevo", end_date
                 cur.execute("UPDATE users SET username=%s, first_name=%s, source=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (username, first_name, source, user_id, group_id))
                 existing_end = normalize_dt(existing["end_date"])
-                if existing["status"] == "active" and existing_end > now:
-                    cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
+                if existing_end > now:
+                    if existing["status"] != "active":
+                        cur.execute("UPDATE users SET status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+                    else:
+                        cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
                     return True, "activo", existing["end_date"]
-                if existing_end <= now: return False, "expirado", None
-                if existing.get("trial_used"): return False, "sin_trial", None
+
+                if existing_end <= now: 
+                    return False, "expirado", None
+
+                if existing.get("trial_used"): 
+                    return False, "sin_trial", None
                 end_date = now + timedelta(minutes=trial_minutes)
                 cur.execute("""UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s""", (now, end_date, user_id, group_id))
                 cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
@@ -611,14 +650,16 @@ class Database:
         def _reg(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM users WHERE user_id=%s AND group_id=%s", (user_id, chat_id))
-                if cur.fetchone(): return False
-                # Insertamos con el source
+                if cur.fetchone():
+                    return False
                 cur.execute("""
                     INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used, source)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (user_id, group_id) DO NOTHING
                 """, (user_id, chat_id, username, first_name, "FREE",
-                      datetime.now(ZoneInfo("UTC")), datetime.now(ZoneInfo("UTC")) + timedelta(days=365), "potencial", False, source))
+                      datetime.now(ZoneInfo("UTC")),
+                      datetime.now(ZoneInfo("UTC")) + timedelta(days=365),
+                      "potencial", False, source))
                 return True
         return await self._run(_reg)
 
@@ -632,7 +673,8 @@ class Database:
         config = get_group_plan_config(group_id, plan)
         effective_price = custom_price if custom_price is not None else config.get('price', 0)
         effective_days = custom_days if custom_days is not None else config.get('days', 7)
-        effective_mins = config.get('minutes', effective_days * 1440)
+        if plan == "trial":
+            effective_mins = config.get('minutes', 1440)
         now = datetime.now(ZoneInfo("UTC"))
 
         def _upsert(conn):
@@ -1115,7 +1157,9 @@ async def _safe_send(chat_id: int, text: str, **kwargs):
 async def check_abandoned_cart(user_id: int, group_id: int):
     user = await db.get_user_by_id(user_id, group_id)
     if not user: return
-    if user.get('status') == 'active' and user.get('plan') != 'trial': return
+    # Si tiene cualquier plan pagado activo, no enviar
+    if user.get('status') == 'active' and user.get('plan') not in ('trial', 'FREE'):
+        return
     
     group = get_group_by_id(group_id)
     if not group: return
@@ -1132,8 +1176,19 @@ async def check_abandoned_cart(user_id: int, group_id: int):
         logger.warning(f"Cart msg failed to {user_id}: {e}")
 
 async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2: await update.message.reply_text("❌ Uso: `/configdeuna group_id link`", parse_mode="Markdown"); return
-    group_id = int(context.args[0]); link = context.args[1].strip()
+    if len(context.args) < 2: 
+        await update.message.reply_text("❌ Uso: `/configdeuna group_id link`", parse_mode="Markdown"); 
+        return
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido")
+        return
+    if not can_manage_group(update.effective_user.id, group_id):
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    link = context.args[1].strip()
     if not link.startswith("https://"): await update.message.reply_text("❌ El link debe empezar con https://"); return
     with GROUPS_LOCK:
         group = GROUPS.get(group_id)
@@ -1143,12 +1198,33 @@ async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("✅ Link Deuna guardado.")
 
 async def config_cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2: await update.message.reply_text("❌ Uso: `/configcart group_id minutos`", parse_mode="Markdown"); return
-    group_id = int(context.args[0]); minutes = int(context.args[1])
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Uso: `/configcart group_id minutos`", parse_mode="Markdown")
+        return
+    
+    try:
+        group_id = int(context.args[0])
+        minutes = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ IDs o minutos inválidos")
+        return
+    
+    if not can_manage_group(update.effective_user.id, group_id):
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    if minutes <= 0:
+        await update.message.reply_text("❌ Los minutos deben ser positivos")
+        return
+    
     with GROUPS_LOCK:
         group = GROUPS.get(group_id)
-        if group:
-            settings = dict(group.get("settings", {})); settings['cart_delay_minutes'] = minutes; group["settings"] = settings
+        if not group:
+            await update.message.reply_text("❌ Grupo no encontrado")
+            return
+        settings = dict(group.get("settings", {}))
+        settings['cart_delay_minutes'] = minutes
+        group["settings"] = settings
     await db.update_group_fields(group_id, {'settings': settings})
     await update.message.reply_text(f"✅ Carrito abandonado configurado a {minutes} minutos.")
 
@@ -1365,7 +1441,13 @@ async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, v
 async def vip_spin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     # Wrapper para spin_discount con callback diferente
     query = update.callback_query
-    query.data = f"spin_{vip_group_id}_{query.from_user.id}"
+    user_id = query.from_user.id
+    group = get_group_by_id(vip_group_id)
+    if not group or group.get("type", "VIP") != "VIP":
+        await query.answer("❌ Grupo no válido", show_alert=True)
+        return
+    # Llamar a spin_discount con datos sintéticos
+    query.data = f"spin_{vip_group_id}_{user_id}"
     await spin_discount(update, context)
 
 # ==================== HANDLERS ====================
@@ -1908,15 +1990,12 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = f"📊 *USUARIOS ACTIVOS* ({len(users)})\n\n"
     
-    # Obtenemos la fecha actual SIN zona horaria para evitar el conflicto
-    now = datetime.utcnow()
+    now = now_utc()
         
     for user in users[:30]:
         end_date = user['end_date']
-        
-        # Si la fecha de la BD trae zona horaria, se la quitamos
-        if end_date.tzinfo is not None:
-            end_date = end_date.replace(tzinfo=None)
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=ZoneInfo("UTC"))
             
         remaining = end_date - now
         total_mins = max(0, int(remaining.total_seconds() / 60))
@@ -1926,7 +2005,7 @@ async def list_active_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         first_name = escape_md_v2(user.get('first_name', '') or 'Sin nombre')
         username = user.get('username', '')
         safe_username = escape_md_v2(username) if username and not username.startswith('user_') else ''
-        display = f"{first_name} (@{safe_username})" if safe_username else f"{first_name} (ID: `{user['user_id']}`)"
+        display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user['user_id']}"))
         chat_link = f"tg://user?id={user['user_id']}"
         msg += f"{emoji} {display}\n   📅 Expira: {fmt_dt(end_date)} ({expiry_text})\n   🔗 [Abrir chat]({chat_link})\n\n"
     if len(users) > 30:
@@ -2093,6 +2172,13 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
                     existing = get_group_by_id(group_id)
                     if existing:
+                        if existing['admin_id'] != admin_id and update.effective_user.id != SUPER_ADMIN_ID:
+                            logger.warning(
+                                f"Restore: saltando grupo {group_id} — "
+                                f"cambio de admin_id de {existing['admin_id']} a {admin_id} "
+                                f"requiere Super Admin"
+                            )
+                            continue
                         for g in GROUPS.values():
                             if g["group_id"] == group_id:
                                 g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
@@ -2113,6 +2199,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ *Restauración completa*\n\n📊 Grupos restaurados: {restored_count}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error al restaurar: {e}")
+        return
 
 async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2446,7 +2533,7 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
 async def _process_new_vip_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
-    display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
+    display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
     chat_link = f"tg://user?id={user_id}"
 
     # Buscamos el grupo FREE para incluir el link en la bienvenida (opcional, no obligatorio)
@@ -2521,7 +2608,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     return False
 
 async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
-    display = first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}")
+    display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
     chat_link = f"tg://user?id={user_id}"
     is_new = await db.register_free_user(chat_id, user_id, username, first_name, source)
     if is_new:
@@ -2556,6 +2643,24 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: 
         await _process_new_free_member(chat_id, user_id, username, first_name, group, source)
 
+import time as _time
+
+_known_members_cache: dict[str, float] = {}
+_KNOWN_TTL = 3600  # 1 hora
+
+def _is_known_member(key: str) -> bool:
+    ts = _known_members_cache.get(key)
+    return ts is not None and (_time.monotonic() - ts) < _KNOWN_TTL
+
+def _mark_known_member(key: str):
+    _known_members_cache[key] = _time.monotonic()
+    # Limpiar entradas viejas ocasionalmente
+    if len(_known_members_cache) > 5000:
+        cutoff = _time.monotonic() - _KNOWN_TTL
+        to_del = [k for k, v in _known_members_cache.items() if v < cutoff]
+        for k in to_del:
+            del _known_members_cache[k]
+
 async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_chat.type not in ("group", "supergroup"):
         return
@@ -2567,24 +2672,40 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = user.id
     username = user.username or f"user_{user_id}"
     first_name = user.first_name or ""
+    
     cache_key = f"known_{chat_id}_{user_id}"
-    if context.bot_data.get(cache_key):
+    
+    if _is_known_member(cache_key):
         return
+        
     existing = await db.get_user_by_id(user_id, chat_id)
-    display = first_name or (f"@{username}" if not username.startswith("user_") else f"Usuario {user_id}")
+    display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
     chat_link = f"tg://user?id={user_id}"
+    
     if group["type"] == "FREE":
         is_new = await db.register_free_user(chat_id, user_id, username, first_name)
         if is_new:
-            await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", parse_mode="Markdown")
+            await _safe_send(
+                group["admin_id"], 
+                f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", 
+                parse_mode="Markdown"
+            )
         if existing and existing.get("status") == "active" or not existing:
-            context.bot_data[cache_key] = True
+            _mark_known_member(cache_key)
     else:
+        # Grupo VIP
         if not existing:
-            await _safe_send(group["admin_id"], f"⚠️ *Usuario sin registro en grupo VIP*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\nPara activarlo: `/add {user_id} semanal`", parse_mode="Markdown")
+            await _safe_send(
+                group["admin_id"], 
+                f"⚠️ *Usuario sin registro en grupo VIP*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\nPara activarlo: `/add {user_id} semanal`", 
+                parse_mode="Markdown"
+            )
+            _mark_known_member(cache_key) 
         elif existing.get("status") == "active":
-            context.bot_data[cache_key] = True
-
+            _mark_known_member(cache_key)
+        else:
+            # BUG-A3 FIX: Usuario expirado/inactivo — cachear también para no spamear al admin
+            _mark_known_member(cache_key)
 # ==================== CONFIGURACIÓN DE PRECIOS Y TRIAL ====================
 async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
@@ -2827,44 +2948,6 @@ async def handle_message_config_input(update: Update, context: ContextTypes.DEFA
     # Delegamos la lógica de guardado a la nueva función
     await save_configured_message(update, context, text, msg_type, group_id)
 
-    if text.lower() == 'default':
-        text = None
-
-    # Guardar según tipo
-    if msg_type == "welcome":
-        await db.save_group_messages(group_id, welcome_msg=text)
-    elif msg_type == "rejection":
-        await db.save_group_messages(group_id, rejection_msg=text)
-    elif msg_type == "channel_select":
-        await db.save_global_message('channel_select_message', text)
-    elif msg_type == "channel_description":
-        await db.save_group_messages(group_id, channel_desc=text)
-    elif msg_type == "vip_menu":
-        await db.save_group_messages(group_id, vip_menu_msg=text)
-    elif msg_type == "fuego_notice":
-        await db.save_group_messages(group_id, fuego_notice_msg=text)
-    elif msg_type == "expired":
-        await db.save_group_messages(group_id, expired_msg=text)
-    elif msg_type == "abandoned":
-        # Guardar en settings del grupo (no en group_messages)
-        group = get_group_by_id(group_id)
-        if group:
-            settings = dict(group.get("settings", {}))
-            settings['abandoned_cart_message'] = text
-            with GROUPS_LOCK:
-                g = GROUPS.get(group_id)
-                if g:
-                    g["settings"] = settings
-            await db.update_group_fields(group_id, {'settings': settings})
-
-    for k in ('config_msg_step', 'config_msg_group_id', 'config_msg_type'):
-        context.user_data.pop(k, None)
-
-    await update.message.reply_text(
-        f"✅ *Mensaje de {msg_type} actualizado*\n\n📋 Grupo: `{group_id}`\n\nEl mensaje se usará a partir de ahora.",
-        parse_mode="Markdown"
-    )
-
 async def save_configured_message(update, context, text, msg_type, group_id):
     # Normalizar
     text = None if text and text.lower().strip() == 'default' else text
@@ -2942,9 +3025,8 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     if text.lower() == 'cancelar':
+        _clear_input_states(context)
         await update.message.reply_text("❌ Edición cancelada")
-        for key in ('editing_field', 'editing_group_id', 'pending_changes', 'editing_mode'):
-            context.user_data.pop(key, None)
         return
     field = context.user_data.get('editing_field')
     group_id = context.user_data.get('editing_group_id')
@@ -3602,7 +3684,6 @@ _SPINNING_LOCK = asyncio.Lock()
 
 async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     parts = query.data.split("_")
     if len(parts) < 3:
         await query.answer("❌ Error en datos", show_alert=True)
@@ -3722,6 +3803,9 @@ async def send_trial_warnings():
     if not bot_app:
         return
     logger.info("⏰ Enviando avisos de expiración de trial...")
+    
+    semaphore = asyncio.Semaphore(25)
+    
     with GROUPS_LOCK:
         groups_snapshot = [g for g in GROUPS.values() if g.get("type", "VIP") == "VIP"]
     for group in groups_snapshot:
@@ -3746,7 +3830,6 @@ async def send_trial_warnings():
             warning_type = f"warning_{minutes_before}min"
             user_ids = [u['user_id'] for u in users]
             spin_batch = await db.get_spin_data_batch(group_id, user_ids) if user_ids else {}
-            semaphore = asyncio.Semaphore(25)
             async def _send_warning(user):
                 async with semaphore:
                     user_id = user['user_id']
@@ -4186,6 +4269,20 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Broadcast cancelado")
         return
 
+    try:
+        await context.bot.send_message(
+            update.effective_user.id,
+            f"🧪 *Vista previa (Markdown):*\n\n{text}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text(
+            "⚠️ El mensaje tiene Markdown inválido. "
+            "Revisa caracteres como `_`, `*`, `[` sin cerrar.\n\n"
+            "Corrige y reenvía el mensaje, o escribe 'cancelar'."
+        )
+        return
+
     context.user_data['broadcast_message'] = text
     context.user_data['broadcast_step'] = 'confirm'
 
@@ -4197,7 +4294,7 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
         .replace("{group_name}", "VIP")
         .replace("{username}", "@juan")
     )
-    # Truncar preview largo para que no desborde el mensaje de confirmación
+    
     if len(preview_msg) > 300:
         preview_msg = preview_msg[:300] + "..."
 
@@ -4223,7 +4320,7 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         await update.message.reply_text(header, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        await update.message.reply_text(f"Vista previa:\n\n{preview_msg}")
+        await update.message.reply_text(f"Vista previa (variables reemplazadas):\n\n{preview_msg}")
     except Exception as e:
         logger.warning(f"Error enviando confirmación de broadcast: {e}")
         await update.message.reply_text(
@@ -4274,7 +4371,6 @@ async def check_expired_subscriptions():
     with GROUPS_LOCK:
         vip_groups = [g for g in GROUPS.values() if g.get("type", "VIP") == "VIP"]
 
-    # FIX-16: Limitar concurrencia para no agotar el pool de DB (max 5 grupos en paralelo)
     sem = asyncio.Semaphore(5)
 
     async def _process_group(group: dict):
@@ -4283,6 +4379,11 @@ async def check_expired_subscriptions():
             expired_users = await db.get_expired_users(group_id)
             if not expired_users:
                 return
+            user_ids = [u['user_id'] for u in expired_users]
+            updated_ids = await db.expire_users_batch(user_ids, group_id)
+            if not updated_ids:  # ← sin for ni nada raro
+                return
+            updated_ids_set = set(updated_ids)
             logger.info(f"Usuarios expirados en {group['group_name']}: {len(expired_users)}")
             
             # FIX-6: Una sola consulta de mensajes para todo el grupo
@@ -4290,21 +4391,14 @@ async def check_expired_subscriptions():
             expired_msg_template = DEFAULT_EXPIRED_MESSAGE
             if custom and custom.get('expired_message'):
                 expired_msg_template = custom['expired_message']
-            
-            # UPDATE masivo primero para reducir N+1
-            user_ids = [u['user_id'] for u in expired_users]
-            updated_ids = await db.expire_users_batch(user_ids, group_id)
-            updated_ids_set = set(updated_ids)
-            if not updated_ids:
-                return
-            
+                     
             for user in expired_users:
                 if user['user_id'] not in updated_ids_set:
                     continue
                 user_id = user['user_id']
                 username = user.get('username') or ''
                 first_name = user.get('first_name') or ''
-                display = (first_name or (f"@{username}" if username and not username.startswith('user_') else f"ID:{user_id}"))
+                display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
                 plan = user.get('plan', 'desconocido')
                 end_date = user.get('end_date')
                 expiry_str = fmt_dt(end_date) if end_date else "N/A"
@@ -4326,7 +4420,6 @@ async def check_expired_subscriptions():
                     parse_mode="Markdown"
                 )
                 
-                # Usamos directamente el template calculado fuera del loop
                 expired_msg = format_message(expired_msg_template, {'group_name': group['group_name']})
                 await _safe_send(
                     user_id,
@@ -4334,12 +4427,13 @@ async def check_expired_subscriptions():
                     reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown"
                 )
 
-    # Usamos return_exceptions=True para que un grupo fallido no detenga a los demás
-    results = await asyncio.gather(*[_process_group(g) for g in vip_groups], return_exceptions=True)
+    results = await asyncio.gather(
+        *[_process_group(g) for g in vip_groups],
+        return_exceptions=True
+    )
     for group, result in zip(vip_groups, results):
         if isinstance(result, Exception):
-            logger.error(f"❌ Error procesando grupo {group['group_name']}: {result}", exc_info=result)
-
+            logger.error(f"❌ Error en grupo {group['group_name']}: {result}")
 # ==================== CALLBACK HANDLER ====================
 
 async def _handle_back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
@@ -4466,6 +4560,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     logger.info(f"🔔 CALLBACK: {data}")
     try:
+        await query.answer()
+    except Exception:
+        pass  # puede ya estar respondida
+    
+    try:
         handler = CALLBACK_EXACT.get(data)
         if handler:
             await handler(update, context, data)
@@ -4475,8 +4574,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if data.startswith(prefix):
                 await handler(update, context, data)
                 return
-
-        await query.answer()
         logger.warning(f"Callback desconocido: {data}")
     except Exception as e:
         logger.error(f"❌ Error en callback '{data}': {e}", exc_info=True)
@@ -4509,7 +4606,8 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
 
     current = await db.get_group_messages(group_id) if group_id != 0 else None
     current_msg = ""
-    
+
+
     # 2. Agregamos 'abandoned' a los defaults
     defaults = {
         "welcome": DEFAULT_WELCOME_MESSAGE,
@@ -4528,7 +4626,8 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         "channel_description": "channel_description",
         "vip_menu": "vip_menu_message",
         "fuego_notice": "fuego_notice_message",
-        "expired": "expired_message"
+        "expired": "expired_message",
+        "abandoned": "abandoned_cart_message"
     }
 
     # 3. Lógica para leer el current_msg (manejando 'abandoned' que vive en settings)
@@ -4536,6 +4635,8 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
         current_msg = group.get("settings", {}).get("abandoned_cart_message", "") or ""
     elif current:
         current_msg = current.get(key_map.get(msg_type, ''), '') or ''
+    else:
+        current_msg = ""
 
     group_name = group['group_name'] if group else "Global"
     await query.edit_message_text(
