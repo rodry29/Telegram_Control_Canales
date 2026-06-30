@@ -1154,9 +1154,9 @@ scheduler = AsyncIOScheduler()
 bot_app = None
 
 # ==================== HELPERS INTERNOS ====================
-async def _safe_send(chat_id: int, text: str, **kwargs):
+async def _safe_send(chat_id: int, text: str, disable_notification: bool = False, **kwargs):
     try:
-        return await bot_app.bot.send_message(chat_id, text, **kwargs)
+        return await bot_app.bot.send_message(chat_id, text, disable_notification=disable_notification, **kwargs)
     except Exception as e:
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
         return None
@@ -1907,6 +1907,57 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in ["semanal", "mensual", "anual"]: msg += f"`/add {target_id} {p}`\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    current_group = get_group_by_id(chat_id)
+    target_vip_group_id = None
+
+    # 1. Si se usa dentro del grupo VIP
+    if current_group and current_group.get("type") == "VIP":
+        target_vip_group_id = chat_id
+        
+    # 2. Si se usa dentro del grupo FREE
+    elif current_group and current_group.get("type") == "FREE":
+        # Buscamos el grupo VIP vinculado a este FREE
+        target_vip_group_id = current_group.get("settings", {}).get("linked_vip_group_id")
+        if not target_vip_group_id:
+            # Si no hay vinculación explícita, buscamos el VIP del mismo admin
+            for g_id, g_obj in GROUPS.items():
+                if g_obj.get("type") == "VIP" and g_obj["admin_id"] == current_group["admin_id"]:
+                    target_vip_group_id = g_id
+                    break
+                    
+    # 3. Si se usa en el chat privado del bot
+    else:
+        # Buscamos si el usuario ya está en algún grupo VIP o FREE
+        for g_id, g_obj in GROUPS.items():
+            user_data = await db.get_user_by_id(user_id, g_id)
+            if user_data:
+                if g_obj.get("type") == "VIP":
+                    target_vip_group_id = g_id
+                    break
+                elif g_obj.get("type") == "FREE" and not target_vip_group_id:
+                    # Si solo está en el FREE, derivamos el VIP de ese mismo admin
+                    for vg_id, vg_obj in GROUPS.items():
+                        if vg_obj.get("type") == "VIP" and vg_obj["admin_id"] == g_obj["admin_id"]:
+                            target_vip_group_id = vg_id
+                            break
+
+    if not target_vip_group_id:
+        await update.message.reply_text("❌ No se encontró un grupo VIP asociado. Usa /start para ver los canales disponibles.")
+        return
+
+    group_id = target_vip_group_id
+    spin_data = await db.get_spin_data(user_id, group_id)
+    
+    if spin_data.get("spin_count", 0) >= 1:
+        await update.message.reply_text("✅ Ya giraste la ruleta. Presiona el botón para reclamar tu descuento y entrar al VIP.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Info de Pago", callback_data=f"pay_{group_id}_{user_id}")]]), parse_mode="Markdown")
+        return
+    
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")]])
+    await update.message.reply_text("🎯 *¡Ruleta VIP!*\n\nPresiona el botón para girar y ganar hasta 50% de descuento en tu membresía.", reply_markup=keyboard, parse_mode="Markdown")
+
 async def renew_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_group = await require_group(update, context)
     if not current_group:
@@ -2625,7 +2676,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             keyboard.append([InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
             
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-            await _safe_send(group["admin_id"], f"🆕 *Nuevo usuario VIP (Acceso Directo)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🌍 *Origen:* {source}\n⏱ *Trial:* {trial_str}\n📅 *Expira:* {expiry_str} (EC)\n\n💡 *Para activar pago:* Responde con `/add {user_id} mensual`", parse_mode="Markdown")
+            await _safe_send(group["admin_id"], f"🆕 *Nuevo usuario VIP (Acceso Directo)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🌍 *Origen:* {source}\n⏱ *Trial:* {trial_str}\n📅 *Expira:* {expiry_str} (EC)\n\n💡 *Para activar pago:* Responde con `/add {user_id} mensual`", parse_mode="Markdown", disable_notification=True)
         elif result_code == "activo":
             logger.info(f"✅ Reingreso permitido: {display} en {group['group_name']} — expira {end_date}")
         return True
@@ -2729,21 +2780,13 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
     if group["type"] == "FREE":
         is_new = await db.register_free_user(chat_id, user_id, username, first_name)
         if is_new:
-            await _safe_send(
-                group["admin_id"], 
-                f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", 
-                parse_mode="Markdown"
-            )
+            await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", parse_mode="Markdown", disable_notification=True)
         if existing and existing.get("status") == "active" or not existing:
             _mark_known_member(cache_key)
     else:
         # Grupo VIP
         if not existing:
-            await _safe_send(
-                group["admin_id"], 
-                f"⚠️ *Usuario sin registro en grupo VIP*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\nPara activarlo: `/add {user_id} semanal`", 
-                parse_mode="Markdown"
-            )
+            await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", parse_mode="Markdown", disable_notification=True)
             _mark_known_member(cache_key) 
         elif existing.get("status") == "active":
             _mark_known_member(cache_key)
