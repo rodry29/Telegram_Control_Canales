@@ -2697,9 +2697,9 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             expired_msg = custom_messages['expired_message']
         expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
         await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
-        await _safe_send(group["admin_id"], f"🚫 *Reingreso denegado*\n\n👤 *Usuario:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n⚠️ *Motivo:* {motivo_admin}", parse_mode="Markdown")
+        await _safe_send(group["admin_id"], f"🚫 *Reingreso denegado*\n\n👤 *Usuario:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n⚠️ *Motivo:* {motivo_admin}", parse_mode="Markdown", disable_notification=True)
     else:
-        await _safe_send(group["admin_id"], f"⚠️ *Expulsión fallida*\n\n👤 [{display}]({chat_link})\n📌 {group['group_name']}\n⚠️ {motivo_admin}\n\n🔧 *Acción manual requerido.*", parse_mode="Markdown")
+        await _safe_send(group["admin_id"], f"⚠️ *Expulsión fallida*\n\n👤 [{display}]({chat_link})\n📌 {group['group_name']}\n⚠️ {motivo_admin}\n\n🔧 *Acción manual requerido.*", parse_mode="Markdown", disable_notification=True)
     return False
 
 async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
@@ -3804,7 +3804,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎰 Este usuario ya giró la ruleta ({best}% OFF).\n"
                 f"{'✅ Descuento ya fue aplicado.' if spin_data.get('used') else '⏳ Descuento aún pendiente.'}\n\n"
                 f"Verifica con: `/checkspin {user_id}`",
-                parse_mode="Markdown"
+                parse_mode="Markdown", disable_notification=True
             )
             if spin_data.get("used"):
                 await query.edit_message_text(
