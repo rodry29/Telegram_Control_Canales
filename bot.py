@@ -361,6 +361,7 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     if last_sent and (now - last_sent).total_seconds() < 300: return True
     _PAYMENT_COOLDOWN[cooldown_key] = now
     try:
+        await db.log_payment_lead(user_id, group_id)
         spin_data = await db.get_spin_data(user_id, group_id)
         spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
         await bot.send_message(user_id, get_payment_info_text(group_id), parse_mode="Markdown", reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link))
@@ -930,6 +931,12 @@ class Database:
                     INSERT INTO broadcast_logs (group_id, filter_type, message_preview, total_count, success_count, fail_count, sent_by)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (group_id, filter_type, preview, total, success, fail, sent_by))
+        await self._run(_log)
+
+    async def log_payment_lead(self, user_id: int, group_id: int):
+        def _log(conn):
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO payment_leads (user_id, group_id) VALUES (%s, %s)", (user_id, group_id))
         await self._run(_log)
 
     async def get_broadcast_history(self, group_id: int, limit: int = 10) -> list:
@@ -1531,7 +1538,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
                 [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
                 [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")],
-                [InlineKeyboardButton("📊 Estadísticas Trial", callback_data="trial_stats")],
+                [InlineKeyboardButton("📊 Estadísticas", callback_data="trial_stats")],
                 [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group['group_id']}")],
                 [InlineKeyboardButton("📢 Broadcast Trial", callback_data="broadcast_menu")],
             ]
@@ -2401,45 +2408,82 @@ async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Solo disponible en grupos VIP")
         return
 
-    now = datetime.now(ZoneInfo("UTC"))
-    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # Calcular fechas en hora de Ecuador
+    now_ec = datetime.now(EC_TZ)
+    start_today_ec = now_ec.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_week_ec = (start_today_ec - timedelta(days=start_today_ec.weekday()))
+    start_month_ec = start_today_ec.replace(day=1)
 
-    def _get_trial_stats(conn):
+    # Convertir a UTC para la base de datos
+    start_today = start_today_ec.astimezone(ZoneInfo("UTC"))
+    start_week = start_week_ec.astimezone(ZoneInfo("UTC"))
+    start_month = start_month_ec.astimezone(ZoneInfo("UTC"))
+
+    def _get_stats(conn):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_today))
-            t_today = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_week))
-            t_week = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_month))
-            t_month = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(DISTINCT u.user_id) as count FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0", (group_id,))
-            converted = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW()", (group_id,))
-            active = cur.fetchone()['count']
-            return t_today, t_week, t_month, converted, active
+            # Trials
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_today))
+            t_today = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_week))
+            t_week = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_month))
+            t_month = cur.fetchone()['c']
+            
+            # Leads (Info de pago)
+            cur.execute("SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s", (group_id, start_today))
+            l_today = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s", (group_id, start_week))
+            l_week = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s", (group_id, start_month))
+            l_month = cur.fetchone()['c']
 
-    t_today, t_week, t_month, converted, active = await db._run(_get_trial_stats)
+            # Ruletas
+            cur.execute("SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s", (group_id, start_today))
+            r_today = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s", (group_id, start_week))
+            r_week = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s", (group_id, start_month))
+            r_month = cur.fetchone()['c']
 
-    msg = f"📊 *ESTADÍSTICAS DE TRIAL — {group['group_name']}*\n\n"
-    msg += f"🆓 *Nuevos Trials (Ingresos)*\n"
-    msg += f"• 📅 Hoy: *{t_today}* personas\n"
-    msg += f"• 📆 Esta Semana: *{t_week}* personas\n"
-    msg += f"• 🗓 Este Mes: *{t_month}* personas\n\n"
-    msg += f"🔥 *Activos ahora:* {active} personas\n"
-    msg += f"💰 *Convertidos a pago (Histórico):* {converted} personas\n"
+            # Convertidos y activos
+            cur.execute("SELECT COUNT(DISTINCT u.user_id) as c FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0", (group_id,))
+            converted = cur.fetchone()['c']
+            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW()", (group_id,))
+            active = cur.fetchone()['c']
+            return t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active
+
+    t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active = await db._run(_get_stats)
+
+    msg = f"📊 *ESTADÍSTICAS DE VENTAS — {group['group_name']}*\n\n"
+    
+    msg += f"🆓 *NUEVOS TRIALS (Ingresos)*\n"
+    msg += f"• 📅 Hoy: *{t_today}*\n"
+    msg += f"• 📆 Semana: *{t_week}*\n"
+    msg += f"• 🗓 Mes: *{t_month}*\n\n"
+    
+    msg += f"💳 *LEADS DE PAGO (Interés)*\n"
+    msg += f"• 📅 Hoy: *{l_today}*\n"
+    msg += f"• 📆 Semana: *{l_week}*\n"
+    msg += f"• 🗓 Mes: *{l_month}*\n\n"
+    
+    msg += f"🎰 *GIROS DE RULETA*\n"
+    msg += f"• 📅 Hoy: *{r_today}*\n"
+    msg += f"• 📆 Semana: *{r_week}*\n"
+    msg += f"• 🗓 Mes: *{r_month}*\n\n"
+    
+    msg += f"🔥 *Trial Activos Ahora:* {active}\n"
+    msg += f"💰 *Convertidos a pago (Histórico):* {converted}\n"
     
     if t_month > 0:
         conversion = (converted / t_month) * 100
-        msg += f"\n📈 *Tasa de conversión (aprox mensual):* {conversion:.1f}%"
+        msg += f"📈 *Conversión Histórica:* {conversion:.1f}%"
 
     keyboard = [_back_button(f"select_group_{group_id}")]
     if query:
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
+        
 async def edit_group_multiple(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
     await query.answer()
