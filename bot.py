@@ -1987,15 +1987,6 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             f"📋 *Panel FREE - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n👑 Admin: `{group['admin_id']}`",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
         )
-    else:
-        keyboard = [
-            [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
-            [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]
-        ]
-        await query.edit_message_text(
-            f"📋 *Panel FREE - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n👑 Admin: `{group['admin_id']}`",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
-        )
 
 async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
