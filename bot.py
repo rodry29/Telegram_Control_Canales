@@ -596,6 +596,12 @@ class Database:
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
+                # 1. Limpiar duplicados históricos antes de aplicar el índice único
+                cur.execute("""
+                    DELETE FROM payment_leads a USING payment_leads b 
+                    WHERE a.id < b.id AND a.user_id = b.user_id AND a.group_id = b.group_id
+                """)
+                # 2. Crear el índice único de forma segura
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_leads_user_group ON payment_leads(user_id, group_id)")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS broadcast_logs (
