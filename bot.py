@@ -1978,6 +1978,29 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             f"🤝 Para activar combos con el VIP vinculado usa `/addcombo` desde ese grupo VIP.",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
         )
+
+    elif group.get("type") == "VIP":
+        cfg = get_group_plan_config(group_id, "trial")
+        cfg_s = get_group_plan_config(group_id, "semanal")
+        cfg_m = get_group_plan_config(group_id, "mensual")
+        keyboard = [
+            [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+            [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+            [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+            [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")],
+            [InlineKeyboardButton("📊 Estadísticas Trial", callback_data="trial_stats")],
+            [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group_id}")],
+            [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
+            [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast_menu")],
+        ]
+        await query.edit_message_text(
+            f"👑 *Panel VIP - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n👑 Admin: `{group['admin_id']}`\n\n"
+            f"💡 *Tarifas actuales:*\n• ⏱ Trial: {fmt_minutes(cfg.get('minutes', 1440))}\n"
+            f"• 📅 Semanal: ${cfg_s['price']}\n• 📆 Mensual: ${cfg_m['price']}\n\n"
+            f"🤝 Usa `/addcombo` para activar VIP + Comunidad al vez.",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        )
+        
     else:
         keyboard = [
             [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
