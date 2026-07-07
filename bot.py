@@ -1864,6 +1864,54 @@ async def total_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ==================== AVISO DE FUEGO (REACCIÓN) ====================
+async def handle_reaction_fuego(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reaction = update.message_reaction
+    if not reaction or not reaction.chat or not reaction.user:
+        return
+
+    group_id = reaction.chat.id
+    user_id = reaction.user.id
+
+    emojis_recibidos = [getattr(r, 'emoji', None) for r in (reaction.new_reaction or [])]
+    logger.info(f"FUEGO REACCIÓN: user={user_id}, group={group_id}, emojis={emojis_recibidos}")
+
+    group = get_group_by_id(group_id)
+    if not group or group.get("type", "VIP") != "VIP":
+        return
+
+    target_emojis = ["🔥"]
+    new_reactions = reaction.new_reaction or []
+    has_target = any(getattr(r, 'emoji', None) in target_emojis for r in new_reactions)
+    if not has_target:
+        return
+
+    # Verificar acceso básico
+    db_user = await db.get_user_by_id(user_id, group_id)
+    if not db_user or db_user.get('status') != 'active':
+        return
+
+    # Verificar si ya se envió aviso
+    if db_user.get('fuego_notice_sent'):
+        return
+
+    # Enviar aviso configurable
+    custom = await db.get_group_messages(group_id)
+    fuego_msg = DEFAULT_FUEGO_NOTICE
+    if custom and custom.get('fuego_notice_message'):
+        fuego_msg = custom['fuego_notice_message']
+    
+    fuego_contact = group.get("settings", {}).get("fuego_contact", "FuegoBot")
+    
+    formatted = format_message(fuego_msg, {
+        'user_name': getattr(reaction.user, 'first_name', None) or 'Usuario',
+        'group_name': group['group_name'],
+        'fuego_username': fuego_contact
+    })
+    
+    await _safe_send(user_id, formatted, parse_mode="Markdown")
+    await db.mark_fuego_notice_sent(user_id, group_id)
+    logger.info(f"✅ Aviso de Fuego enviado a {user_id}")
+    
 async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
     if not update.message.text or not update.message.text.startswith('/add'): return
