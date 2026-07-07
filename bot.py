@@ -821,6 +821,13 @@ class Database:
 
     async def get_user(self, user_id: int, group_id: int, columns: str = "*") -> Optional[dict]:
         """Consulta unificada con proyección de columnas configurable."""
+        safe_columns = {"user_id", "status", "end_date", "plan", "trial_used", "fuego_notice_sent", "username", "first_name", "start_date", "source", "*"}
+        # Verificamos que las columnas pedidas estén en la lista blanca
+        if columns != "*":
+            requested = [c.strip() for c in columns.split(",")]
+            if not all(col in safe_columns for col in requested):
+                columns = "*" # Si piden algo raro, devolvemos todo por seguridad
+                
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(f"SELECT {columns} FROM users WHERE user_id=%s AND group_id=%s LIMIT 1", (user_id, group_id))
@@ -858,6 +865,8 @@ class Database:
                     return True, "trial_nuevo", end_date
                 cur.execute("UPDATE users SET username=%s, first_name=%s, source=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (username, first_name, source, user_id, group_id))
                 existing_end = normalize_dt(existing["end_date"])
+                
+                # 1. Si aún está activo, no hacemos nada
                 if existing_end > now:
                     if existing["status"] != "active":
                         cur.execute("UPDATE users SET status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (user_id, group_id))
@@ -865,11 +874,11 @@ class Database:
                         cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
                     return True, "activo", existing["end_date"]
 
-                if existing_end <= now: 
-                    return False, "expirado", None
-
+                # 2. Si expiró, verificamos si tiene derecho a Trial
                 if existing.get("trial_used"): 
                     return False, "sin_trial", None
+                
+                # 3. Si expiró y NO ha usado trial, se lo damos
                 end_date = now + timedelta(minutes=trial_minutes)
                 cur.execute("""UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s""", (now, end_date, user_id, group_id))
                 cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (user_id, group_id))
@@ -5414,6 +5423,8 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
             
     await _prompt_message_config(update, context, group_id, msg_type)
 # ==================== MAIN ====================
+db = Database(DATABASE_URL)
+
 async def main():
     global bot_app
     await db.init_tables()
