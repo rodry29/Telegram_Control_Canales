@@ -1948,7 +1948,7 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     context.user_data['current_group'] = group_id
-    elif group.get("type") == "COMUNIDAD":
+    if group.get("type") == "COMUNIDAD":
         cfg = get_group_plan_config(group_id, "trial")
         cfg_s = get_group_plan_config(group_id, "semanal")
         cfg_m = get_group_plan_config(group_id, "mensual")
