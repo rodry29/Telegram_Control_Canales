@@ -1878,7 +1878,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_groups) == 1:
         group = user_groups[0]
         context.user_data['current_group'] = group['group_id']
-        elif group.get("type") == "COMUNIDAD":
+        if group.get("type") == "COMUNIDAD":
             cfg = get_group_plan_config(group_id, "trial")
             cfg_s = get_group_plan_config(group_id, "semanal")
             cfg_m = get_group_plan_config(group_id, "mensual")
