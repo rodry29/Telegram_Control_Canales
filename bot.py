@@ -67,6 +67,8 @@ UNMUTE_PERMISSIONS = ChatPermissions(
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
 GROUPS: Dict[int, Dict[str, Any]] = {}
 GROUPS_LOCK = threading.RLock()
+GROUP_MESSAGES_CACHE: Dict[int, dict] = {}
+GROUP_MESSAGES_LOCK = threading.RLock()
 
 for _group_config in GROUPS_CONFIG.split(","):
     if _group_config.strip():
@@ -619,8 +621,14 @@ class Database:
 
     def _get_pool(self) -> pool.ThreadedConnectionPool:
         if self._pool is None or self._pool.closed:
-            self._pool = pool.ThreadedConnectionPool(minconn=2, maxconn=15, dsn=self.db_url)
-            logger.info("✅ Connection pool creado (min=2, max=15)")
+            # Forzamos el timezone a UTC en cada nueva conexión que se establezca
+            self._pool = pool.ThreadedConnectionPool(
+                minconn=2, 
+                maxconn=15, 
+                dsn=self.db_url,
+                options="-c timezone=UTC"
+            )
+            logger.info("✅ Connection pool creado (min=2, max=15) | Timezone forzado a UTC")
         return self._pool
 
     def _execute(self, func, retries=2):
@@ -656,15 +664,6 @@ class Database:
         if self._pool and not self._pool.closed:
             self._pool.closeall()
             logger.info("🔌 Connection pool cerrado")
-
-    def _insert_free_user_sync(self, conn, user_id: int, chat_id: int, username: str, first_name: str):
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (user_id, group_id) DO NOTHING
-            """, (user_id, chat_id, username, first_name, "FREE",
-                  datetime.now(ZoneInfo("UTC")), datetime.now(ZoneInfo("UTC")) + timedelta(days=365), "potencial", False))
 
     async def init_tables(self):
         def _init(conn):
@@ -786,12 +785,6 @@ class Database:
                             THEN ALTER TABLE group_messages ADD COLUMN expired_message TEXT DEFAULT NULL; END IF;
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='source')
                             THEN ALTER TABLE users ADD COLUMN source TEXT DEFAULT 'Directo'; END IF;
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='community_trial_used')
-                            THEN ALTER TABLE users ADD COLUMN community_trial_used BOOLEAN DEFAULT FALSE; END IF;
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='community_trial_end_date')
-                            THEN ALTER TABLE users ADD COLUMN community_trial_end_date TIMESTAMP DEFAULT NULL; END IF;
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='community_kicked_at')
-                            THEN ALTER TABLE users ADD COLUMN community_kicked_at TIMESTAMP DEFAULT NULL; END IF;
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_leads' AND column_name='cart_msg_sent_at')
                             THEN ALTER TABLE payment_leads ADD COLUMN cart_msg_sent_at TIMESTAMP DEFAULT NULL; END IF;
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_leads' AND column_name='cart_step')
@@ -809,20 +802,17 @@ class Database:
         await self._run(_init)
         logger.info("✅ Base de datos inicializada")
 
-    async def load_groups_from_db(self):
+    async def load_group_messages(self):
         def _load(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT group_id, group_name, admin_id, COALESCE(group_type, 'VIP') as group_type, COALESCE(settings, '{}') as settings FROM groups")
+                cur.execute("SELECT * FROM group_messages")
                 return cur.fetchall()
         rows = await self._run(_load)
-        if rows:
-            with GROUPS_LOCK:
-                GROUPS.clear()
-                for g in rows:
-                    settings = g["settings"] if isinstance(g["settings"], dict) else {}
-                    GROUPS[g["group_id"]] = {"group_id": g["group_id"], "group_name": g["group_name"],
-                                   "admin_id": g["admin_id"], "type": g["group_type"], "settings": settings}
-            logger.info(f"📦 {len(GROUPS)} grupos cargados desde BD")
+        with GROUP_MESSAGES_LOCK:
+            GROUP_MESSAGES_CACHE.clear()
+            for r in rows:
+                GROUP_MESSAGES_CACHE[r['group_id']] = dict(r)
+        logger.info(f"📨 {len(GROUP_MESSAGES_CACHE)} mensajes de grupo cargados en caché")
             return True
         return False
 
@@ -867,6 +857,14 @@ class Database:
 
     async def get_user_by_id_full(self, user_id: int, group_id: int):
         return await self.get_user(user_id, group_id, "*")
+
+    async def get_user_groups(self, user_id: int) -> List[int]:
+        """Retorna todos los group_ids en los que el usuario tiene un registro, en 1 sola query."""
+        def _get(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT group_id FROM users WHERE user_id = %s", (user_id,))
+                return [row[0] for row in cur.fetchall()]
+        return await self._run(_get)
 
     async def register_user_auto(self, group_id: int, user_id: int, username: str, first_name: str, source: str = "Directo"):
         now = now_utc()
@@ -1282,19 +1280,20 @@ class Database:
         if group:
             group.setdefault('settings', {})['warning_config'] = config
 
-    async def get_users_for_warning(self, group_id: int, minutes_before: int) -> list:
+    async def get_users_for_warning_multi(self, group_ids: List[int], minutes_before: int) -> list:
+        """Versión optimizada que busca avisos para múltiples grupos en 1 sola query."""
         warning_threshold = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=minutes_before)
         warning_type = f"warning_{minutes_before}min"
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT u.user_id, u.username, u.first_name, u.end_date, u.plan
+                    SELECT u.user_id, u.username, u.first_name, u.end_date, u.plan, u.group_id
                     FROM users u LEFT JOIN warning_logs w
                         ON u.user_id = w.user_id AND u.group_id = w.group_id AND w.warning_type = %s
-                    WHERE u.group_id = %s AND u.status = 'active'
+                    WHERE u.group_id = ANY(%s) AND u.status = 'active'
                       AND u.end_date <= %s AND u.end_date > NOW() AND w.id IS NULL
                     ORDER BY u.end_date ASC
-                """, (warning_type, group_id, warning_threshold))
+                """, (warning_type, group_ids, warning_threshold))
                 return cur.fetchall()
         return await self._run(_get)
 
@@ -1365,15 +1364,22 @@ class Database:
                 """, (plan, user_id, group_id))
         await self._run(_upd)
 
-    async def get_group_messages(self, group_id: int) -> dict:
+    async def get_group_messages(self, group_id: int) -> Optional[dict]:
+        with GROUP_MESSAGES_LOCK:
+            if group_id in GROUP_MESSAGES_CACHE:
+                return GROUP_MESSAGES_CACHE[group_id]
+                
         def _get(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM group_messages WHERE group_id = %s", (group_id,))
                 row = cur.fetchone()
-                if not row:
-                    return None
-                return dict(row)
-        return await self._run(_get)
+                return dict(row) if row else None
+        msg_data = await self._run(_get)
+        
+        if msg_data:
+            with GROUP_MESSAGES_LOCK:
+                GROUP_MESSAGES_CACHE[group_id] = msg_data
+        return msg_data
 
     async def save_group_messages(self, group_id: int, welcome_msg: str = None, welcome_buttons: list = None,
                                    rejection_msg: str = None, rejection_buttons: list = None,
@@ -1402,6 +1408,18 @@ class Database:
                       rejection_msg, json.dumps(rejection_buttons) if rejection_buttons else None,
                       channel_select_msg, channel_desc, vip_menu_msg, fuego_notice_msg, expired_msg))
         await self._run(_save)
+        
+        # Actualizar caché en RAM
+        with GROUP_MESSAGES_LOCK:
+            current = GROUP_MESSAGES_CACHE.get(group_id, {})
+            if welcome_msg is not None: current['welcome_message'] = welcome_msg
+            if rejection_msg is not None: current['rejection_message'] = rejection_msg
+            if channel_select_msg is not None: current['channel_select_message'] = channel_select_msg
+            if channel_desc is not None: current['channel_description'] = channel_desc
+            if vip_menu_msg is not None: current['vip_menu_message'] = vip_menu_msg
+            if fuego_notice_msg is not None: current['fuego_notice_message'] = fuego_notice_msg
+            if expired_msg is not None: current['expired_message'] = expired_msg
+            GROUP_MESSAGES_CACHE[group_id] = current
 
     _VALID_MSG_COLUMNS = {
         "welcome_message", "rejection_message", "channel_select_message",
@@ -1427,13 +1445,6 @@ class Database:
                 cur.execute("UPDATE users SET restricted_at=NULL WHERE user_id=%s AND group_id=%s", (user_id, group_id))
         await self._run(_upd)
 
-    async def get_users_with_old_community_kick(self, vip_group_id: int) -> list:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id FROM users WHERE group_id=%s AND community_kicked_at IS NOT NULL", (vip_group_id,))
-                return cur.fetchall()
-        return await self._run(_get)
-
     async def get_global_message(self, msg_type: str) -> Optional[str]:
         if msg_type not in self._VALID_MSG_COLUMNS:
             logger.error(f"❌ Intento de inyección SQL o columna inválida bloqueado en get_global_message: {msg_type}")
@@ -1457,6 +1468,12 @@ class Database:
                     ON CONFLICT (group_id) DO UPDATE SET {msg_type} = EXCLUDED.{msg_type}
                 """, (text,))
         await self._run(_save)
+        
+        # Actualizar caché en RAM
+        with GROUP_MESSAGES_LOCK:
+            current = GROUP_MESSAGES_CACHE.get(0, {})
+            current[msg_type] = text
+            GROUP_MESSAGES_CACHE[0] = current
 
     # --- Backup tracking en DB en vez de archivo local ---
     async def get_last_backup_date(self) -> Optional[datetime]:
@@ -1488,27 +1505,6 @@ async def _safe_send(chat_id: int, text: str, disable_notification: bool = False
     except Exception as e:
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
         return None
-
-async def check_abandoned_cart(user_id: int, group_id: int):
-    user = await db.get_user_by_id(user_id, group_id)
-    if not user: return
-    # Si tiene cualquier plan pagado activo, no enviar
-    if user.get('status') == 'active' and user.get('plan') not in ('trial', 'FREE'):
-        return
-    
-    group = get_group_by_id(group_id)
-    if not group: return
-    
-    # Leemos el mensaje directamente de la configuración del grupo
-    cart_msg = group.get("settings", {}).get("abandoned_cart_message")
-    if not cart_msg:
-        cart_msg = "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra a tu suscripción. ¡Escríbeme para ayudarte!"
-        
-    cart_msg = format_message(cart_msg, {'group_name': group.get('group_name', 'VIP')})
-    try: 
-        await bot_app.bot.send_message(user_id, cart_msg, reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
-    except Exception as e: 
-        logger.warning(f"Cart msg failed to {user_id}: {e}")
 
 async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2: 
@@ -1632,14 +1628,7 @@ async def verify_on_startup():
     except Exception as e:
         logger.error(f"❌ Error en verificación de expirados: {e}")
     
-    # 2. Reintegrar usuarios de Comunidad expulsados por esquema viejo
-    try:
-        await reintegrate_comunidad_users()
-        logger.info("✅ Reintegración de Comunidad completada")
-    except Exception as e:
-        logger.error(f"❌ Error en reintegración: {e}")
-    
-    # 3. Notificar al Super Admin
+    # 2. Notificar al Super Admin
     try:
         groups_count = len(get_all_groups_snapshot())
         await _safe_send(
@@ -1647,7 +1636,6 @@ async def verify_on_startup():
             f"🚀 *Bot reiniciado — Verificación completada*\n\n"
             f"📊 Grupos activos: {groups_count}\n"
             f"✅ Expulsados expirados: verificado\n"
-            f"✅ Reintegración Comunidad: verificado\n"
             f"✅ Eventos pendientes: procesando...\n\n"
             f"💡 Los usuarios que entraron durante la caída serán detectados al escribir o mediante eventos pendientes.",
             parse_mode="Markdown"
@@ -1656,28 +1644,6 @@ async def verify_on_startup():
         pass
     
     logger.info("✅ Verificación post-deploy finalizada")
-
-async def reintegrate_comunidad_users():
-    """Reintegra (desbanea) usuarios expulsados por el esquema viejo de Comunidad."""
-    vip_groups = [g for g in get_all_groups_snapshot()
-                  if g.get("type", "VIP") == "VIP" and g.get("settings", {}).get("linked_comunidad_group_id")]
-    for vip in vip_groups:
-        com_id = vip["settings"]["linked_comunidad_group_id"]
-        try:
-            rows = await db.get_users_with_old_community_kick(vip["group_id"])
-        except Exception as e:
-            logger.error(f"Error consultando reintegración para {vip['group_id']}: {e}")
-            continue
-        if not rows:
-            continue
-        count = 0
-        for r in rows:
-            try:
-                await bot_app.bot.unban_chat_member(com_id, r['user_id'], only_if_banned=True)
-                count += 1
-            except Exception as e:
-                logger.warning(f"No se pudo reintegrar {r['user_id']} en {com_id}: {e}")
-        logger.info(f"✅ Reintegrados {count} usuarios previamente expulsados de Comunidad {com_id}")
 
 def _back_button(callback: str) -> list:
     return [InlineKeyboardButton("🔙 Volver", callback_data=callback)]
@@ -1705,6 +1671,8 @@ def get_channels() -> List[Dict[str, Any]]:
     for vip in get_all_groups_snapshot():
         if vip.get("type", "VIP") != "VIP":
             continue
+            
+        # Buscar grupo Free
         free_group = None
         free_id = vip.get("settings", {}).get("linked_free_group_id")
         if free_id:
@@ -1715,17 +1683,20 @@ def get_channels() -> List[Dict[str, Any]]:
                 if g.get("type") == "FREE" and g["admin_id"] == vip["admin_id"]:
                     free_group = g
                     break
-
+            
+        # Buscar grupo Comunidad vinculado
         comunidad_group = None
         com_id = vip.get("settings", {}).get("linked_comunidad_group_id")
         if com_id:
             comunidad_group = get_group_by_id(com_id)
-        
+            
         channel_name = vip.get("settings", {}).get("channel_name", vip["group_name"])
+        
         channels.append({
             "channel_name": channel_name,
             "vip": vip,
-            "free": free_group
+            "free": free_group,
+            "comunidad": comunidad_group  # <- AQUI se agrega la key faltante
         })
     return channels
 
@@ -1738,14 +1709,28 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
     custom = await db.get_group_messages(group_id)
     vip_invite_link = group.get("settings", {}).get("vip_invite_link", "").strip()
     
-    msg = (
+    default_msg = (
         "🔥 *¡Bienvenido al VIP!*\n\n"
         "Este es el canal exclusivo de *{group_name}*.\n\n"
         "📋 *Planes disponibles:*\n{price_list}\n\n"
-    ).format(
-        group_name=group.get('group_name', 'VIP'),
-        price_list=price_lines
     )
+    
+    # Usar el mensaje personalizado si existe, si no, el por defecto
+    msg = default_msg
+    if custom and custom.get('welcome_message'):
+        msg = custom['welcome_message']
+        
+    # Formatear variables de forma segura
+    cfg_t = get_group_plan_config(group_id, "trial")
+    trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
+    
+    msg = format_message(msg, {
+        'group_name': safe_name(group.get('group_name', 'VIP')),
+        'price_list': price_lines,
+        'trial_duration': trial_str,
+        'expiry_time': 'Al unirte al grupo',
+        'user_name': 'Usuario'
+    })
     
     keyboard = []
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
@@ -1755,7 +1740,7 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
     keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     
     await send_func(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
+    
 async def show_channel_selector(send_func, user_id: int):
     channels = get_channels()
     if not channels:
@@ -1820,7 +1805,9 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
         [InlineKeyboardButton("🔥 Menú VIP", callback_data=f"cfg_msg_edit_{group_id}_vip_menu")],
         [InlineKeyboardButton("🤖 Aviso Fuego", callback_data=f"cfg_msg_edit_{group_id}_fuego_notice")],
         [InlineKeyboardButton("⏰ Expiración", callback_data=f"cfg_msg_edit_{group_id}_expired")],
-        [InlineKeyboardButton("🛒 Msg. Carrito Abandonado", callback_data=f"cfg_msg_edit_{group_id}_abandoned")],
+        [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 1)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_1")],
+        [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 2)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_2")],
+        [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 3)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_3")],
         [InlineKeyboardButton(f"⏱ Tiempo Carrito ({cart_mins} min)", callback_data=f"cfg_cart_{group_id}")],
         _back_button(f"select_group_{group_id}"),
     ]
@@ -1964,18 +1951,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_groups) == 1:
         group = user_groups[0]
         context.user_data['current_group'] = group['group_id']
+        
         if group.get("type") == "COMUNIDAD":
-            cfg = get_group_plan_config(group_id, "trial")
-            cfg_s = get_group_plan_config(group_id, "semanal")
-            cfg_m = get_group_plan_config(group_id, "mensual")
+            cfg = get_group_plan_config(group['group_id'], "trial")
+            cfg_s = get_group_plan_config(group['group_id'], "semanal")
+            cfg_m = get_group_plan_config(group['group_id'], "mensual")
             keyboard = [
                 [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
                 [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
                 [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
                 [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")],
-                [InlineKeyboardButton("📊 Estadísticas Trial", callback_data="trial_stats")],
-                [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group_id}")],
-                [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
+                [InlineKeyboardButton("📊 Estadísticas", callback_data="trial_stats")],
+                [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group['group_id']}")],
+                [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group['group_id']}")],
                 [InlineKeyboardButton("📢 Broadcast Trial", callback_data="broadcast_menu")],
             ]
             await send(
@@ -1985,7 +1973,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤝 Para activar combos con el VIP vinculado usa `/addcombo` desde ese grupo VIP.",
                 reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
             )
-        else:
+        elif group.get("type") == "VIP":
+            cfg = get_group_plan_config(group['group_id'], "trial")
+            cfg_s = get_group_plan_config(group['group_id'], "semanal")
+            cfg_m = get_group_plan_config(group['group_id'], "mensual")
+            keyboard = [
+                [InlineKeyboardButton("➕ Agregar usuario", callback_data="add_user")],
+                [InlineKeyboardButton("📊 Usuarios activos", callback_data="list_active")],
+                [InlineKeyboardButton("💰 Ganancias", callback_data="earnings")],
+                [InlineKeyboardButton("📥 Exportar mes", callback_data="export_month")],
+                [InlineKeyboardButton("📊 Estadísticas", callback_data="trial_stats")],
+                [InlineKeyboardButton("⚙️ Precios y Trial", callback_data=f"cfg_group_{group['group_id']}")],
+                [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group['group_id']}")],
+                [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast_menu")],
+            ]
+            await send(
+                f"👑 *Panel VIP - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n👑 Admin: `{group['admin_id']}`\n\n"
+                f"💡 *Tarifas actuales:*\n• ⏱ Trial: {fmt_minutes(cfg.get('minutes', 1440))}\n"
+                f"• 📅 Semanal: ${cfg_s['price']}\n• 📆 Mensual: ${cfg_m['price']}\n\n"
+                f"🤝 Usa `/addcombo` para activar VIP + Comunidad al vez.",
+                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+            )
+        else: # FREE
             keyboard = [
                 [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
                 [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]
@@ -2589,16 +2598,31 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
     # 3. Si se usa en el chat privado del bot
     else:
-        for g_obj in get_all_groups_snapshot():
-            user_data = await db.get_user_by_id(user_id, g_obj["group_id"])
-            if user_data:
-                if g_obj.get("type") == "VIP":
-                    target_vip_group_id = g_obj["group_id"]
+        # OPTIMIZACIÓN: 1 sola query a la BD para obtener todos los grupos del usuario
+        user_group_ids = await db.get_user_groups(user_id)
+        if user_group_ids:
+            # Priorizar si ya está en un VIP
+            for gid in user_group_ids:
+                g_obj = get_group_by_id(gid)
+                if g_obj and g_obj.get("type") == "VIP":
+                    target_vip_group_id = gid
                     break
-                elif g_obj.get("type") == "FREE" and not target_vip_group_id:
-                    for vg_obj in get_all_groups_snapshot():
-                        if vg_obj.get("type") == "VIP" and vg_obj["admin_id"] == g_obj["admin_id"]:
-                            target_vip_group_id = vg_obj["group_id"]
+            
+            # Si no está en ningún VIP, buscar si está en un FREE y derivar al VIP del admin
+            if not target_vip_group_id:
+                for gid in user_group_ids:
+                    g_obj = get_group_by_id(gid)
+                    if g_obj and g_obj.get("type") == "FREE":
+                        vip_id = g_obj.get("settings", {}).get("linked_vip_group_id")
+                        if vip_id and get_group_by_id(vip_id):
+                            target_vip_group_id = vip_id
+                            break
+                        # Fallback por admin
+                        for vg_obj in get_all_groups_snapshot():
+                            if vg_obj.get("type") == "VIP" and vg_obj["admin_id"] == g_obj["admin_id"]:
+                                target_vip_group_id = vg_obj["group_id"]
+                                break
+                        if target_vip_group_id:
                             break
 
     if not target_vip_group_id:
@@ -2614,7 +2638,6 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")]])
     await update.message.reply_text("🎯 *¡Ruleta VIP!*\n\nPresiona el botón para girar y ganar hasta 50% de descuento en tu membresía.", reply_markup=keyboard, parse_mode="Markdown")
-
 # ==================== HANDLER PARA REPLY CON /renew ====================
 async def handle_reply_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
@@ -3464,7 +3487,14 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
             cfg_t = get_group_plan_config(chat_id, "trial")
             trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
             expiry_str = fmt_dt(end_date) if end_date else "N/A"
-            welcome_msg = format_message(DEFAULT_COMUNIDAD_WELCOME_MESSAGE, {
+            
+            # Cargar mensaje personalizado de la BD
+            custom_messages = await db.get_group_messages(chat_id)
+            welcome_msg = DEFAULT_COMUNIDAD_WELCOME_MESSAGE
+            if custom_messages and custom_messages.get('welcome_message'):
+                welcome_msg = custom_messages['welcome_message']
+                
+            welcome_msg = format_message(welcome_msg, {
                 'trial_duration': trial_str,
                 'expiry_time': expiry_str,
                 'group_name': safe_name(group['group_name']),
@@ -3478,9 +3508,9 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
                 f"👤 [{display}]({chat_link})\n"
                 f"🆔 *ID:* `{user_id}`\n"
                 f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
-                f"🌍 *Origen:* {source}\n"
+                f"🌍 *Origen:* {safe_name(source)}\n"
                 f"⏱ *Trial:* {trial_str}\n\n"
-                f"💡 `/add {user_id} mensual` (usando este grupo Comunidad)",
+                f"💡 `/add {user_id} mensual comunidad`",
                 parse_mode="Markdown", disable_notification=True
             )
         # result_code == "activo" -> reingreso permitido, sin acción
@@ -3489,7 +3519,13 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
     # Trial ya usado o plan vencido, sin pago activo -> SILENCIAR, no expulsar
     muted = await _mute_user_with_retry(chat_id, user_id)
     if muted:
-        expired_msg = format_message(DEFAULT_COMUNIDAD_MUTED_MESSAGE, {'group_name': group['group_name']})
+        # Cargar mensaje de silenciado personalizado si existe
+        custom_messages = await db.get_group_messages(chat_id)
+        muted_msg = DEFAULT_COMUNIDAD_MUTED_MESSAGE
+        if custom_messages and custom_messages.get('expired_message'):
+            muted_msg = custom_messages['expired_message']
+            
+        expired_msg = format_message(muted_msg, {'group_name': safe_name(group['group_name'])})
         await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
         motivo = "Plan vencido" if result_code == "expirado" else "Trial ya utilizado"
         await _safe_send(
@@ -3933,8 +3969,15 @@ async def save_configured_message(update, context, text, msg_type, group_id):
     async def save_abandoned():
         group = get_group_by_id(group_id)
         if group:
+            step_index = int(msg_type.split("_")[1]) - 1
             settings = dict(group.get("settings", {}))
-            settings['abandoned_cart_message'] = text
+            # Copiamos los defaults para no mutar la lista original
+            msgs = list(settings.get('abandoned_cart_messages', DEFAULT_CART_MESSAGES))
+            while len(msgs) <= step_index:
+                msgs.append("")
+            msgs[step_index] = text
+            settings['abandoned_cart_messages'] = msgs
+            
             with GROUPS_LOCK:
                 g = GROUPS.get(group_id)
                 if g:
@@ -3950,7 +3993,9 @@ async def save_configured_message(update, context, text, msg_type, group_id):
         "vip_menu": lambda: db.save_group_messages(group_id, vip_menu_msg=text),
         "fuego_notice": lambda: db.save_group_messages(group_id, fuego_notice_msg=text),
         "expired": lambda: db.save_group_messages(group_id, expired_msg=text),
-        "abandoned": save_abandoned,  # ← Usamos la función helper asíncrona
+        "abandoned_1": save_abandoned,
+        "abandoned_2": save_abandoned,
+        "abandoned_3": save_abandoned,
     }
 
     handler = handlers.get(msg_type)
@@ -3975,11 +4020,10 @@ async def save_configured_message(update, context, text, msg_type, group_id):
     safe_type = msg_type.replace('_', r'\_')
     await update.message.reply_text(
         f"✅ *Mensaje de {safe_type} actualizado*\n\n"
-        f"📋 Grupo: {safe_name(group['group_name'])}\n\n"
+        f"📋 Grupo: `{group_id}`\n\n"
         f"El mensaje se usará a partir de ahora.",
         parse_mode="Markdown"
     )
-
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -4328,7 +4372,9 @@ async def _prompt_message_config(update: Update, context: ContextTypes.DEFAULT_T
         "vip_menu": DEFAULT_VIP_MENU_MESSAGE,
         "fuego_notice": DEFAULT_FUEGO_NOTICE,
         "expired": DEFAULT_EXPIRED_MESSAGE,
-        "abandoned": "⏳ ¿Te quedaste sin tiempo? No te preocupes. 🤝\n\nSi activas tu plan ahora, te regalo 24 horas extra."
+        "abandoned_1": DEFAULT_CART_MESSAGES[0] if len(DEFAULT_CART_MESSAGES) > 0 else "",
+        "abandoned_2": DEFAULT_CART_MESSAGES[1] if len(DEFAULT_CART_MESSAGES) > 1 else "",
+        "abandoned_3": DEFAULT_CART_MESSAGES[2] if len(DEFAULT_CART_MESSAGES) > 2 else "",
     }
     default_msg = defaults.get(msg_type, "")
     
@@ -4338,8 +4384,10 @@ async def _prompt_message_config(update: Update, context: ContextTypes.DEFAULT_T
         "fuego_notice": "fuego_notice_message", "expired": "expired_message"
     }
 
-    if msg_type == "abandoned" and group:
-        current_msg = group.get("settings", {}).get("abandoned_cart_message", "") or ""
+    if msg_type.startswith("abandoned_") and group:
+        step_index = int(msg_type.split("_")[1]) - 1
+        msgs = group.get("settings", {}).get("abandoned_cart_messages", DEFAULT_CART_MESSAGES)
+        current_msg = msgs[step_index] if step_index < len(msgs) else ""
     elif msg_type == "channel_select":
         current_msg = await db.get_global_message('channel_select_message') or ""
     elif current:
@@ -4367,7 +4415,7 @@ async def config_messages_command(update: Update, context: ContextTypes.DEFAULT_
     if not context.args:
         await update.message.reply_text(
             "❌ *Uso: `/configmsg group_id tipo`*\n\n"
-            "Tipos: `welcome`, `rejection`, `channel_description`, `vip_menu`, `fuego_notice`, `expired`, `abandoned`",
+            "Tipos: `welcome`, `rejection`, `channel_description`, `vip_menu`, `fuego_notice`, `expired`, `abandoned_1`, `abandoned_2`, `abandoned_3`",
             parse_mode="Markdown"
         )
         return
@@ -4393,7 +4441,7 @@ async def config_messages_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ Grupo no encontrado")
         return
 
-    valid_types = ["welcome", "rejection", "channel_description", "vip_menu", "fuego_notice", "expired", "abandoned"]
+    valid_types = ["welcome", "rejection", "channel_description", "vip_menu", "fuego_notice", "expired", "abandoned_1", "abandoned_2", "abandoned_3"]
     if msg_type not in valid_types:
         await update.message.reply_text(f"❌ Tipo inválido. Usa: {', '.join(valid_types)}")
         return
@@ -4816,66 +4864,102 @@ async def send_trial_warnings():
     logger.info("⏰ Enviando avisos de expiración de trial...")
     
     semaphore = asyncio.Semaphore(25)
-    
     groups_snapshot = [g for g in get_all_groups_snapshot() if g.get("type", "VIP") in ("VIP", "COMUNIDAD")]
+    
+    if not groups_snapshot:
+        return
+
+    # 1. Agrupar todas las reglas activas por 'minutes_before' para minimizar queries
+    rules_by_minutes = {}
     for group in groups_snapshot:
         group_id = group["group_id"]
-        try:
-            warning_config = await db.get_warning_config(group_id)
-        except Exception as e:
-            logger.error(f"❌ Error obteniendo warning_config para grupo {group_id}: {e}")
-            continue
+        warning_config = await db.get_warning_config(group_id)
+        
         if not warning_config or not warning_config.get("enabled", False):
             continue
+            
         for warning in warning_config.get("warnings", []):
             minutes_before = warning.get("minutes_before", 15)
             message_template = warning.get("message", "⏳ Tu trial expira pronto")
-            try:
-                users = await db.get_users_for_warning(group_id, minutes_before)
-            except Exception as e:
-                logger.error(f"❌ Error obteniendo usuarios para aviso en grupo {group_id}: {e}")
-                continue
-            if not users:
-                continue
-            warning_type = f"warning_{minutes_before}min"
-            user_ids = [u['user_id'] for u in users]
-            spin_batch = await db.get_spin_data_batch(group_id, user_ids) if user_ids else {}
-            async def _send_warning(user):
-                async with semaphore:
-                    user_id = user['user_id']
-                    end_date = normalize_dt(user['end_date'])
-                    remaining = end_date - now_utc()
-                    mins_left = max(0, int(remaining.total_seconds() / 60))
-                    if mins_left <= 0:
-                        return
-                    expiry_str = fmt_dt(user['end_date'])
-                    expiry_time = expiry_str.split(' ')[1] if ' ' in expiry_str else expiry_str
-                    message = (message_template
-                               .replace("{minutes_left}", str(mins_left))
-                               .replace("{expiry_time}", expiry_time)
-                               .replace("{expiry_datetime}", expiry_str)
-                               .replace("{group_name}", group.get("group_name", "VIP"))
-                               .replace("{user_name}", user.get("first_name", "Usuario") or "Usuario"))
-                    try:
-                        spin_data = spin_batch.get(user_id, {})
-                        spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
-                        group_obj = get_group_by_id(group_id)
-                        vip_invite_link = group_obj.get("settings", {}).get("vip_invite_link", "") if group_obj else ""
-                        await bot_app.bot.send_message(
-                            user_id, message,
-                            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link),
-                            parse_mode="Markdown"
-                        )
-                        await db.log_warning_sent(user_id, group_id, warning_type)
-                        logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes")
-                    except Exception as e:
-                        logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
+            
+            if minutes_before not in rules_by_minutes:
+                rules_by_minutes[minutes_before] = []
+                
+            rules_by_minutes[minutes_before].append({
+                "group_id": group_id,
+                "group_name": group.get("group_name", "VIP"),
+                "message_template": message_template,
+                "vip_invite_link": group.get("settings", {}).get("vip_invite_link", "")
+            })
 
-            # Procesar en chunks para evitar saturación de memoria
-            chunk_size = 100
-            for i in range(0, len(users), chunk_size):
-                chunk = users[i:i+chunk_size]
-                await asyncio.gather(*[_send_warning(u) for u in chunk])
+    # 2. Por cada conjunto de minutos, hacer 1 sola query multi-grupo
+    for minutes_before, rules in rules_by_minutes.items():
+        group_ids = [r["group_id"] for r in rules]
+        warning_type = f"warning_{minutes_before}min"
+        
+        try:
+            users = await db.get_users_for_warning_multi(group_ids, minutes_before)
+        except Exception as e:
+            logger.error(f"❌ Error obteniendo usuarios para aviso de {minutes_before}min: {e}")
+            continue
+            
+        if not users:
+            continue
+            
+        # Agrupar usuarios por grupo para optimizar la carga de la ruleta en batch
+        users_by_group = {}
+        for u in users:
+            users_by_group.setdefault(u['group_id'], []).append(u)
+            
+        spin_data_map = {}
+        for gid, g_users in users_by_group.items():
+            user_ids = [u['user_id'] for u in g_users]
+            spin_data_map[gid] = await db.get_spin_data_batch(gid, user_ids)
+            
+        # Mapeo rápido de reglas por group_id
+        rules_map = {r["group_id"]: r for r in rules}
+
+        async def _send_warning(user):
+            async with semaphore:
+                user_id = user['user_id']
+                gid = user['group_id']
+                rule = rules_map.get(gid)
+                if not rule:
+                    return
+                    
+                end_date = normalize_dt(user['end_date'])
+                remaining = end_date - now_utc()
+                mins_left = max(0, int(remaining.total_seconds() / 60))
+                if mins_left <= 0:
+                    return
+                    
+                expiry_str = fmt_dt(user['end_date'])
+                expiry_time = expiry_str.split(' ')[1] if ' ' in expiry_str else expiry_str
+                
+                message = (rule["message_template"]
+                           .replace("{minutes_left}", str(mins_left))
+                           .replace("{expiry_time}", expiry_time)
+                           .replace("{expiry_datetime}", expiry_str)
+                           .replace("{group_name}", rule["group_name"])
+                           .replace("{user_name}", user.get("first_name", "Usuario") or "Usuario"))
+                try:
+                    spin_data = spin_data_map.get(gid, {}).get(user_id, {})
+                    spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+                    await bot_app.bot.send_message(
+                        user_id, message,
+                        reply_markup=get_payment_keyboard(gid, user_id, spin_used=spin_used, vip_invite_link=rule["vip_invite_link"]),
+                        parse_mode="Markdown"
+                    )
+                    await db.log_warning_sent(user_id, gid, warning_type)
+                    logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes en grupo {gid}")
+                except Exception as e:
+                    logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
+
+        # Procesar en chunks para evitar saturación de memoria
+        chunk_size = 100
+        for i in range(0, len(users), chunk_size):
+            chunk = users[i:i+chunk_size]
+            await asyncio.gather(*[_send_warning(u) for u in chunk])
 
 async def menu_warning_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
@@ -5345,7 +5429,8 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
         await bot.send_message(sent_by, "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.", parse_mode="Markdown")
         return
     group = get_group_by_id(group_id)
-    group_name = group.get('group_name', 'VIP') if group else 'VIP'
+    # Usar safe_name (v1) para el nombre del grupo también
+    group_name = safe_name(group.get('group_name', 'VIP')) if group else 'VIP'
     total = len(targets); success_count = 0; fail_count = 0; delay = 0.12
     try:
         progress_msg = await bot.send_message(sent_by, f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0", parse_mode="Markdown")
@@ -5354,8 +5439,9 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
         
     for i, user in enumerate(targets, 1):
         user_id = user['user_id']
-        safe_name = escape_md_v2(user.get('first_name', 'Usuario') or 'Usuario')
-        personalized = message_text.replace("{user_name}", safe_name).replace("{group_name}", group_name)
+        # Usar safe_name (v1) y cambiar el nombre de la variable para no sobrescribir la función
+        display_name = safe_name(user.get('first_name', 'Usuario') or 'Usuario')
+        personalized = message_text.replace("{user_name}", display_name).replace("{group_name}", group_name)
         try:
             await bot.send_message(user_id, personalized, parse_mode="Markdown", disable_web_page_preview=True)
             success_count += 1
@@ -5649,12 +5735,11 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
             
     await _prompt_message_config(update, context, group_id, msg_type)
 # ==================== MAIN ====================
-db = Database(DATABASE_URL)
-
 async def main():
     global bot_app
     await db.init_tables()
     await db.load_groups_from_db()
+    await db.load_group_messages() 
     with GROUPS_LOCK:
         logger.info(f"📦 {len(GROUPS)} grupos disponibles")
 
