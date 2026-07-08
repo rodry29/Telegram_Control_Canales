@@ -3167,6 +3167,9 @@ async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• También puedes RESPONDER al mensaje de registro con `/add plan`\n"
         "• `/configpago group_id` - Configurar datos de pago\n"
         "• `/configfuego group_id @username` - Configurar contacto de Fuego\n"
+        "• `/configpago group_id` - Configurar datos de pago\n"
+        "• `/configlink group_id link` - Configurar link de FREE o Comunidad\n"
+        "• `/configfuego group_id @username` - Configurar contacto de Fuego\n"
         "• `/configmsg group_id tipo` - Configurar mensajes del flujo\n"
         "• `/broadcast group_id` - Enviar mensaje masivo\n\n"
         "*Usuarios (VIP):*\n• `/pagar` - Ver datos de pago\n\n"
@@ -4534,13 +4537,13 @@ async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode="Markdown"
     )
 
-async def config_free_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def config_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "❌ *Uso: `/configfreelink group_id link_invitación`*\n\n"
-            "Ejemplo:\n`/configfreelink -1001234567890 https://t.me/+AbCdEfGhIjKlMnOp`\n\n"
-            "O para canal público:\n`/configfreelink -1001234567890 https://t.me/micanal`",
+            "❌ *Uso: `/configlink group_id link_invitación`*\n\n"
+            "Ejemplo:\n`/configlink -1001234567890 https://t.me/+AbCdEfGhIjKlMnOp`\n\n"
+            "O para canal público:\n`/configlink -1001234567890 https://t.me/micanal`",
             parse_mode="Markdown"
         )
         return
@@ -4552,22 +4555,26 @@ async def config_free_link_command(update: Update, context: ContextTypes.DEFAULT
     if not can_manage_group(user_id, group_id):
         await update.message.reply_text("❌ No autorizado")
         return
+    
     group = get_group_by_id(group_id)
-    if not group or group.get("type") != "FREE":
-        await update.message.reply_text("❌ Este comando solo funciona en grupos FREE")
+    if not group or group.get("type") not in ("FREE", "COMUNIDAD"):
+        await update.message.reply_text("❌ Este comando solo funciona en grupos FREE o Comunidad")
         return
+        
     invite_link = " ".join(context.args[1:]).strip()
     if not invite_link.startswith(("https://t.me/", "http://t.me/")):
         await update.message.reply_text("❌ Link inválido. Debe empezar con `https://t.me/`", parse_mode="Markdown")
         return
+        
     with GROUPS_LOCK:
-        group = get_group_by_id(group_id)
-        if not group or group.get("type", "VIP") not in ("FREE", "COMUNIDAD"):
-            await update.message.reply_text("❌ Este comando solo funciona en grupos FREE o Comunidad")
+        group = GROUPS.get(group_id)
+        if not group:
+            await update.message.reply_text("❌ Grupo no encontrado")
             return
         settings = dict(group.get("settings", {}))
         settings['invite_link'] = invite_link
         group["settings"] = settings
+        
     await db.update_group_fields(group_id, {'settings': settings})
     await update.message.reply_text(
         f"✅ *Link configurado*\n\n📋 Grupo: {group['group_name']}\n🔗 Link: `{invite_link}`\n\n"
@@ -5786,7 +5793,7 @@ async def main():
     bot_app.add_handler(CommandHandler("linkvip", link_vip_command))
     bot_app.add_handler(CommandHandler("linkcomunidad", link_comunidad_command)) 
     bot_app.add_handler(CommandHandler("checkspin", check_spin_command))
-    bot_app.add_handler(CommandHandler("configfreelink", config_free_link_command))
+    bot_app.add_handler(CommandHandler("configlink", config_link_command))
     bot_app.add_handler(CommandHandler("configmsg", config_messages_command))
     bot_app.add_handler(CommandHandler("configfuego", config_fuego_command))
     bot_app.add_handler(CommandHandler("info", info_command))
