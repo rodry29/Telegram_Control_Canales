@@ -468,12 +468,17 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
         return False
 
 def extract_user_from_reply(text: str) -> tuple:
-    """Extrae user_id, username y first_name de un mensaje del bot de forma uniforme."""
+    """Extrae user_id, group_id, username y first_name de un mensaje del bot de forma uniforme."""
     if not text:
-        return None, None, None
-    # Regex unificada y robusta
+        return None, None, None, None
+    
     id_match = re.search(r'🆔\s*\*?ID:?\*?\s*`?(\d+)`?', text)
+    if not id_match:
+        id_match = re.search(r'tg://user\?id=(\d+)', text)
     user_id = int(id_match.group(1)) if id_match else None
+    
+    group_match = re.search(r'📌\s*\*?Grupo:?\*?\s*`?(-?\d+)`?', text)
+    group_id = int(group_match.group(1)) if group_match else None
     
     name_match = re.search(r'👤\s*\*?Nombre:?\*?\s*(.+?)(?:\n|$)', text)
     first_name = name_match.group(1).strip().replace('*', '') if name_match else None
@@ -481,11 +486,10 @@ def extract_user_from_reply(text: str) -> tuple:
     username_match = re.search(r'@(\w+)', text)
     username = username_match.group(1) if username_match else None
     
-    return user_id, username, first_name
+    return user_id, group_id, username, first_name
 
 async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user_id: int, plan: str, custom_price: float = None, custom_days: int = None, is_renewal: bool = False):
     """Función centralizada para activar o renovar suscripciones. Recibe SIEMPRE un user_id resuelto."""
-    # 1. Intentar obtener info fresca de Telegram, si falla, usar la BD
     first_name = ""
     username = f"user_{target_user_id}"
     try:
@@ -499,12 +503,10 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
             first_name = db_user.get('first_name', '') or ''
             username = db_user.get('username', '') or f"user_{target_user_id}"
 
-    # 2. Asegurar que el usuario exista en la base de datos (si es nuevo)
     existing = await db.get_user_by_id(target_user_id, group_id)
     if not existing:
         await db.register_free_user(group_id, target_user_id, username, first_name)
 
-    # 3. Ejecutar la acción en la base de datos
     if is_renewal:
         success, msg = await db.renew_user_subscription(group_id, target_user_id, plan, custom_price, custom_days, first_name)
         action_text = "Renovación"
@@ -512,10 +514,15 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
         success, msg = await db.add_or_update_user_by_id(group_id, target_user_id, plan, first_name, custom_price, custom_days)
         action_text = "Activación"
 
-    # 4. Notificar al administrador el resultado de la BD
-    await reply_func(f"✅ *{action_text} de suscripción*\n\n{msg}", parse_mode="Markdown")
+    group = get_group_by_id(group_id)
+    group_name = group.get('group_name', 'VIP') if group else 'VIP'
+    group_type = group.get('type', 'VIP') if group else 'VIP'
+    
+    await reply_func(
+        f"✅ *{action_text} de suscripción*\n\n📌 *Grupo:* {group_name} ({group_type})\n🆔 *ID:* `{group_id}`\n\n{msg}",
+        parse_mode="Markdown"
+    )
 
-    # 5. Si tuvo éxito, marcar descuento de ruleta (si aplica) y notificar al usuario
     if success:
         await _mark_discount_if_any(target_user_id, group_id, plan)
         await _send_subscription_notification(bot, target_user_id, group_id, plan, is_renewal=is_renewal)
@@ -578,18 +585,29 @@ async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, t
         parse_mode="Markdown"
     )
 
-    if success_vip:
-        await _mark_discount_if_any(target_user_id, vip_group_id, plan)
-    if success_com:
-        await _mark_discount_if_any(target_user_id, comunidad_group_id, plan)
-
     if success_vip or success_com:
+        for gid, success in [(vip_group_id, success_vip), (comunidad_group_id, success_com)]:
+            if success:
+                try:
+                    await bot.unban_chat_member(gid, target_user_id, only_if_banned=True)
+                except Exception as e:
+                    logger.warning(f"No se pudo desbanear a {target_user_id} en {gid}: {e}")
+                try:
+                    await bot.restrict_chat_member(gid, target_user_id, permissions=UNMUTE_PERMISSIONS)
+                    await db.clear_muted(target_user_id, gid)
+                except Exception:
+                    pass
+        
+        vip_link = vip_group.get("settings", {}).get("vip_invite_link", "").strip()
+        link_msg = f"\n\n🔗 *Enlace VIP:* {vip_link}" if vip_link else ""
+        
         try:
             await bot.send_message(
                 target_user_id,
                 f"🎉 *¡Tu combo VIP + Comunidad ha sido {'renovado' if is_renewal else 'activado'}!*\n\n"
-                f"👑 Acceso VIP: *{plan}*\n👥 Acceso Comunidad: *{plan}*\n\n¡Gracias por tu confianza! 🙌",
-                parse_mode="Markdown"
+                f"👑 Acceso VIP: *{plan}*\n👥 Acceso Comunidad: *{plan}*{link_msg}\n\n¡Gracias por tu confianza! 🙌",
+                parse_mode="Markdown",
+                disable_web_page_preview=True
             )
         except Exception as e:
             logger.warning(f"No se pudo notificar combo a {target_user_id}: {e}")
@@ -955,6 +973,16 @@ class Database:
                     INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (existing['user_id'], group_id, uname, fn, plan, effective_price, dur_minutes, now))
+                
+                # --- DISPARAR NOTIFY PARA OTROS BOTS ---
+                payload = json.dumps({
+                    "user_id": existing['user_id'], 
+                    "group_id": group_id, 
+                    "plan": plan
+                })
+                cur.execute("NOTIFY vip_cache_invalidation, %s", (payload,))
+                # ---------------------------------------
+
                 price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
                 display = fn if fn else uname
                 return True, f"✅ *{display}* {action}\n📋 Plan: {plan} | 💰 {price_str}\n📅 Expira: {expiry_str}"
@@ -1593,6 +1621,42 @@ async def _unmute_user_and_unban(group_id: int, user_id: int):
         pass
     await db.clear_muted(user_id, group_id)
 
+async def verify_on_startup():
+    """Verificación post-deploy: detecta usuarios que entraron durante la caída del bot."""
+    logger.info("🚀 Iniciando verificación post-deploy...")
+    
+    # 1. Ejecutar verificación de expirados inmediatamente
+    try:
+        await check_expired_subscriptions()
+        logger.info("✅ Verificación de expirados completada")
+    except Exception as e:
+        logger.error(f"❌ Error en verificación de expirados: {e}")
+    
+    # 2. Reintegrar usuarios de Comunidad expulsados por esquema viejo
+    try:
+        await reintegrate_comunidad_users()
+        logger.info("✅ Reintegración de Comunidad completada")
+    except Exception as e:
+        logger.error(f"❌ Error en reintegración: {e}")
+    
+    # 3. Notificar al Super Admin
+    try:
+        groups_count = len(get_all_groups_snapshot())
+        await _safe_send(
+            SUPER_ADMIN_ID,
+            f"🚀 *Bot reiniciado — Verificación completada*\n\n"
+            f"📊 Grupos activos: {groups_count}\n"
+            f"✅ Expulsados expirados: verificado\n"
+            f"✅ Reintegración Comunidad: verificado\n"
+            f"✅ Eventos pendientes: procesando...\n\n"
+            f"💡 Los usuarios que entraron durante la caída serán detectados al escribir o mediante eventos pendientes.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+    
+    logger.info("✅ Verificación post-deploy finalizada")
+
 async def reintegrate_comunidad_users():
     """Reintegra (desbanea) usuarios expulsados por el esquema viejo de Comunidad."""
     vip_groups = [g for g in get_all_groups_snapshot()
@@ -1901,7 +1965,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📝 Configurar Mensajes", callback_data=f"cfg_messages_{group_id}")],
                 [InlineKeyboardButton("📢 Broadcast Trial", callback_data="broadcast_menu")],
             ]
-            await query.edit_message_text(
+            await send(
                 f"👥 *Panel Comunidad - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n👑 Admin: `{group['admin_id']}`\n\n"
                 f"💡 *Tarifas actuales:*\n• ⏱ Trial: {fmt_minutes(cfg.get('minutes', 1440))}\n"
                 f"• 📅 Semanal: ${cfg_s['price']}\n• 📆 Mensual: ${cfg_m['price']}\n\n"
@@ -1913,7 +1977,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📋 Clientes potenciales", callback_data="list_potential")],
                 [InlineKeyboardButton("📥 Exportar clientes", callback_data="export_clients")]
             ]
-            await query.edit_message_text(
+            await send(
                 f"📋 *Panel FREE - {group['group_name']}*\n\n🆔 ID: `{group['group_id']}`\n👑 Admin: `{group['admin_id']}`",
                 reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
             )
@@ -2080,7 +2144,7 @@ async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-    target_user_id, _, _ = extract_user_from_reply(text)
+    target_user_id, target_group_id, _, _ = extract_user_from_reply(text)
     
     if not target_user_id:
         await update.message.reply_text(
@@ -2091,7 +2155,7 @@ async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
         
-    current_group = context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
+    current_group = target_group_id or context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
     if not current_group or not can_manage_group(user_id, current_group):
         await update.message.reply_text("❌ No autorizado para gestionar este grupo")
         return
@@ -2122,7 +2186,6 @@ async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Días inválidos", parse_mode="Markdown"); return
 
-    # Delegamos al flujo central
     await _execute_subscription_flow(
         context.bot, update.message.reply_text, current_group, target_user_id, plan, custom_price, custom_days, is_renewal=False
     )
@@ -2195,11 +2258,11 @@ async def handle_reply_addcombo(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-    target_user_id, _, _ = extract_user_from_reply(text)
+    target_user_id, target_group_id, _, _ = extract_user_from_reply(text)
     if not target_user_id:
         await update.message.reply_text("❌ No pude encontrar el ID del usuario en el mensaje.", parse_mode="Markdown")
         return
-    current_group = context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
+    current_group = target_group_id or context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
     if not current_group or not can_manage_group(user_id, current_group):
         await update.message.reply_text("❌ No autorizado para gestionar este grupo")
         return
@@ -2274,11 +2337,11 @@ async def handle_reply_renewcombo(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-    target_user_id, _, _ = extract_user_from_reply(text)
+    target_user_id, target_group_id, _, _ = extract_user_from_reply(text)
     if not target_user_id:
         await update.message.reply_text("❌ No pude encontrar el ID del usuario en el mensaje.", parse_mode="Markdown")
         return
-    current_group = context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
+    current_group = target_group_id or context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
     if not current_group or not can_manage_group(user_id, current_group):
         await update.message.reply_text("❌ No autorizado para gestionar este grupo")
         return
@@ -2358,19 +2421,31 @@ async def _send_subscription_notification(bot, target_user_id: int, current_grou
     """Envía un mensaje de confirmación al usuario dependiendo de si es activación o renovación."""
     group = get_group_by_id(current_group)
     group_name = group['group_name'] if group else 'VIP'
+    group_type = group.get('type', 'VIP') if group else 'VIP'
+
     try:
-        if is_renewal:
-            await bot.send_message(
-                target_user_id,
-                f"🔄 *¡Tu suscripción ha sido renovada!*\n\nTu plan *{plan}* en *{group_name}* ha sido extendido. ¡Gracias! 🎉",
-                parse_mode="Markdown"
-            )
-        else:
-            await bot.send_message(
-                target_user_id,
-                f"🎉 *¡Suscripción activada!*\n\nTu plan *{plan}* en *{group_name}* ha sido activado. ¡Gracias!",
-                parse_mode="Markdown"
-            )
+        await bot.unban_chat_member(current_group, target_user_id, only_if_banned=True)
+        logger.info(f"✅ Usuario {target_user_id} desbaneado de {current_group} (si estaba baneado)")
+    except Exception as e:
+        logger.warning(f"No se pudo desbanear a {target_user_id} en {current_group}: {e}")
+
+    try:
+        await bot.restrict_chat_member(current_group, target_user_id, permissions=UNMUTE_PERMISSIONS)
+        await db.clear_muted(target_user_id, current_group)
+    except Exception as e:
+        logger.warning(f"No se pudo desmutear a {target_user_id} en {current_group}: {e}")
+
+    if is_renewal:
+        msg = f"🔄 *¡Tu suscripción ha sido renovada!*\n\nTu plan *{plan}* en *{group_name}* ha sido extendido. ¡Gracias! 🎉"
+    else:
+        msg = f"🎉 *¡Suscripción activada!*\n\nTu plan *{plan}* en *{group_name}* ({group_type}) ha sido activado. ¡Gracias!"
+    
+    if group and group.get("type", "VIP") == "VIP":
+        vip_link = group.get("settings", {}).get("vip_invite_link", "").strip()
+        if vip_link and vip_link.startswith(("https://", "http://")):
+            msg += f"\n\n🔗 *Enlace para entrar al VIP:*\n{vip_link}\n\n⚠️ Si no puedes entrar, espera 30 segundos e intenta de nuevo."
+    try:
+        await bot.send_message(target_user_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         logger.warning(f"No se pudo notificar al usuario {target_user_id}: {e}")
 
@@ -2477,7 +2552,7 @@ async def handle_reply_renew(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-    target_user_id, _, _ = extract_user_from_reply(text)
+    target_user_id, target_group_id, _, _ = extract_user_from_reply(text)
     
     if not target_user_id:
         await update.message.reply_text(
@@ -3270,8 +3345,13 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             await _safe_send(
                 group["admin_id"],
-                f"🆕 *Nuevo usuario VIP (Acceso Directo)*\n\n👤 *Nombre:* [{display}]({chat_link})\n🆔 *ID:* `{user_id}`\n"
-                f"⏱ *Trial VIP:* {trial_str}\n\n💡 *Para activar pago:* `/add {user_id} mensual`\n"
+                f"🆕 *Nuevo usuario VIP*\n\n"
+                f"👤 *Nombre:* [{display}]({chat_link})\n"
+                f"🆔 *ID:* `{user_id}`\n"
+                f"📌 *Grupo:* `{chat_id}`\n"
+                f"🌍 *Origen:* {source}\n"
+                f"⏱ *Trial VIP:* {trial_str}\n\n"
+                f"💡 *Para activar pago:* `/add {user_id} mensual`\n"
                 f"🤝 *Combo con Comunidad:* `/addcombo {user_id} mensual`",
                 parse_mode="Markdown", disable_notification=True
             )
@@ -3289,7 +3369,16 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             expired_msg = custom_messages['expired_message']
         expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
         await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
-        await _safe_send(group["admin_id"], f"🚫 *Reingreso denegado (VIP)*\n\n👤 [{display}]({chat_link})\n⚠️ *Motivo:* {motivo_admin}", parse_mode="Markdown", disable_notification=True)
+        await _safe_send(
+            group["admin_id"],
+            f"🚫 *Reingreso denegado (VIP)*\n\n"
+            f"👤 [{display}]({chat_link})\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 *Grupo:* `{chat_id}`\n"
+            f"🌍 *Origen:* {source}\n"
+            f"⚠️ *Motivo:* {motivo_admin}",
+            parse_mode="Markdown", disable_notification=True
+        )
     return False
 # --- NUEVO HANDLER PARA COMUNIDAD ---
 async def _process_new_comunidad_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
@@ -3313,7 +3402,12 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             await _safe_send(
                 group["admin_id"],
-                f"🆕 *Nuevo usuario Comunidad*\n\n👤 [{display}]({chat_link})\n🆔 `{user_id}`\n⏱ Trial: {trial_str}\n\n"
+                f"🆕 *Nuevo usuario Comunidad*\n\n"
+                f"👤 [{display}]({chat_link})\n"
+                f"🆔 *ID:* `{user_id}`\n"
+                f"📌 *Grupo:* `{chat_id}`\n"
+                f"🌍 *Origen:* {source}\n"
+                f"⏱ *Trial:* {trial_str}\n\n"
                 f"💡 `/add {user_id} mensual` (usando este grupo Comunidad)",
                 parse_mode="Markdown", disable_notification=True
             )
@@ -3326,7 +3420,16 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
         expired_msg = format_message(DEFAULT_COMUNIDAD_MUTED_MESSAGE, {'group_name': group['group_name']})
         await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
         motivo = "Plan vencido" if result_code == "expirado" else "Trial ya utilizado"
-        await _safe_send(group["admin_id"], f"🔇 *Silenciado en Comunidad*\n\n👤 [{display}]({chat_link})\n⚠️ Motivo: {motivo}", parse_mode="Markdown", disable_notification=True)
+        await _safe_send(
+            group["admin_id"],
+            f"🔇 *Silenciado*\n\n"
+            f"👤 [{display}]({chat_link})\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 *Grupo:* `{chat_id}`\n"
+            f"🌍 *Origen:* {source}\n"
+            f"⚠️ *Motivo:* {motivo}",
+            parse_mode="Markdown", disable_notification=True
+        )
     return False
     
 async def _process_new_free_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
@@ -3334,7 +3437,16 @@ async def _process_new_free_member(chat_id: int, user_id: int, username: str, fi
     chat_link = f"tg://user?id={user_id}"
     is_new = await db.register_free_user(chat_id, user_id, username, first_name, source)
     if is_new:
-                await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🌍 *Origen:* {source}\n🔗 [Abrir chat]({chat_link})", parse_mode="Markdown")
+        await _safe_send(
+            group["admin_id"],
+            f"📋 *Nuevo cliente potencial*\n\n"
+            f"👤 *Nombre:* {display}\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 *Grupo:* `{chat_id}`\n"
+            f"🌍 *Origen:* {source}\n"
+            f"🔗 [Abrir chat]({chat_link})",
+            parse_mode="Markdown"
+        )
     return is_new
 
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3353,8 +3465,25 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group: return
     
     source = "Directo"
-    if result.invite_link and result.invite_link.name:
-        source = result.invite_link.name
+    if result.invite_link:
+        link_name = result.invite_link.name
+        link_url = result.invite_link.invite_link or ""
+        if link_name:
+            source = f"Link: {link_name}"
+        elif link_url:
+            # Extraer identificador corto del link
+            if "+" in link_url:
+                short = link_url.split("+")[-1][:15]
+            else:
+                short = link_url.split("/")[-1][:15]
+            source = f"Link sin nombre (…{short})"
+        else:
+            source = "Link (sin datos)"
+    
+    if result.via_chat_folder_invite_link:
+        source = "Link de carpeta"
+    if result.from_user and result.from_user.id != new_member.id and not result.invite_link:
+        source = f"Añadido por: {result.from_user.first_name or result.from_user.id}"
         
     user_id = new_member.id
     username = new_member.username or f"user_{user_id}"
@@ -3393,19 +3522,26 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
     if group["type"] == "FREE":
         is_new = await db.register_free_user(chat_id, user_id, username, first_name)
         if is_new:
-            await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", parse_mode="Markdown", disable_notification=True)
-        if existing and existing.get("status") == "active" or not existing:
-            _mark_known_member(cache_key)
-    else:
-        # Grupo VIP
+            await _safe_send(
+                group["admin_id"],
+                f"📋 *Nuevo cliente potencial detectado*\n\n"
+                f"👤 *Nombre:* {display}\n"
+                f"🆔 *ID:* `{user_id}`\n"
+                f"📌 *Grupo:* `{chat_id}`\n"
+                f"🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._",
+                parse_mode="Markdown", disable_notification=True
+            )
+        _mark_known_member(cache_key)
+    elif group["type"] == "VIP":
         if not existing:
-            await _safe_send(group["admin_id"], f"📋 *Nuevo cliente potencial detectado*\n\n👤 *Nombre:* {display}\n🆔 *ID:* `{user_id}`\n📌 *Grupo:* {group['group_name']}\n🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._", parse_mode="Markdown", disable_notification=True)
-            _mark_known_member(cache_key) 
-        elif existing.get("status") == "active":
-            _mark_known_member(cache_key)
-        else:
-            
-            _mark_known_member(cache_key)
+            logger.info(f"🔍 Usuario {user_id} detectado en VIP {chat_id} sin registro previo — procesando como nuevo")
+            await _process_new_vip_member(chat_id, user_id, username, first_name, group, source="Detectado al escribir (posible caída del bot)")
+        _mark_known_member(cache_key)
+    elif group["type"] == "COMUNIDAD":
+        if not existing:
+            logger.info(f"🔍 Usuario {user_id} detectado en Comunidad {chat_id} sin registro previo — procesando como nuevo")
+            await _process_new_comunidad_member(chat_id, user_id, username, first_name, group, source="Detectado al escribir (posible caída del bot)")
+        _mark_known_member(cache_key)
 # ==================== CONFIGURACIÓN DE PRECIOS Y TRIAL ====================
 async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
@@ -5262,7 +5398,11 @@ async def check_expired_subscriptions():
 
                 await _safe_send(
                     group["admin_id"],
-                    f"{emoji} *Suscripción/Trial Expirado*\n\n👤 [{display}]({chat_link})\n✅ Usuario {action_text}.",
+                    f"{emoji} *Suscripción/Trial Expirado*\n\n"
+                    f"👤 [{display}]({chat_link})\n"
+                    f"🆔 *ID:* `{user_id}`\n"
+                    f"📌 *Grupo:* `{group_id}`\n"
+                    f"✅ Usuario {action_text}.",
                     parse_mode="Markdown"
                 )
                 expired_msg = format_message(expired_msg_template, {'group_name': group['group_name']})
@@ -5509,9 +5649,9 @@ async def main():
     logger.info("🤖 Bot iniciado")
     await bot_app.initialize()
     await bot_app.start()
-    await reintegrate_comunidad_users()
+    await verify_on_startup()
     await bot_app.updater.start_polling(
-        drop_pending_updates=True,
+        drop_pending_updates=False,
         allowed_updates=["message", "callback_query", "chat_member", "my_chat_member", "message_reaction"]
     )
     await asyncio.Event().wait()
