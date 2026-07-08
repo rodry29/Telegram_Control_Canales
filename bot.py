@@ -2045,6 +2045,7 @@ async def menu_view_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     keyboard = [
         [InlineKeyboardButton("👑 Grupos VIP", callback_data="view_vip_groups")],
+        [InlineKeyboardButton("👥 Grupos Comunidad", callback_data="view_comunidad_groups")],
         [InlineKeyboardButton("📋 Grupos FREE", callback_data="view_free_groups")],
         _back_button("menu_groups"),
     ]
@@ -3081,6 +3082,9 @@ async def view_vip_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def view_free_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_groups_by_type(update, context, "FREE", True)
 
+async def view_comunidad_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_groups_by_type(update, context, "COMUNIDAD", True)
+    
 async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_type: str, select_mode: bool = False):
     query = update.callback_query
     await query.answer()
@@ -5630,6 +5634,8 @@ CALLBACK_EXACT = {
     "view_vip_groups": lambda u, c, d: view_vip_groups(u, c),
     "free_groups": lambda u, c, d: view_free_groups(u, c),
     "view_free_groups": lambda u, c, d: view_free_groups(u, c),
+    "comunidad_groups": lambda u, c, d: view_comunidad_groups(u, c),
+    "view_comunidad_groups": lambda u, c, d: view_comunidad_groups(u, c),
     "total_earnings": lambda u, c, d: total_earnings(u, c),
     "all_groups": lambda u, c, d: list_groups(u, c),
     "groups": lambda u, c, d: list_groups(u, c),
