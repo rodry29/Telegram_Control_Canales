@@ -802,6 +802,23 @@ class Database:
         await self._run(_init)
         logger.info("✅ Base de datos inicializada")
 
+    async def load_groups_from_db(self):
+        def _load(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT group_id, group_name, admin_id, COALESCE(group_type, 'VIP') as group_type, COALESCE(settings, '{}') as settings FROM groups")
+                return cur.fetchall()
+        rows = await self._run(_load)
+        if rows:
+            with GROUPS_LOCK:
+                GROUPS.clear()
+                for g in rows:
+                    settings = g["settings"] if isinstance(g["settings"], dict) else {}
+                    GROUPS[g["group_id"]] = {"group_id": g["group_id"], "group_name": g["group_name"],
+                                   "admin_id": g["admin_id"], "type": g["group_type"], "settings": settings}
+            logger.info(f"📦 {len(GROUPS)} grupos cargados desde BD")
+            return True
+        return False
+        
     async def load_group_messages(self):
         def _load(conn):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
