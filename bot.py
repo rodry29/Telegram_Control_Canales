@@ -221,7 +221,7 @@ def safe_name(text: str) -> str:
     """Sanitiza texto para Markdown v1 (parse_mode='Markdown')."""
     if not text:
         return ""
-    return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('`', '\\`').replace('(', '\\(').replace(')', '\\)')
+    return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('`', '\\`')
 
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
@@ -515,7 +515,7 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
         action_text = "Activación"
 
     group = get_group_by_id(group_id)
-    group_name = group.get('group_name', 'VIP') if group else 'VIP'
+    group_name = safe_name(group.get('group_name', 'VIP')) if group else 'VIP'
     group_type = group.get('type', 'VIP') if group else 'VIP'
     
     await reply_func(
@@ -2489,7 +2489,7 @@ async def _mark_discount_if_any(target_user_id: int, current_group: int, plan: s
 async def _send_subscription_notification(bot, target_user_id: int, current_group: int, plan: str, is_renewal: bool):
     """Envía un mensaje de confirmación al usuario dependiendo de si es activación o renovación."""
     group = get_group_by_id(current_group)
-    group_name = group['group_name'] if group else 'VIP'
+    group_name = safe_name(group['group_name']) if group else 'VIP'
     group_type = group.get('type', 'VIP') if group else 'VIP'
 
     try:
@@ -3399,8 +3399,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             welcome_msg = format_message(welcome_msg, {
                 'trial_duration': trial_str,
                 'expiry_time': expiry_str,
-                'group_name': group['group_name'],
-                'user_name': first_name or username
+                'group_name': safe_name(group['group_name']),
+                'user_name': safe_name(first_name or username)
             })
 
             keyboard = []
@@ -3417,7 +3417,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 f"🆕 *Nuevo usuario VIP*\n\n"
                 f"👤 *Nombre:* [{display}]({chat_link})\n"
                 f"🆔 *ID:* `{user_id}`\n"
-                f"📌 *Grupo:* `{chat_id}`\n"
+                f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
                 f"🌍 *Origen:* {source}\n"
                 f"⏱ *Trial VIP:* {trial_str}\n\n"
                 f"💡 *Para activar pago:* `/add {user_id} mensual`\n"
@@ -3443,9 +3443,9 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             f"🚫 *Reingreso denegado (VIP)*\n\n"
             f"👤 [{display}]({chat_link})\n"
             f"🆔 *ID:* `{user_id}`\n"
-            f"📌 *Grupo:* `{chat_id}`\n"
-            f"🌍 *Origen:* {source}\n"
-            f"⚠️ *Motivo:* {motivo_admin}",
+            f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
+            f"🌍 *Origen:* {safe_name(source)}\n"
+            f"⚠️ *Motivo:* {safe_name(motivo_admin)}",
             parse_mode="Markdown", disable_notification=True
         )
     return False
@@ -3464,8 +3464,8 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
             welcome_msg = format_message(DEFAULT_COMUNIDAD_WELCOME_MESSAGE, {
                 'trial_duration': trial_str,
                 'expiry_time': expiry_str,
-                'group_name': group['group_name'],
-                'user_name': first_name or username
+                'group_name': safe_name(group['group_name']),
+                'user_name': safe_name(first_name or username)
             })
             keyboard = [[InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")]]
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -3474,7 +3474,7 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
                 f"🆕 *Nuevo usuario Comunidad*\n\n"
                 f"👤 [{display}]({chat_link})\n"
                 f"🆔 *ID:* `{user_id}`\n"
-                f"📌 *Grupo:* `{chat_id}`\n"
+                f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
                 f"🌍 *Origen:* {source}\n"
                 f"⏱ *Trial:* {trial_str}\n\n"
                 f"💡 `/add {user_id} mensual` (usando este grupo Comunidad)",
@@ -3494,9 +3494,9 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
             f"🔇 *Silenciado*\n\n"
             f"👤 [{display}]({chat_link})\n"
             f"🆔 *ID:* `{user_id}`\n"
-            f"📌 *Grupo:* `{chat_id}`\n"
-            f"🌍 *Origen:* {source}\n"
-            f"⚠️ *Motivo:* {motivo}",
+            f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
+            f"🌍 *Origen:* {safe_name(source)}\n"
+            f"⚠️ *Motivo:* {safe_name(motivo)}",
             parse_mode="Markdown", disable_notification=True
         )
     return False
@@ -3511,7 +3511,7 @@ async def _process_new_free_member(chat_id: int, user_id: int, username: str, fi
             f"📋 *Nuevo cliente potencial*\n\n"
             f"👤 *Nombre:* {display}\n"
             f"🆔 *ID:* `{user_id}`\n"
-            f"📌 *Grupo:* `{chat_id}`\n"
+            f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
             f"🌍 *Origen:* {source}\n"
             f"🔗 [Abrir chat]({chat_link})",
             parse_mode="Markdown"
@@ -3596,7 +3596,7 @@ async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"📋 *Nuevo cliente potencial detectado*\n\n"
                 f"👤 *Nombre:* {display}\n"
                 f"🆔 *ID:* `{user_id}`\n"
-                f"📌 *Grupo:* `{chat_id}`\n"
+                f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
                 f"🔗 [Abrir chat]({chat_link})\n\n_Detectado al escribir en el grupo._",
                 parse_mode="Markdown", disable_notification=True
             )
@@ -3972,7 +3972,7 @@ async def save_configured_message(update, context, text, msg_type, group_id):
     safe_type = msg_type.replace('_', r'\_')
     await update.message.reply_text(
         f"✅ *Mensaje de {safe_type} actualizado*\n\n"
-        f"📋 Grupo: `{group_id}`\n\n"
+        f"📋 Grupo: {safe_name(group['group_name'])}\n\n"
         f"El mensaje se usará a partir de ahora.",
         parse_mode="Markdown"
     )
@@ -5470,16 +5470,16 @@ async def check_expired_subscriptions():
                     f"{emoji} *Suscripción/Trial Expirado*\n\n"
                     f"👤 [{display}]({chat_link})\n"
                     f"🆔 *ID:* `{user_id}`\n"
-                    f"📌 *Grupo:* `{group_id}`\n"
-                    f"✅ Usuario {action_text}.",
+                    f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
+                    f"✅ Usuario {safe_name(action_text)}.",
                     parse_mode="Markdown"
                 )
-                expired_msg = format_message(expired_msg_template, {'group_name': group['group_name']})
+                expired_msg = format_message(expired_msg_template, {'group_name': safe_name(group['group_name'])})
                 await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
 
     await asyncio.gather(*[_process_group(g) for g in groups_to_check], return_exceptions=True)
+    
 # ==================== CALLBACK HANDLER ====================
-
 async def _handle_back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     query = update.callback_query
     await query.answer()
