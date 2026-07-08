@@ -813,8 +813,6 @@ class Database:
             for r in rows:
                 GROUP_MESSAGES_CACHE[r['group_id']] = dict(r)
         logger.info(f"📨 {len(GROUP_MESSAGES_CACHE)} mensajes de grupo cargados en caché")
-            return True
-        return False
 
     async def save_group(self, group_id: int, group_name: str, admin_id: int, group_type: str = "VIP"):
         def _save(conn):
