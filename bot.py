@@ -221,7 +221,7 @@ def safe_name(text: str) -> str:
     """Sanitiza texto para Markdown v1 (parse_mode='Markdown')."""
     if not text:
         return ""
-    return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
+    return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('`', '\\`').replace('(', '\\(').replace(')', '\\)')
 
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
@@ -1715,7 +1715,12 @@ def get_channels() -> List[Dict[str, Any]]:
                 if g.get("type") == "FREE" and g["admin_id"] == vip["admin_id"]:
                     free_group = g
                     break
-            
+
+        comunidad_group = None
+        com_id = vip.get("settings", {}).get("linked_comunidad_group_id")
+        if com_id:
+            comunidad_group = get_group_by_id(com_id)
+        
         channel_name = vip.get("settings", {}).get("channel_name", vip["group_name"])
         channels.append({
             "channel_name": channel_name,
@@ -1789,7 +1794,12 @@ async def show_channel_menu(send_func, user_id: int, channel: dict):
     elif free:
         # Solo mostramos el botón deshabilitado si el FREE existe pero no tiene link
         keyboard.append([InlineKeyboardButton("📢 Grupo Free (sin link)", callback_data="no_free_link")])
-    
+
+    if com_link:
+        keyboard.append([InlineKeyboardButton("👥 Grupo Comunidad", url=com_link)])
+    elif comunidad:
+        keyboard.append([InlineKeyboardButton("👥 Grupo Comunidad (sin link)", callback_data="no_free_link")])
+        
     keyboard.append([InlineKeyboardButton("🔥 Grupo VIP", callback_data=f"channel_vip_{group_id}")])
     await send_func(desc, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
