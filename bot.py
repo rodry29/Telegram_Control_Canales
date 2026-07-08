@@ -1089,6 +1089,14 @@ class Database:
                 return [row[0] for row in cur.fetchall()]
         return await self._run(_expire)
 
+    async def get_user_spins_anywhere(self, user_id: int) -> List[dict]:
+        """Busca si un usuario tiene giros de ruleta en cualquier grupo, aunque no esté en la tabla users."""
+        def _get(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM discount_spins WHERE user_id = %s", (user_id,))
+                return cur.fetchall()
+        return await self._run(_get)
+
     async def get_potential_clients_stats(self, group_id: int):
         now = datetime.now(ZoneInfo("UTC"))
         start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -2549,46 +2557,140 @@ async def _send_subscription_notification(bot, target_user_id: int, current_grou
 # ==================== COMANDO /add ====================
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_manage_group(update.effective_user.id, context.user_data.get('current_group', 0)) and update.effective_user.id != SUPER_ADMIN_ID: return
+    
     target_id = None
+    target_group_id = None
+    
+    # 1. Si se responde a un mensaje, extraer ID y Group_ID de ahí
     if update.message.reply_to_message:
         text = update.message.reply_to_message.text or ""
-        match = re.search(r'ID:?\s*`?(\d+)`?', text)
-        if match: target_id = int(match.group(1))
+        target_id, target_group_id, _, _ = extract_user_from_reply(text)
+        
+    # 2. Si no se encontró por respuesta, buscar en los argumentos
     if not target_id and context.args:
-        if context.args[0].isdigit(): target_id = int(context.args[0])
-        else:
-            user_rec = await db.get_user_by_username(context.args[0], context.user_data.get('current_group'))
-            if user_rec: target_id = user_rec['user_id']
+        if context.args[0].isdigit(): 
+            target_id = int(context.args[0])
+            
     if not target_id:
         await update.message.reply_text("❌ Responde a un mensaje de alerta del bot o usa `/info ID`.", parse_mode="Markdown"); return
-    group_id = context.user_data.get('current_group')
-    if not group_id: await update.message.reply_text("❌ Selecciona un grupo primero con /start"); return
-
-    user = await db.get_user_by_id_full(target_id, group_id)
-    if not user:
-        await update.message.reply_text("❌ Usuario no encontrado en este grupo."); return
-    spin_data = await db.get_spin_data(target_id, group_id)
-    best_discount = spin_data.get("best_discount", 0)
-    spin_used = spin_data.get("used", False)
-    msg = f"📊 *EXPEDIENTE DE CLIENTE*\n\n"
-    msg += f"👤 *Nombre:* {user.get('first_name', 'N/A')}\n"
-    msg += f"🆔 *ID:* `{user['user_id']}`\n"
-    username = user.get('username')
-    if username and not username.startswith('user_'): msg += f"🔗 *Username:* @{username}\n"
-    msg += f"🌍 *Origen:* {user.get('source', 'Directo')}\n"
-    msg += f"📋 *Estado:* {user.get('status', 'N/A').upper()}\n"
-    msg += f"📦 *Plan:* {user.get('plan', 'N/A').upper()}\n"
-    msg += f"📅 *Expira:* {fmt_dt(user.get('end_date'))}\n"
-    msg += f"🎰 *Ruleta:* {'✅ Usado' if spin_used else '⏳ Pendiente'}\n"
-    if best_discount > 0:
-        msg += f"🏆 *Descuento:* {best_discount}% OFF\n\n*💰 Precios con descuento:*\n"
-        msg += _build_price_list(group_id, discounted_pct=best_discount) + "\n\n💡 *Comandos:*\n"
-        for p in ["semanal", "mensual", "anual"]:
-            cfg = get_group_plan_config(group_id, p); price = cfg['price'] * (1 - best_discount/100)
-            msg += f"`/add {target_id} {p} {price:.2f}`\n"
-    else:
-        msg += "\n*💰 Precios normales:*\n" + _build_price_list(group_id) + "\n\n💡 *Comandos:*\n"
-        for p in ["semanal", "mensual", "anual"]: msg += f"`/add {target_id} {p}`\n"
+        
+    # 3. Determinar en qué grupo buscar primero (el del mensaje respondido, el actual, o el del chat)
+    group_id_to_query = target_group_id or context.user_data.get('current_group')
+    if not group_id_to_query and update.effective_chat.type in ("group", "supergroup"):
+        group_id_to_query = update.effective_chat.id
+        
+    # 4. Intentar buscar en el grupo específico
+    if group_id_to_query:
+        user = await db.get_user_by_id_full(target_id, group_id_to_query)
+        group = get_group_by_id(group_id_to_query)
+        group_name = safe_name(group.get('group_name', 'VIP')) if group else 'VIP'
+        g_type = 'vip' if (group and group.get('type') == 'VIP') else 'comunidad'
+        
+        # Si NO está en la tabla users, pero queremos saber si tiene ruleta
+        if not user:
+            spin_data = await db.get_spin_data(target_id, group_id_to_query)
+            if spin_data.get("spin_count", 0) > 0:
+                best_discount = spin_data.get("best_discount", 0)
+                spin_used = spin_data.get("used", False)
+                
+                msg = f"👤 *EXPEDIENTE DE CLIENTE POTENCIAL*\n\n"
+                msg += f"📌 *Grupo:* {group_name}\n"
+                msg += f"🆔 *ID:* `{target_id}`\n"
+                msg += f"📋 *Estado:* NO REGISTRADO (Aún no ingresa al grupo)\n"
+                msg += f"🎰 *Ruleta:* {'✅ Usado' if spin_used else '⏳ Pendiente'}\n"
+                
+                if best_discount > 0:
+                    msg += f"🏆 *Descuento:* {best_discount}% OFF\n\n*💰 Precios con descuento:*\n"
+                    msg += _build_price_list(group_id_to_query, discounted_pct=best_discount) + "\n\n💡 *Para activar pago:*\n"
+                    for p in ["semanal", "mensual", "anual"]:
+                        cfg = get_group_plan_config(group_id_to_query, p); price = cfg['price'] * (1 - best_discount/100)
+                        msg += f"`/add {target_id} {p} {price:.2f} {g_type}`\n"
+                else:
+                    msg += "\n*💰 Precios normales:*\n" + _build_price_list(group_id_to_query) + "\n\n💡 *Para activar pago:*\n"
+                    for p in ["semanal", "mensual", "anual"]: 
+                        msg += f"`/add {target_id} {p} {g_type}`\n"
+                        
+                await update.message.reply_text(msg, parse_mode="Markdown")
+                return
+                
+        # Si SÍ está en la tabla users
+        if user:
+            spin_data = await db.get_spin_data(target_id, group_id_to_query)
+            best_discount = spin_data.get("best_discount", 0)
+            spin_used = spin_data.get("used", False)
+            
+            msg = f"📊 *EXPEDIENTE DE CLIENTE*\n\n"
+            msg += f"📌 *Grupo:* {group_name}\n"
+            msg += f"👤 *Nombre:* {user.get('first_name', 'N/A')}\n"
+            msg += f"🆔 *ID:* `{user['user_id']}`\n"
+            username = user.get('username')
+            if username and not username.startswith('user_'): msg += f"🔗 *Username:* @{username}\n"
+            msg += f"🌍 *Origen:* {user.get('source', 'Directo')}\n"
+            msg += f"📋 *Estado:* {user.get('status', 'N/A').upper()}\n"
+            msg += f"📦 *Plan:* {user.get('plan', 'N/A').upper()}\n"
+            msg += f"📅 *Expira:* {fmt_dt(user.get('end_date'))}\n"
+            msg += f"🎰 *Ruleta:* {'✅ Usado' if spin_used else '⏳ Pendiente'}\n"
+            
+            if best_discount > 0:
+                msg += f"🏆 *Descuento:* {best_discount}% OFF\n\n*💰 Precios con descuento:*\n"
+                msg += _build_price_list(group_id_to_query, discounted_pct=best_discount) + "\n\n💡 *Comandos:*\n"
+                for p in ["semanal", "mensual", "anual"]:
+                    cfg = get_group_plan_config(group_id_to_query, p); price = cfg['price'] * (1 - best_discount/100)
+                    msg += f"`/add {target_id} {p} {price:.2f} {g_type}`\n"
+            else:
+                msg += "\n*💰 Precios normales:*\n" + _build_price_list(group_id_to_query) + "\n\n💡 *Comandos:*\n"
+                for p in ["semanal", "mensual", "anual"]: 
+                    msg += f"`/add {target_id} {p} {g_type}`\n"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+            
+    # 5. Si no está en el grupo actual ni tiene ruleta ahí, buscar en TODOS los grupos
+    user_groups = await db.get_user_groups(target_id)
+    spins_anywhere = await db.get_user_spins_anywhere(target_id)
+    
+    if not user_groups and not spins_anywhere:
+        await update.message.reply_text(f"❌ El usuario `{target_id}` no está registrado en ningún grupo ni tiene giros de ruleta.", parse_mode="Markdown")
+        return
+        
+    msg = f"👤 *EXPEDIENTE MULTI-GRUPO*\n\n🆔 *ID:* `{target_id}`\n\n"
+    
+    if user_groups:
+        msg += "📝 *Registros en grupos:*\n"
+        for gid in user_groups:
+            u = await db.get_user_by_id_full(target_id, gid)
+            g_obj = get_group_by_id(gid)
+            g_name = safe_name(g_obj.get('group_name', 'VIP')) if g_obj else "Desconocido"
+            g_type_str = "VIP" if g_obj.get("type") == "VIP" else "Comunidad" if g_obj.get("type") == "COMUNIDAD" else "FREE"
+            
+            if u:
+                spin_data = await db.get_spin_data(target_id, gid)
+                best_discount = spin_data.get("best_discount", 0)
+                spin_used = spin_data.get("used", False)
+                
+                msg += f"📌 *{g_name}* ({g_type_str})\n"
+                msg += f"   • Estado: {u.get('status', 'N/A').upper()}\n"
+                msg += f"   • Plan: {u.get('plan', 'N/A').upper()}\n"
+                msg += f"   • Expira: {fmt_dt(u.get('end_date'))}\n"
+                msg += f"   • Ruleta: {'✅ Usado' if spin_used else '⏳ Pendiente'} ({best_discount}% OFF)\n\n"
+                
+    if not user_groups and spins_anywhere:
+        msg += "📝 *Giros de ruleta (No registrado en users):*\n"
+        for spin in spins_anywhere:
+            gid = spin['group_id']
+            g_obj = get_group_by_id(gid)
+            g_name = safe_name(g_obj.get('group_name', 'VIP')) if g_obj else "Desconocido"
+            g_type_str = "VIP" if g_obj.get("type") == "VIP" else "Comunidad"
+            
+            best = spin.get("best_discount", 0)
+            used = spin.get("used", False)
+            
+            msg += f"📌 *{g_name}* ({g_type_str})\n"
+            msg += f"   • Ruleta: {'✅ Usado' if used else '⏳ Pendiente'}\n"
+            msg += f"   • Descuento: {best}% OFF\n\n"
+            
+    msg += "💡 *Para activar en un grupo específico, usa:*\n"
+    msg += f"`/add {target_id} mensual vip` o `comunidad`"
+            
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
