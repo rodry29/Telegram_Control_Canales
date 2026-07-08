@@ -2556,15 +2556,17 @@ async def _send_subscription_notification(bot, target_user_id: int, current_grou
 
 # ==================== COMANDO /add ====================
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not can_manage_group(update.effective_user.id, context.user_data.get('current_group', 0)) and update.effective_user.id != SUPER_ADMIN_ID: return
+    user_id = update.effective_user.id
+    # Cualquier admin de cualquier grupo o Super Admin puede usar /info
+    is_admin = user_id == SUPER_ADMIN_ID or user_id in EXTRA_ADMINS or get_groups_by_admin(user_id)
+    if not is_admin: return
     
     target_id = None
-    target_group_id = None
     
-    # 1. Si se responde a un mensaje, extraer ID y Group_ID de ahí
+    # 1. Si se responde a un mensaje, extraer ID de ahí
     if update.message.reply_to_message:
         text = update.message.reply_to_message.text or ""
-        target_id, target_group_id, _, _ = extract_user_from_reply(text)
+        target_id, _, _, _ = extract_user_from_reply(text)
         
     # 2. Si no se encontró por respuesta, buscar en los argumentos
     if not target_id and context.args:
@@ -2574,8 +2576,8 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id:
         await update.message.reply_text("❌ Responde a un mensaje de alerta del bot o usa `/info ID`.", parse_mode="Markdown"); return
         
-    # 3. Determinar en qué grupo buscar primero (el del mensaje respondido, el actual, o el del chat)
-    group_id_to_query = target_group_id or context.user_data.get('current_group')
+    # 3. Determinar en qué grupo buscar primero (el actual seleccionado o el del chat)
+    group_id_to_query = context.user_data.get('current_group')
     if not group_id_to_query and update.effective_chat.type in ("group", "supergroup"):
         group_id_to_query = update.effective_chat.id
         
