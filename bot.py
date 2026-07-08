@@ -2135,6 +2135,49 @@ async def handle_reaction_fuego(update: Update, context: ContextTypes.DEFAULT_TY
     await _safe_send(user_id, formatted, parse_mode="Markdown")
     await db.mark_fuego_notice_sent(user_id, group_id)
     logger.info(f"✅ Aviso de Fuego enviado a {user_id}")
+
+def _resolve_group_from_type(update: Update, context: ContextTypes.DEFAULT_TYPE, target_type: str) -> Optional[int]:
+    """Resuelve el group_id real basado en si el admin pidió 'vip' o 'comunidad'."""
+    target_type = target_type.lower()
+    if target_type not in ("vip", "comunidad"):
+        return None
+        
+    chat_id = update.effective_chat.id
+    
+    # Determinar el grupo base (si estamos en un grupo o si el admin lo seleccionó en /start)
+    base_group_id = context.user_data.get('current_group')
+    if not base_group_id and update.effective_chat.type in ("group", "supergroup"):
+        base_group_id = chat_id
+            
+    if not base_group_id:
+        return None
+        
+    base_group = get_group_by_id(base_group_id)
+    if not base_group:
+        return None
+        
+    current_type = base_group.get("type", "VIP")
+    
+    if target_type == "vip":
+        if current_type == "VIP":
+            return base_group_id
+        elif current_type == "COMUNIDAD":
+            return base_group.get("settings", {}).get("linked_vip_group_id")
+        elif current_type == "FREE":
+            return base_group.get("settings", {}).get("linked_vip_group_id")
+                
+    elif target_type == "comunidad":
+        if current_type == "COMUNIDAD":
+            return base_group_id
+        elif current_type == "VIP":
+            return base_group.get("settings", {}).get("linked_comunidad_group_id")
+        elif current_type == "FREE":
+            vip_id = base_group.get("settings", {}).get("linked_vip_group_id")
+            if vip_id:
+                vip_group = get_group_by_id(vip_id)
+                if vip_group:
+                    return vip_group.get("settings", {}).get("linked_comunidad_group_id")
+    return None
     
 async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
@@ -2144,44 +2187,50 @@ async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-    target_user_id, target_group_id, _, _ = extract_user_from_reply(text)
+    target_user_id, _, _, _ = extract_user_from_reply(text)
     
     if not target_user_id:
         await update.message.reply_text(
             "❌ No pude encontrar el ID del usuario en el mensaje.\n"
             "Asegúrate de responder al mensaje de registro del trial.\n\n"
-            "También puedes usar:\n• `/add 123456789 mensual`\n• `/add @usuario mensual`",
+            "Uso: `/add plan grupo` (ej: `/add mensual vip`)",
             parse_mode="Markdown"
         )
         return
         
-    current_group = target_group_id or context.user_data.get('current_group') or (chat_id if update.effective_chat.type in ("group", "supergroup") else None)
-    if not current_group or not can_manage_group(user_id, current_group):
-        await update.message.reply_text("❌ No autorizado para gestionar este grupo")
-        return
-        
     args = update.message.text.split()
-    if len(args) < 2:
-        await update.message.reply_text("❌ *Uso:* `/add plan [precio] [días]`\n\n*Ejemplos:*\n• `/add mensual`\n• `/add semanal 5.99`", parse_mode="Markdown")
+    if len(args) < 3:
+        await update.message.reply_text("❌ *Uso (respondiendo):* `/add plan grupo`\n\n*Ejemplos:*\n• `/add mensual vip`\n• `/add semanal comunidad`", parse_mode="Markdown")
         return
         
     plan = args[1].lower()
+    target_type = args[2].lower()
+    
     if plan not in PLANS:
         await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal, mensual, anual")
         return
         
+    if target_type not in ("vip", "comunidad"):
+        await update.message.reply_text("❌ Grupo inválido. Debes especificar `vip` o `comunidad`.", parse_mode="Markdown")
+        return
+        
+    current_group = _resolve_group_from_type(update, context, target_type)
+    if not current_group or not can_manage_group(user_id, current_group):
+        await update.message.reply_text("❌ No autorizado o no se pudo resolver el grupo. Asegúrate de tener el grupo base seleccionado con /start.")
+        return
+        
     custom_price = None
     custom_days = None
-    if len(args) >= 3:
+    if len(args) >= 4:
         try:
-            custom_price = float(args[2].replace(",", "."))
+            custom_price = float(args[3].replace(",", "."))
             if custom_price < 0: raise ValueError
         except ValueError:
             await update.message.reply_text("❌ Precio inválido", parse_mode="Markdown"); return
             
-    if len(args) >= 4:
+    if len(args) >= 5:
         try:
-            custom_days = int(args[3])
+            custom_days = int(args[4])
             if custom_days <= 0: raise ValueError
         except ValueError:
             await update.message.reply_text("❌ Días inválidos", parse_mode="Markdown"); return
@@ -2195,45 +2244,56 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_reply_add(update, context)
         return
         
-    current_group = await require_group(update, context)
-    if not current_group:
-        await update.message.reply_text("❌ Usa /start primero o no estás autorizado")
-        return
+    user_id = update.effective_user.id
         
-    if len(context.args) < 2:
-        # (Mostrar ayuda de /add)
-        await update.message.reply_text("❌ *Uso:* `/add @username|ID plan [precio] [días]`", parse_mode="Markdown")
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ *Uso:* `/add @username|ID plan grupo [precio] [días]`\n\n"
+            "*Ejemplos:*\n• `/add @juan mensual vip`\n• `/add 123456 semanal comunidad`\n"
+            "• `/add @juan mensual vip 5.99`\n\n"
+            "💡 *Grupos permitidos:* `vip` o `comunidad`",
+            parse_mode="Markdown"
+        )
         return
         
     identifier = context.args[0].replace("@", "")
     plan = context.args[1].lower()
+    target_type = context.args[2].lower()
+    
     if plan not in PLANS:
         await update.message.reply_text("❌ Plan inválido. Usa: trial, semanal, mensual, anual")
         return
         
+    if target_type not in ("vip", "comunidad"):
+        await update.message.reply_text("❌ Grupo inválido. Debes especificar `vip` o `comunidad`.", parse_mode="Markdown")
+        return
+        
+    current_group = _resolve_group_from_type(update, context, target_type)
+    if not current_group or not can_manage_group(user_id, current_group):
+        await update.message.reply_text("❌ No autorizado o no se pudo resolver el grupo. Asegúrate de tener el grupo base seleccionado con /start.")
+        return
+        
     custom_price = None
     custom_days = None
-    if len(context.args) >= 3:
+    if len(context.args) >= 4:
         try:
-            custom_price = float(context.args[2].replace(",", "."))
+            custom_price = float(context.args[3].replace(",", "."))
             if custom_price < 0: raise ValueError
         except ValueError:
             await update.message.reply_text("❌ Precio inválido", parse_mode="Markdown"); return
             
-    if len(context.args) >= 4:
+    if len(context.args) >= 5:
         try:
-            custom_days = int(context.args[3])
+            custom_days = int(context.args[4])
             if custom_days <= 0: raise ValueError
         except ValueError:
             await update.message.reply_text("❌ Días inválidos", parse_mode="Markdown"); return
 
     target_user_id = None
     
-    # Resolución de usuario: Siempre buscamos el ID numérico
     if identifier.isdigit():
         target_user_id = int(identifier)
     else:
-        # Si es @username, intentamos resolverlo a ID vía Telegram API o BD
         try:
             member = await context.bot.get_chat_member(current_group, identifier)
             if member and member.user: target_user_id = member.user.id
@@ -2247,7 +2307,6 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ No se encontró a @{identifier}. Asegúrate de que esté en el grupo o registrado.")
             return
 
-    # Delegamos al flujo central
     await _execute_subscription_flow(
         context.bot, update.message.reply_text, current_group, target_user_id, plan, custom_price, custom_days, is_renewal=False
     )
