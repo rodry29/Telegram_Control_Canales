@@ -1772,7 +1772,8 @@ async def show_channel_selector(send_func, user_id: int):
 
 async def show_channel_menu(send_func, user_id: int, channel: dict):
     vip = channel['vip']
-    free = channel.get('free') # Usamos .get() por si es None
+    free = channel.get('free')
+    comunidad = channel.get('comunidad')
     group_id = vip['group_id']
     custom = await db.get_group_messages(group_id)
     
@@ -1783,23 +1784,25 @@ async def show_channel_menu(send_func, user_id: int, channel: dict):
     desc = format_message(desc, {
         'channel_name': channel['channel_name'],
         'vip_group_name': vip['group_name'],
-        'free_group_name': free['group_name'] if free else "N/A"
+        'free_group_name': free['group_name'] if free else "N/A",
+        'comunidad_group_name': comunidad['group_name'] if comunidad else "N/A"
     })
-    
+
     free_link = free.get("settings", {}).get("invite_link", "") if free else ""
+    com_link = comunidad.get("settings", {}).get("invite_link", "") if comunidad else ""
+    
     keyboard = []
     
     if free_link:
         keyboard.append([InlineKeyboardButton("📢 Grupo Free", url=free_link)])
     elif free:
-        # Solo mostramos el botón deshabilitado si el FREE existe pero no tiene link
         keyboard.append([InlineKeyboardButton("📢 Grupo Free (sin link)", callback_data="no_free_link")])
-
+    
     if com_link:
         keyboard.append([InlineKeyboardButton("👥 Grupo Comunidad", url=com_link)])
     elif comunidad:
         keyboard.append([InlineKeyboardButton("👥 Grupo Comunidad (sin link)", callback_data="no_free_link")])
-        
+    
     keyboard.append([InlineKeyboardButton("🔥 Grupo VIP", callback_data=f"channel_vip_{group_id}")])
     await send_func(desc, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
