@@ -443,10 +443,7 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     last_sent = _PAYMENT_COOLDOWN.get(cooldown_key)
     if last_sent and (now - last_sent).total_seconds() < 300:
         return True
-    try:
-        await db.log_payment_lead(user_id, group_id)
-    except Exception as e:
-        logger.warning(f"No se pudo registrar payment_lead para {user_id}: {e}")
+    _fire_and_forget(db.log_payment_lead(user_id, group_id), "payment_lead")
 
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
@@ -614,41 +611,115 @@ async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, t
         except Exception as e:
             logger.warning(f"No se pudo notificar combo a {target_user_id}: {e}")
 # ==================== BASE DE DATOS ====================
-# ==================== BASE DE DATOS ====================
+RETRYABLE_PGCODES = {
+    "08000", "08003", "08006", "08001", "57P03", "53300", "53200", "40001", "40P01"
+}
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=10, recovery_timeout=15.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    async def allow(self) -> bool:
+        async with self._lock:
+            if self._opened_at is None:
+                return True
+            if _time.monotonic() - self._opened_at > self.recovery_timeout:
+                self._opened_at = None
+                self._failures = 0
+                return True
+            return False
+
+    async def record_success(self):
+        async with self._lock:
+            self._failures = 0
+            self._opened_at = None
+
+    async def record_failure(self):
+        async with self._lock:
+            self._failures += 1
+            if self._failures >= self.failure_threshold:
+                self._opened_at = _time.monotonic()
+                logger.error(
+                    f"🔴 Circuit breaker OPEN tras {self._failures} fallos — "
+                    f"fallando rápido por {self.recovery_timeout}s"
+                )
+
 class Database:
     def __init__(self, db_url: str):
         self.db_url = db_url
         self._pool: AsyncConnectionPool = None
+        self._circuit = CircuitBreaker()
+        self._retry_count = 0
+        self._op_count = 0
+        self._last_error: str | None = None
 
     async def _get_pool(self) -> AsyncConnectionPool:
         if self._pool is None or self._pool.closed:
             self._pool = AsyncConnectionPool(
                 conninfo=self.db_url,
-                min_size=2, 
+                min_size=2,
                 max_size=20,
-                kwargs={"options": "-c timezone=UTC"},
-                timeout=30.0,
+                kwargs={
+                    "options": "-c timezone=UTC -c statement_timeout=15000",
+                    "connect_timeout": 5,        
+                    "application_name": "ayudante_vip_bot",
+                },
+                timeout=10.0,                    
+                max_idle=300.0,                  
+                reconnect_timeout=30.0,
                 open=False
             )
             await self._pool.open()
             logger.info("✅ psycopg3 AsyncConnectionPool creado (min=2, max=20) | Timezone UTC")
         return self._pool
 
-    async def _run(self, func, retries=2):
+    async def _run(self, func, retries=2, base_delay=0.1, max_delay=2.0, op_name="unknown"):
+        self._op_count += 1
+        
+        if not await self._circuit.allow():
+            self._last_error = "Circuit breaker abierto"
+            raise psycopg.OperationalError("Circuit breaker abierto — BD posiblemente caída")
+
         pool = await self._get_pool()
         last_error = None
+        
         for attempt in range(retries + 1):
             try:
                 async with pool.connection() as conn:
-                    return await func(conn)
+                    result = await func(conn)
+                    await self._circuit.record_success()
+                    return result
+                    
             except psycopg.OperationalError as e:
                 last_error = e
-                if attempt < retries:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-                    continue
-                raise last_error
-            except Exception:
-                raise
+                self._last_error = f"{op_name}: {e}"
+                pgcode = getattr(e, 'pgcode', None)
+                
+                # 2. Diferenciar errores (no reintentar si son fatales/no recuperables)
+                if pgcode and pgcode not in RETRYABLE_PGCODES:
+                    break
+                    
+                # Si fue el último intento permitido, salir del bucle
+                if attempt >= retries:
+                    break
+                    
+                self._retry_count += 1
+                
+                # 3. Backoff exponencial con jitter decorrelacionado
+                delay = min(max_delay, base_delay * (2 ** attempt))
+                delay = random.uniform(0, delay)
+                
+                logger.warning(
+                    f"DB OperationalError (intento {attempt+1}/{retries+1}) en '{op_name}': {pgcode} — "
+                    f"retry en {delay:.2f}s"
+                )
+                await asyncio.sleep(delay)
+                
+        await self._circuit.record_failure()
         raise last_error
 
     async def close(self):
@@ -1486,6 +1557,23 @@ scheduler = AsyncIOScheduler()
 bot_app = None
 
 # ==================== HELPERS INTERNOS ====================
+async def _fire_and_forget(coro, name="op"):
+    async def _wrapper():
+        try:
+            await coro
+        except Exception as e:
+            logger.warning(f"Fire-and-forget '{name}' falló: {e}")
+    asyncio.create_task(_wrapper())
+
+async def db_health_command(update, context):
+    retry_rate = db._retry_count / max(1, db._op_count)
+    await update.message.reply_text(
+        f"📊 *DB Health*\n"
+        f"• Operaciones: {db._op_count}\n"
+        f"• Reintentos: {db._retry_count} ({retry_rate:.1%})\n"
+        f"• Último error: `{db._last_error or 'ninguno'}`\n"
+        f"• Circuit: {'🔴 OPEN' if db._circuit._opened_at else '🟢 CLOSED'}"
+    )
 async def _safe_send(chat_id: int, text: str, disable_notification: bool = False, **kwargs):
     try:
         return await bot_app.bot.send_message(chat_id, text, disable_notification=disable_notification, **kwargs)
@@ -1602,7 +1690,7 @@ async def _unmute_user_and_unban(group_id: int, user_id: int):
         await bot_app.bot.unban_chat_member(group_id, user_id, only_if_banned=True)
     except Exception:
         pass
-    await db.clear_muted(user_id, group_id)
+    _fire_and_forget(db.clear_muted(user_id, group_id), "clear_muted")
 
 async def verify_on_startup():
     """Verificación post-deploy: detecta usuarios que entraron durante la caída del bot."""
@@ -2143,7 +2231,7 @@ async def handle_reaction_fuego(update: Update, context: ContextTypes.DEFAULT_TY
     })
     
     await _safe_send(user_id, formatted, parse_mode="Markdown")
-    await db.mark_fuego_notice_sent(user_id, group_id)
+    _fire_and_forget(db.mark_fuego_notice_sent(user_id, group_id), "fuego_notice_sent")
     logger.info(f"✅ Aviso de Fuego enviado a {user_id}")
 
 def _resolve_group_from_type(update: Update, context: ContextTypes.DEFAULT_TYPE, target_type: str) -> Optional[int]:
@@ -3010,7 +3098,7 @@ async def auto_backup():
                 parse_mode="Markdown"
             )
             output.close()
-            await db.log_backup_sent()
+            _fire_and_forget(db.log_backup_sent(), "log_backup")
             logger.info("✅ Backup automático enviado")
         except Exception as e:
             logger.error(f"❌ Error enviando backup automático: {e}")
@@ -4848,14 +4936,12 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Grupo no válido", show_alert=True)
         return
 
-    # Verificar si ya está procesando
     async with _SPINNING_LOCK:
         if (user_id, group_id) in _SPINNING:
             await query.answer("⏳ Procesando...", show_alert=True)
             return
         _SPINNING.add((user_id, group_id))
 
-    # Obtener datos de spin FUERA del lock para no bloquear
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
 
@@ -4896,7 +4982,7 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
         discount = random.choice(discounts)
-        await db.record_spin(user_id, group_id, discount)
+        _fire_and_forget(db.record_spin(user_id, group_id, discount), "record_spin")
 
         for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
             try:
@@ -5044,7 +5130,7 @@ async def send_trial_warnings():
                         reply_markup=get_payment_keyboard(gid, user_id, spin_used=spin_used, vip_invite_link=rule["vip_invite_link"]),
                         parse_mode="Markdown"
                     )
-                    await db.log_warning_sent(user_id, gid, warning_type)
+                    _fire_and_forget(db.log_warning_sent(user_id, gid, warning_type), "log_warning")
                     logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes en grupo {gid}")
                 except Exception as e:
                     logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
@@ -5551,7 +5637,7 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
                 await bot.edit_message_text(f"🚀 *Broadcast...*\n• Enviados: {success_count}\n• Fallidos: {fail_count}\n• Progreso: {int(i/total*100)}%", chat_id=sent_by, message_id=progress_msg.message_id, parse_mode="Markdown")
             except: pass
             
-    await db.log_broadcast_sent(group_id, filter_type, message_text, total, success_count, fail_count, sent_by)
+    _fire_and_forget(db.log_broadcast_sent(group_id, filter_type, message_text, total, success_count, fail_count, sent_by), "log_broadcast")
     await bot.send_message(sent_by, f"✅ *Broadcast completado*\n\n• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}", parse_mode="Markdown")
 
 async def process_abandoned_carts():
@@ -5869,6 +5955,7 @@ async def main():
     bot_app.add_handler(CommandHandler("configcart", config_cart_command))
     bot_app.add_handler(CommandHandler("addcombo", addcombo_command))
     bot_app.add_handler(CommandHandler("renewcombo", renewcombo_command))
+    bot_app.add_handler(CommandHandler("dbhealth", db_health_command))
 
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
