@@ -535,6 +535,23 @@ def extract_user_from_reply(text: str) -> tuple:
     
     return user_id, group_id, username, first_name
 
+def _is_bot_message(msg, bot_id: int) -> bool:
+    if msg is None:
+        return False
+    return bool(msg.from_user and msg.from_user.id == bot_id)
+
+async def _require_bot_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    reply = update.message.reply_to_message
+    if not reply or not _is_bot_message(reply, context.bot.id):
+        await update.message.reply_text(
+            "⚠️ *Verificación de seguridad fallida*\n\n"
+            "Solo puedo confiar en mensajes enviados por mí mismo.\n"
+            "Usa el modo directo: `/add ID mensual vip`",
+            parse_mode="Markdown"
+        )
+        return False
+    return True
+
 async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user_id: int, plan: str, custom_price: float = None, custom_days: int = None, is_renewal: bool = False):
     """Función centralizada para activar o renovar suscripciones. Recibe SIEMPRE un user_id resuelto."""
     first_name = ""
@@ -2309,6 +2326,8 @@ def _resolve_group_from_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def handle_reply_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
     if not update.message.text or not update.message.text.startswith('/add'): return
+    if not await _require_bot_reply(update, context):
+        return
     
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -2441,6 +2460,9 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_reply_addcombo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
     if not update.message.text or not update.message.text.startswith('/addcombo'): return
+    if not await _require_bot_reply(update, context):
+        return
+        
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
@@ -2520,6 +2542,8 @@ async def addcombo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_reply_renewcombo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
     if not update.message.text or not update.message.text.startswith('/renewcombo'): return
+    if not await _require_bot_reply(update, context):
+        return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
@@ -2638,16 +2662,20 @@ async def _send_subscription_notification(bot, target_user_id: int, current_grou
 # ==================== COMANDO /add ====================
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Cualquier admin de cualquier grupo o Super Admin puede usar /info
     is_admin = user_id == SUPER_ADMIN_ID or user_id in EXTRA_ADMINS or get_groups_by_admin(user_id)
     if not is_admin: return
     
     target_id = None
     
-    # 1. Si se responde a un mensaje, extraer ID de ahí
-    if update.message.reply_to_message:
+    # 1. Si se responde a un mensaje DEL BOT, extraer ID de ahí
+    if update.message.reply_to_message and _is_bot_message(update.message.reply_to_message, context.bot.id):
         text = update.message.reply_to_message.text or ""
         target_id, _, _, _ = extract_user_from_reply(text)
+    
+    # 2. Si no se encontró por respuesta (o no era del bot), buscar en los argumentos
+    if not target_id and context.args:
+        if context.args[0].isdigit(): 
+            target_id = int(context.args[0])
         
     # 2. Si no se encontró por respuesta, buscar en los argumentos
     if not target_id and context.args:
