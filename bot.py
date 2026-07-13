@@ -140,6 +140,33 @@ def _invalidate_price_cache(group_id: int):
     for k in keys_to_remove:
         _plan_config_cache.pop(k, None)
 
+async def update_group_settings(group_id: int, changes: dict) -> bool:
+    """Único punto autorizado para mutar settings. Maneja RAM, DB y caché automáticamente."""
+    PRICE_FIELDS = {
+        "trial_minutes",
+        "price_semanal", "price_mensual", "price_anual",
+        "duration_semanal", "duration_mensual", "duration_anual",
+        "combo_price_semanal", "combo_price_mensual", "combo_price_anual",
+    }
+    with GROUPS_LOCK:
+        group = GROUPS.get(group_id)
+        if not group:
+            return False
+        settings = dict(group.get("settings", {}))
+        for k, v in changes.items():
+            if v is None:
+                settings.pop(k, None)
+            else:
+                settings[k] = v
+        group["settings"] = settings
+        
+    await db.update_group_fields(group_id, {'settings': settings})
+    
+    # Invalidar caché SOLO si se modificó un campo que afecta precios/duraciones
+    if any(k in PRICE_FIELDS for k in changes):
+        _invalidate_price_cache(group_id)
+    return True
+
 # ==================== UTILIDADES ====================
 def get_group_by_id(group_id: int) -> Optional[dict]:
     with GROUPS_LOCK:
@@ -1617,11 +1644,9 @@ async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     link = context.args[1].strip()
     if not link.startswith("https://"): await update.message.reply_text("❌ El link debe empezar con https://"); return
-    with GROUPS_LOCK:
-        group = GROUPS.get(group_id)
-        if group:
-            settings = dict(group.get("settings", {})); settings['deuna_link'] = link; group["settings"] = settings
-    await db.update_group_fields(group_id, {'settings': settings})
+    if not await update_group_settings(group_id, {'deuna_link': link}):
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
     await update.message.reply_text("✅ Link Deuna guardado.")
 
 async def config_cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1644,15 +1669,9 @@ async def config_cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Los minutos deben ser positivos")
         return
     
-    with GROUPS_LOCK:
-        group = GROUPS.get(group_id)
-        if not group:
-            await update.message.reply_text("❌ Grupo no encontrado")
-            return
-        settings = dict(group.get("settings", {}))
-        settings['cart_delay_minutes'] = minutes
-        group["settings"] = settings
-    await db.update_group_fields(group_id, {'settings': settings})
+    if not await update_group_settings(group_id, {'cart_delay_minutes': minutes}):
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
     await update.message.reply_text(f"✅ Carrito abandonado configurado a {minutes} minutos.")
 
 async def _kick_user_with_retry(group_id: int, user_id: int, retries: int = 3) -> bool:
@@ -4020,16 +4039,10 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text.startswith("https://"):
             await update.message.reply_text("❌ El link debe empezar con `https://`")
             return
-        with GROUPS_LOCK:
-            group = GROUPS.get(group_id)
-            if not group:
-                await update.message.reply_text("❌ Grupo no encontrado")
-                _clear_input_states(context)
-                return
-            settings = dict(group.get("settings", {}))
-            settings['deuna_link'] = text
-            group["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
+        if not await update_group_settings(group_id, {'deuna_link': text}):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            _clear_input_states(context)
+            return
         _clear_input_states(context)
         await update.message.reply_text("✅ *Link Deuna guardado correctamente.*", parse_mode="Markdown")
         return
@@ -4043,16 +4056,10 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Debe ser un número entero positivo (ej. `30`).")
             return
-        with GROUPS_LOCK:
-            group = GROUPS.get(group_id)
-            if not group:
-                await update.message.reply_text("❌ Grupo no encontrado")
-                _clear_input_states(context)
-                return
-            settings = dict(group.get("settings", {}))
-            settings['cart_delay_minutes'] = minutes
-            group["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
+        if not await update_group_settings(group_id, {'cart_delay_minutes': minutes}):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            _clear_input_states(context)
+            return
         _clear_input_states(context)
         await update.message.reply_text(f"✅ *Carrito abandonado configurado a {minutes} minutos.*", parse_mode="Markdown")
         return
@@ -4072,18 +4079,11 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Valor inválido.")
         return
 
-    with GROUPS_LOCK:
-        group = GROUPS.get(group_id)
-        if not group:
-            await update.message.reply_text("❌ Grupo no encontrado")
-            _clear_input_states(context)
-            return
-        settings = dict(group.get("settings", {}))
-        settings[field] = value
-        group["settings"] = settings
+    if not await update_group_settings(group_id, {field: value}):
+        await update.message.reply_text("❌ Grupo no encontrado")
+        _clear_input_states(context)
+        return
 
-    await db.update_group_fields(group_id, {'settings': settings})
-    _invalidate_price_cache(group_id)
     _clear_input_states(context)
 
     labels = {
@@ -4149,20 +4149,11 @@ async def save_configured_message(update, context, text, msg_type, group_id):
         group = get_group_by_id(group_id)
         if group:
             step_index = int(msg_type.split("_")[1]) - 1
-            settings = dict(group.get("settings", {}))
-            # Copiamos los defaults para no mutar la lista original
-            msgs = list(settings.get('abandoned_cart_messages', DEFAULT_CART_MESSAGES))
+            msgs = list(group.get("settings", {}).get('abandoned_cart_messages', DEFAULT_CART_MESSAGES))
             while len(msgs) <= step_index:
                 msgs.append("")
             msgs[step_index] = text
-            settings['abandoned_cart_messages'] = msgs
-            
-            with GROUPS_LOCK:
-                g = GROUPS.get(group_id)
-                if g:
-                    g["settings"] = settings
-            await db.update_group_fields(group_id, {'settings': settings})
-
+            await update_group_settings(group_id, {'abandoned_cart_messages': msgs})
     # Mapeo unificado
     handlers = {
         "welcome": lambda: db.save_group_messages(group_id, welcome_msg=text),
@@ -4419,25 +4410,8 @@ async def link_vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ El segundo grupo debe ser VIP")
         return
 
-    with GROUPS_LOCK:
-        free_group = GROUPS.get(free_id)
-        if not free_group:
-            await update.message.reply_text("❌ Grupo FREE no encontrado")
-            return
-        free_settings = dict(free_group.get("settings", {}))
-        free_settings['linked_vip_group_id'] = vip_id
-        free_group["settings"] = free_settings
-    await db.update_group_fields(free_id, {'settings': free_settings})
-
-    with GROUPS_LOCK:
-        vip_group = GROUPS.get(vip_id)
-        if not vip_group:
-            await update.message.reply_text("❌ Grupo VIP no encontrado")
-            return
-        vip_settings = dict(vip_group.get("settings", {}))
-        vip_settings['linked_free_group_id'] = free_id
-        vip_group["settings"] = vip_settings
-    await db.update_group_fields(vip_id, {'settings': vip_settings})
+    await update_group_settings(free_id, {'linked_vip_group_id': vip_id})
+    await update_group_settings(vip_id, {'linked_free_group_id': free_id})
 
     await update.message.reply_text(
         f"✅ *Vinculación completada*\n\n"
@@ -4475,17 +4449,8 @@ async def link_comunidad_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ El segundo ID debe ser un grupo COMUNIDAD (usa /addgroup para crearlo con tipo COMUNIDAD).")
         return
 
-    with GROUPS_LOCK:
-        vip_settings = dict(vip_group.get("settings", {}))
-        vip_settings['linked_comunidad_group_id'] = com_id
-        vip_group["settings"] = vip_settings
-
-        com_settings = dict(com_group.get("settings", {}))
-        com_settings['linked_vip_group_id'] = vip_id
-        com_group["settings"] = com_settings
-
-    await db.update_group_fields(vip_id, {'settings': vip_settings})
-    await db.update_group_fields(com_id, {'settings': com_settings})
+    await update_group_settings(vip_id, {'linked_comunidad_group_id': com_id})
+    await update_group_settings(com_id, {'linked_vip_group_id': vip_id})
 
     await update.message.reply_text("✅ *Grupo VIP y Comunidad vinculados exitosamente.*", parse_mode="Markdown")
 
@@ -4723,16 +4688,10 @@ async def config_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Link inválido. Debe empezar con `https://t.me/`", parse_mode="Markdown")
         return
         
-    with GROUPS_LOCK:
-        group = GROUPS.get(group_id)
-        if not group:
-            await update.message.reply_text("❌ Grupo no encontrado")
-            return
-        settings = dict(group.get("settings", {}))
-        settings['invite_link'] = invite_link
-        group["settings"] = settings
+    if not await update_group_settings(group_id, {'invite_link': invite_link}):
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
         
-    await db.update_group_fields(group_id, {'settings': settings})
     await update.message.reply_text(
         f"✅ *Link configurado*\n\n📋 Grupo: {group['group_name']}\n🔗 Link: `{invite_link}`\n\n"
         f"Los usuarios podrán unirse al canal desde el botón.",
@@ -4762,15 +4721,10 @@ async def config_fuego_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Grupo no encontrado o no es VIP")
         return
     fuego_username = context.args[1].lstrip('@').strip()
-    with GROUPS_LOCK:
-        group = GROUPS.get(group_id)
-        if not group:
-            await update.message.reply_text("❌ Grupo no encontrado")
-            return
-        settings = dict(group.get("settings", {}))
-        settings['fuego_contact'] = fuego_username
-        group["settings"] = settings
-    await db.update_group_fields(group_id, {'settings': settings})
+    if not await update_group_settings(group_id, {'fuego_contact': fuego_username}):
+        await update.message.reply_text("❌ Grupo no encontrado")
+        return
+        
     await update.message.reply_text(
         f"✅ *Contacto de Fuego configurado*\n\n📋 Grupo: {group['group_name']}\n🤖 Fuego: @{fuego_username}\n\n"
         f"Los usuarios recibirán este contacto cuando soliciten descargas.",
@@ -4789,68 +4743,67 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
     text = update.message.text.strip()
     
     if step == 'bank_data':
-        with GROUPS_LOCK:
-            group = GROUPS.get(group_id)
-            if not group:
-                await update.message.reply_text("❌ Grupo no encontrado")
-                context.user_data.pop('config_payment_step', None)
-                context.user_data.pop('config_payment_group_id', None)
-                return
-            settings = dict(group.get("settings", {}))
-            if text.lower() not in ('saltar',):
-                if text.lower() == 'eliminar':
-                    settings.pop('bank_data', None)
-                else:
-                    settings['bank_data'] = text
-            group["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
+        changes = {}
+        if text.lower() not in ('saltar',):
+            if text.lower() == 'eliminar':
+                changes['bank_data'] = None
+            else:
+                changes['bank_data'] = text
+                
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
         context.user_data['config_payment_step'] = 'payment_contact'
-        current_contact = settings.get("payment_contact", "")
+        group = get_group_by_id(group_id)
+        current_contact = group.get("settings", {}).get("payment_contact", "") if group else ""
         await update.message.reply_text(
             f"✅ *Datos bancarios guardados.*\n\nPaso 2/3: *Contacto para comprobantes*\n"
             f"Envía el username de Telegram.\n\n📋 *Actual:* `{current_contact or 'No configurado'}`\n\n"
             f"*Escribe 'saltar' para dejar el valor actual.*",
             parse_mode="Markdown"
         )
+        
     elif step == 'payment_contact':
-        with GROUPS_LOCK:
-            group = GROUPS.get(group_id)
-            if not group:
-                await update.message.reply_text("❌ Grupo no encontrado")
-                context.user_data.pop('config_payment_step', None)
-                context.user_data.pop('config_payment_group_id', None)
-                return
-            settings = dict(group.get("settings", {}))
-            if text.lower() != 'saltar':
-                settings['payment_contact'] = text.lstrip('@').strip()
-            group["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
+        changes = {}
+        if text.lower() != 'saltar':
+            changes['payment_contact'] = text.lstrip('@').strip()
+            
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
         context.user_data['config_payment_step'] = 'paypal_data'
-        current_paypal = settings.get("paypal_data", "")
+        group = get_group_by_id(group_id)
+        current_paypal = group.get("settings", {}).get("paypal_data", "") if group else ""
         await update.message.reply_text(
             f"✅ *Contacto guardado.*\n\nPaso 3/3: *PayPal (opcional)*\n"
             f"Envía los datos de PayPal o escribe 'saltar' / 'eliminar'.\n\n"
             f"📋 *Actual:* `{current_paypal or 'No configurado'}`",
             parse_mode="Markdown"
         )
+        
     elif step == 'paypal_data':
-        with GROUPS_LOCK:
-            group = GROUPS.get(group_id)
-            if not group:
-                await update.message.reply_text("❌ Grupo no encontrado")
-                context.user_data.pop('config_payment_step', None)
-                context.user_data.pop('config_payment_group_id', None)
-                return
-            settings = dict(group.get("settings", {}))
-            if text.lower() not in ('saltar',):
-                if text.lower() == 'eliminar':
-                    settings.pop('paypal_data', None)
-                else:
-                    settings['paypal_data'] = text
-            group["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
+        changes = {}
+        if text.lower() not in ('saltar',):
+            if text.lower() == 'eliminar':
+                changes['paypal_data'] = None
+            else:
+                changes['paypal_data'] = text
+                
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
         context.user_data['config_payment_step'] = 'vip_invite_link'
-        current_vip_link = settings.get("vip_invite_link", "")
+        group = get_group_by_id(group_id)
+        current_vip_link = group.get("settings", {}).get("vip_invite_link", "") if group else ""
         await update.message.reply_text(
             f"✅ *PayPal guardado.*\n\nPaso 4/4: *Link de invitación al VIP*\n"
             f"Envía el link de invitación al grupo VIP (para el botón 'Entrar al VIP').\n\n"
@@ -4859,7 +4812,9 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
             f"💡 *Para obtener el link:* Ve al grupo VIP → Administradores → Invitar por link → Copiar",
             parse_mode="Markdown"
         )
+        
     elif step == 'vip_invite_link':
+        changes = {}
         if text.lower() not in ('saltar', 'eliminar'):
             if not text.startswith(("https://", "http://")):
                 await update.message.reply_text(
@@ -4868,27 +4823,24 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
                     parse_mode="Markdown"
                 )
                 return
-        with GROUPS_LOCK:
-            group = GROUPS.get(group_id)
-            if not group:
-                await update.message.reply_text("❌ Grupo no encontrado")
-                context.user_data.pop('config_payment_step', None)
-                context.user_data.pop('config_payment_group_id', None)
-                return
-            settings = dict(group.get("settings", {}))
-            if text.lower() not in ('saltar',):
-                if text.lower() == 'eliminar':
-                    settings.pop('vip_invite_link', None)
-                else:
-                    settings['vip_invite_link'] = text
-            group["settings"] = settings
-        await db.update_group_fields(group_id, {'settings': settings})
+            changes['vip_invite_link'] = text
+        elif text.lower() == 'eliminar':
+            changes['vip_invite_link'] = None
+            
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
         context.user_data.pop('config_payment_step', None)
         context.user_data.pop('config_payment_group_id', None)
         
+        group = get_group_by_id(group_id)
+        settings = group.get("settings", {}) if group else {}
         vip_link_status = settings.get('vip_invite_link', 'No configurado')
         await update.message.reply_text(
-            f"✅ *Configuración de pago completada*\n\n📌 *Grupo:* {group['group_name']}\n\n"
+            f"✅ *Configuración de pago completada*\n\n📌 *Grupo:* {group['group_name'] if group else 'Desconocido'}\n\n"
             f"🏦 *Bancaria:*\n`{settings.get('bank_data', 'No configurado')}`\n\n"
             f"📤 *Contacto:* @{settings.get('payment_contact', 'No configurado')}\n\n"
             f"🅿️ *PayPal:* `{settings.get('paypal_data', 'No configurado')}`\n\n"
