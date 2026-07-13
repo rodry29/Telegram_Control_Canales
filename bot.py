@@ -5606,39 +5606,99 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
 async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: str, sent_by: int):
     targets = await db.get_broadcast_targets(group_id, filter_type)
     if not targets:
-        await bot.send_message(sent_by, "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.", parse_mode="Markdown")
+        await bot.send_message(
+            sent_by,
+            "📭 *Broadcast completado*\n\nNo hay usuarios con el filtro seleccionado.",
+            parse_mode="Markdown",
+        )
         return
+
     group = get_group_by_id(group_id)
-    # Usar safe_name (v1) para el nombre del grupo también
     group_name = safe_name(group.get('group_name', 'VIP')) if group else 'VIP'
-    total = len(targets); success_count = 0; fail_count = 0; delay = 0.12
+    total = len(targets)
+
+    success_count = 0
+    fail_count = 0
+    processed = 0
+
+    semaphore = asyncio.Semaphore(25)
+
     try:
-        progress_msg = await bot.send_message(sent_by, f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0", parse_mode="Markdown")
+        progress_msg = await bot.send_message(
+            sent_by,
+            f"🚀 *Broadcast en progreso...*\n\n• Total: {total} usuarios\n• Enviados: 0",
+            parse_mode="Markdown",
+        )
     except Exception as e:
-        logger.error(f"❌ No se pudo enviar mensaje de progreso: {e}"); progress_msg = None
-        
-    for i, user in enumerate(targets, 1):
-        user_id = user['user_id']
-        # Usar safe_name (v1) y cambiar el nombre de la variable para no sobrescribir la función
-        display_name = safe_name(user.get('first_name', 'Usuario') or 'Usuario')
-        personalized = message_text.replace("{user_name}", display_name).replace("{group_name}", group_name)
-        try:
-            await bot.send_message(user_id, personalized, parse_mode="Markdown", disable_web_page_preview=True)
-            success_count += 1
-        except Exception:
+        logger.error(f"❌ No se pudo enviar mensaje de progreso: {e}")
+        progress_msg = None
+
+    async def _send_one(user):
+        nonlocal success_count, fail_count, processed
+        async with semaphore:
+            user_id = user['user_id']
+            display_name = safe_name(user.get('first_name', 'Usuario') or 'Usuario')
+            personalized = (
+                message_text
+                .replace("{user_name}", display_name)
+                .replace("{group_name}", group_name)
+            )
             try:
-                await bot.send_message(user_id, personalized, disable_web_page_preview=True) # Fallback texto plano
+                await bot.send_message(
+                    user_id, personalized,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
                 success_count += 1
             except Exception:
-                fail_count += 1
-        await asyncio.sleep(delay)
-        if progress_msg and i % 10 == 0:
+                try:
+                    await bot.send_message(
+                        user_id, personalized,
+                        disable_web_page_preview=True,
+                    )
+                    success_count += 1
+                except Exception:
+                    fail_count += 1
+            processed += 1
+
+    chunk_size = 100
+    for i in range(0, total, chunk_size):
+        chunk = targets[i : i + chunk_size]
+        await asyncio.gather(*[_send_one(u) for u in chunk])
+
+        if progress_msg:
             try:
-                await bot.edit_message_text(f"🚀 *Broadcast...*\n• Enviados: {success_count}\n• Fallidos: {fail_count}\n• Progreso: {int(i/total*100)}%", chat_id=sent_by, message_id=progress_msg.message_id, parse_mode="Markdown")
-            except: pass
-            
-    _fire_and_forget(db.log_broadcast_sent(group_id, filter_type, message_text, total, success_count, fail_count, sent_by), "log_broadcast")
-    await bot.send_message(sent_by, f"✅ *Broadcast completado*\n\n• Total: {total}\n• ✅ Enviados: {success_count}\n• ❌ Fallidos: {fail_count}", parse_mode="Markdown")
+                pct = int(processed / total * 100)
+                await bot.edit_message_text(
+                    f"🚀 *Broadcast en progreso...*\n\n"
+                    f"• Total: {total}\n"
+                    f"• ✅ Enviados: {success_count}\n"
+                    f"• ❌ Fallidos: {fail_count}\n"
+                    f"• 📊 Progreso: {pct}%",
+                    chat_id=sent_by,
+                    message_id=progress_msg.message_id,
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+    _fire_and_forget(
+        db.log_broadcast_sent(
+            group_id, filter_type, message_text,
+            total, success_count, fail_count, sent_by,
+        ),
+        "log_broadcast",
+    )
+    await bot.send_message(
+        sent_by,
+        f"✅ *Broadcast completado*\n\n"
+        f"• Total: {total}\n"
+        f"• ✅ Enviados: {success_count}\n"
+        f"• ❌ Fallidos: {fail_count}",
+        parse_mode="Markdown",
+    )
 
 async def process_abandoned_carts():
     if not bot_app:
