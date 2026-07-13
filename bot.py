@@ -273,6 +273,20 @@ def safe_name(text: str) -> str:
         return ""
     return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('`', '\\`')
 
+def render_template(template: str, variables: dict) -> str:
+    """
+    Reemplaza variables en una plantilla.
+    Escapa automáticamente las variables de texto libre para Markdown v1.
+    """
+    safe_keys = {"user_name", "group_name", "username", "first_name"}
+    result = template
+    for key, value in variables.items():
+        str_val = str(value) if value is not None else ""
+        if key in safe_keys:
+            str_val = safe_name(str_val)
+        result = result.replace(f"{{{key}}}", str_val)
+    return result
+
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
     if h >= 24:
@@ -5097,12 +5111,15 @@ async def send_trial_warnings():
                 expiry_str = fmt_dt(user['end_date'])
                 expiry_time = expiry_str.split(' ')[1] if ' ' in expiry_str else expiry_str
                 
-                message = (rule["message_template"]
-                           .replace("{minutes_left}", str(mins_left))
-                           .replace("{expiry_time}", expiry_time)
-                           .replace("{expiry_datetime}", expiry_str)
-                           .replace("{group_name}", rule["group_name"])
-                           .replace("{user_name}", user.get("first_name", "Usuario") or "Usuario"))
+                # ✅ Usar el nuevo helper que escapa automáticamente
+                message = render_template(rule["message_template"], {
+                    "minutes_left": mins_left,
+                    "expiry_time": expiry_time,
+                    "expiry_datetime": expiry_str,
+                    "group_name": rule["group_name"],
+                    "user_name": user.get("first_name", "Usuario") or "Usuario"
+                })
+                
                 try:
                     spin_data = spin_data_map.get(gid, {}).get(user_id, {})
                     spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
@@ -5113,6 +5130,11 @@ async def send_trial_warnings():
                     )
                     _fire_and_forget(db.log_warning_sent(user_id, gid, warning_type), "log_warning")
                     logger.info(f"⚠️ Aviso enviado a {user_id}: {mins_left} min restantes en grupo {gid}")
+                except BadRequest as e:
+                    # ✅ Guard anti-loop: si la plantilla del admin rompe Markdown, 
+                    # marcamos como enviado para no spamear el log ni reintentar cada minuto.
+                    logger.error(f"❌ Markdown inválido en aviso para {user_id} (grupo {gid}): {e}")
+                    _fire_and_forget(db.log_warning_sent(user_id, gid, warning_type), "log_warning_guard")
                 except Exception as e:
                     logger.warning(f"No se pudo enviar aviso a {user_id}: {e}")
 
@@ -5235,11 +5257,15 @@ async def test_warning(update: Update, context: ContextTypes.DEFAULT_TYPE, group
     test_w = warnings[0]
     msg_tpl = test_w.get("message", "⏳ Tu trial expira pronto")
     group = get_group_by_id(group_id)
-    message = (msg_tpl.replace("{minutes_left}", "15")
-                .replace("{expiry_time}", "22:45")
-                .replace("{expiry_datetime}", "15/06/2026 22:45")
-                .replace("{group_name}", group.get("group_name", "VIP") if group else "VIP")
-                .replace("{user_name}", query.from_user.first_name or "Usuario"))
+    
+    message = render_template(msg_tpl, {
+        "minutes_left": "15",
+        "expiry_time": "22:45",
+        "expiry_datetime": "15/06/2026 22:45",
+        "group_name": group.get("group_name", "VIP") if group else "VIP",
+        "user_name": query.from_user.first_name or "Usuario"
+    })
+    
     try:
         await context.bot.send_message(
             query.from_user.id,
@@ -5618,12 +5644,15 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
         nonlocal success_count, fail_count, processed
         async with semaphore:
             user_id = user['user_id']
-            display_name = safe_name(user.get('first_name', 'Usuario') or 'Usuario')
-            personalized = (
-                message_text
-                .replace("{user_name}", display_name)
-                .replace("{group_name}", group_name)
-            )
+            display_raw = user.get('first_name', 'Usuario') or 'Usuario'
+            group_name_raw = group.get('group_name', 'VIP') if group else 'VIP'
+            
+            personalized = render_template(message_text, {
+                "user_name": display_raw,
+                "group_name": group_name_raw,
+                "username": user.get('username', '')
+            })
+
             try:
                 await bot.send_message(
                     user_id, personalized,
@@ -5632,6 +5661,8 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
                 )
                 success_count += 1
             except Exception:
+                # Fallback: si falla el Markdown (a pesar del safe_name), 
+                # intenta enviarlo como texto plano sin parse_mode
                 try:
                     await bot.send_message(
                         user_id, personalized,
@@ -5641,7 +5672,7 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
                 except Exception:
                     fail_count += 1
             processed += 1
-
+    
     chunk_size = 100
     for i in range(0, total, chunk_size):
         chunk = targets[i : i + chunk_size]
