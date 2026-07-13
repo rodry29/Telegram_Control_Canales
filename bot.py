@@ -12,9 +12,9 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Callable
 from zoneinfo import ZoneInfo
 
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
@@ -614,68 +614,59 @@ async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, t
         except Exception as e:
             logger.warning(f"No se pudo notificar combo a {target_user_id}: {e}")
 # ==================== BASE DE DATOS ====================
+# ==================== BASE DE DATOS ====================
 class Database:
     def __init__(self, db_url: str):
         self.db_url = db_url
-        self._pool: pool.ThreadedConnectionPool = None
+        self._pool: AsyncConnectionPool = None
 
-    def _get_pool(self) -> pool.ThreadedConnectionPool:
+    async def _get_pool(self) -> AsyncConnectionPool:
         if self._pool is None or self._pool.closed:
-            # Forzamos el timezone a UTC en cada nueva conexión que se establezca
-            self._pool = pool.ThreadedConnectionPool(
-                minconn=2, 
-                maxconn=15, 
-                dsn=self.db_url,
-                options="-c timezone=UTC"
+            self._pool = AsyncConnectionPool(
+                conninfo=self.db_url,
+                min_size=2, 
+                max_size=20,
+                kwargs={"options": "-c timezone=UTC"},
+                timeout=30.0,
+                open=False
             )
-            logger.info("✅ Connection pool creado (min=2, max=15) | Timezone forzado a UTC")
+            await self._pool.open()
+            logger.info("✅ psycopg3 AsyncConnectionPool creado (min=2, max=20) | Timezone UTC")
         return self._pool
 
-    def _execute(self, func, retries=2):
-        p = self._get_pool()
+    async def _run(self, func, retries=2):
+        pool = await self._get_pool()
         last_error = None
         for attempt in range(retries + 1):
-            conn = p.getconn()
             try:
-                conn.autocommit = False
-                result = func(conn)
-                conn.commit()
-                p.putconn(conn)
-                return result
-            except psycopg2.OperationalError as e:
-                conn.rollback()
-                p.putconn(conn, close=True)  # ← descartar conexión corrupta
+                async with pool.connection() as conn:
+                    return await func(conn)
+            except psycopg.OperationalError as e:
                 last_error = e
                 if attempt < retries:
-                    import time
-                    time.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(0.5 * (attempt + 1))
                     continue
                 raise last_error
-            except Exception as e:
-                conn.rollback()
-                p.putconn(conn)  # ← devolver conexión sana
+            except Exception:
                 raise
         raise last_error
 
-    async def _run(self, func):
-        return await asyncio.to_thread(self._execute, func)
-
     async def close(self):
         if self._pool and not self._pool.closed:
-            self._pool.closeall()
-            logger.info("🔌 Connection pool cerrado")
+            await self._pool.close()
+            logger.info("🔌 psycopg3 Connection pool cerrado")
 
     async def init_tables(self):
-        def _init(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _init(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS groups (
                         group_id BIGINT PRIMARY KEY, group_name TEXT, group_type TEXT DEFAULT 'VIP',
                         admin_id BIGINT, super_admin_id BIGINT, created_at TIMESTAMP DEFAULT NOW(),
                         settings JSONB DEFAULT '{}'::jsonb
                     )
                 """)
-                cur.execute("""
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, group_id BIGINT NOT NULL,
                         username TEXT, first_name TEXT, plan TEXT NOT NULL,
@@ -688,7 +679,7 @@ class Database:
                         source TEXT DEFAULT 'Directo'
                     )
                 """)
-                cur.execute("""
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS payments (
                         id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, group_id BIGINT NOT NULL,
                         username TEXT, first_name TEXT, plan TEXT NOT NULL,
@@ -696,14 +687,14 @@ class Database:
                         payment_date TIMESTAMP DEFAULT NOW()
                     )
                 """)
-                cur.execute("""
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS warning_logs (
                         id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, group_id BIGINT NOT NULL,
                         warning_type TEXT NOT NULL, sent_at TIMESTAMP DEFAULT NOW(),
                         UNIQUE(user_id, group_id, warning_type)
                     )
                 """)
-                cur.execute("""
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS payment_leads (
                         id SERIAL PRIMARY KEY,
                         user_id BIGINT NOT NULL,
@@ -711,21 +702,19 @@ class Database:
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
-                # 1. Limpiar duplicados históricos antes de aplicar el índice único
-                cur.execute("""
+                await cur.execute("""
                     DELETE FROM payment_leads a USING payment_leads b 
                     WHERE a.id < b.id AND a.user_id = b.user_id AND a.group_id = b.group_id
                 """)
-                # 2. Crear el índice único de forma segura
-                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_leads_user_group ON payment_leads(user_id, group_id)")
-                cur.execute("""
+                await cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_leads_user_group ON payment_leads(user_id, group_id)")
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS broadcast_logs (
                         id SERIAL PRIMARY KEY, group_id BIGINT NOT NULL, filter_type TEXT NOT NULL,
                         message_preview TEXT, total_count INTEGER DEFAULT 0, success_count INTEGER DEFAULT 0,
                         fail_count INTEGER DEFAULT 0, sent_by BIGINT, sent_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
-                cur.execute("""
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS discount_spins (
                         user_id BIGINT NOT NULL, group_id BIGINT NOT NULL, spin_count INTEGER DEFAULT 1,
                         last_spin TIMESTAMP DEFAULT NOW(), best_discount INTEGER DEFAULT 0,
@@ -733,7 +722,7 @@ class Database:
                         UNIQUE(user_id, group_id)
                     )
                 """)
-                cur.execute("""
+                await cur.execute("""
                     CREATE TABLE IF NOT EXISTS group_messages (
                         group_id BIGINT PRIMARY KEY,
                         welcome_message TEXT DEFAULT NULL,
@@ -748,7 +737,6 @@ class Database:
                         updated_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
-                # Índices
                 for idx_sql in [
                     "CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)",
                     "CREATE INDEX IF NOT EXISTS idx_warning_logs_lookup ON warning_logs(user_id, group_id, warning_type)",
@@ -761,9 +749,8 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
                     "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)"
                 ]:
-                    cur.execute(idx_sql)
-                # Migraciones seguras
-                cur.execute("""
+                    await cur.execute(idx_sql)
+                await cur.execute("""
                     DO $$                     BEGIN
                         IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payments' AND column_name='amount' AND data_type='integer')
                             THEN ALTER TABLE payments ALTER COLUMN amount TYPE NUMERIC(10,2); END IF;
@@ -793,8 +780,7 @@ class Database:
                             THEN ALTER TABLE users ADD COLUMN restricted_at TIMESTAMP DEFAULT NULL; END IF;
                     END $$;
                 """)
-                # Fix trial_used
-                cur.execute("""
+                await cur.execute("""
                     UPDATE users SET trial_used = TRUE, updated_at = NOW()
                     WHERE (trial_used = FALSE OR trial_used IS NULL)
                       AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id = users.user_id AND p.group_id = users.group_id AND p.plan = 'trial')
@@ -803,10 +789,10 @@ class Database:
         logger.info("✅ Base de datos inicializada")
 
     async def load_groups_from_db(self):
-        def _load(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT group_id, group_name, admin_id, COALESCE(group_type, 'VIP') as group_type, COALESCE(settings, '{}') as settings FROM groups")
-                return cur.fetchall()
+        async def _load(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT group_id, group_name, admin_id, COALESCE(group_type, 'VIP') as group_type, COALESCE(settings, '{}') as settings FROM groups")
+                return await cur.fetchall()
         rows = await self._run(_load)
         if rows:
             with GROUPS_LOCK:
@@ -820,10 +806,10 @@ class Database:
         return False
         
     async def load_group_messages(self):
-        def _load(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM group_messages")
-                return cur.fetchall()
+        async def _load(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT * FROM group_messages")
+                return await cur.fetchall()
         rows = await self._run(_load)
         with GROUP_MESSAGES_LOCK:
             GROUP_MESSAGES_CACHE.clear()
@@ -832,9 +818,9 @@ class Database:
         logger.info(f"📨 {len(GROUP_MESSAGES_CACHE)} mensajes de grupo cargados en caché")
 
     async def save_group(self, group_id: int, group_name: str, admin_id: int, group_type: str = "VIP"):
-        def _save(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _save(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO groups (group_id, group_name, admin_id, super_admin_id, group_type)
                     VALUES (%s,%s,%s,%s,%s)
                     ON CONFLICT (group_id) DO UPDATE SET
@@ -843,28 +829,26 @@ class Database:
         await self._run(_save)
 
     async def get_user(self, user_id: int, group_id: int, columns: str = "*") -> Optional[dict]:
-        """Consulta unificada con proyección de columnas configurable."""
         safe_columns = {"user_id", "status", "end_date", "plan", "trial_used", "fuego_notice_sent", "username", "first_name", "start_date", "source", "*"}
-        # Verificamos que las columnas pedidas estén en la lista blanca
         if columns != "*":
             requested = [c.strip() for c in columns.split(",")]
             if not all(col in safe_columns for col in requested):
-                columns = "*" # Si piden algo raro, devolvemos todo por seguridad
+                columns = "*" 
                 
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(f"SELECT {columns} FROM users WHERE user_id=%s AND group_id=%s LIMIT 1", (user_id, group_id))
-                return cur.fetchone()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(f"SELECT {columns} FROM users WHERE user_id=%s AND group_id=%s LIMIT 1", (user_id, group_id))
+                return await cur.fetchone()
         return await self._run(_get)
 
     async def get_user_by_username(self, username: str, group_id: int = None):
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
                 if group_id:
-                    cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s", (username, group_id))
+                    await cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s", (username, group_id))
                 else:
-                    cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s)", (username,))
-                return cur.fetchone()
+                    await cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s)", (username,))
+                return await cur.fetchone()
         return await self._run(_get)
 
     async def get_user_by_id(self, user_id: int, group_id: int):
@@ -874,56 +858,52 @@ class Database:
         return await self.get_user(user_id, group_id, "*")
 
     async def get_user_groups(self, user_id: int) -> List[int]:
-        """Retorna todos los group_ids en los que el usuario tiene un registro, en 1 sola query."""
-        def _get(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT group_id FROM users WHERE user_id = %s", (user_id,))
-                return [row[0] for row in cur.fetchall()]
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT group_id FROM users WHERE user_id = %s", (user_id,))
+                return [row[0] for row in await cur.fetchall()]
         return await self._run(_get)
 
     async def register_user_auto(self, group_id: int, user_id: int, username: str, first_name: str, source: str = "Directo"):
         now = now_utc()
         trial_cfg = get_group_plan_config(group_id, "trial")
         trial_minutes = trial_cfg.get("minutes", 60)
-        def _register(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id, trial_used, status, end_date, plan, source FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (user_id, group_id))
-                existing = cur.fetchone()
+        async def _register(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT user_id, trial_used, status, end_date, plan, source FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (user_id, group_id))
+                existing = await cur.fetchone()
                 if not existing:
                     end_date = now + timedelta(minutes=trial_minutes)
-                    cur.execute("""INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, trial_used, status, source) VALUES (%s,%s,%s,%s,'trial',%s,%s,TRUE,'active',%s)""", (user_id, group_id, username, first_name, now, end_date, source))
-                    cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
+                    await cur.execute("""INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, trial_used, status, source) VALUES (%s,%s,%s,%s,'trial',%s,%s,TRUE,'active',%s)""", (user_id, group_id, username, first_name, now, end_date, source))
+                    await cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
                     return True, "trial_nuevo", end_date
-                cur.execute("UPDATE users SET username=%s, first_name=%s, source=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (username, first_name, source, user_id, group_id))
+                await cur.execute("UPDATE users SET username=%s, first_name=%s, source=%s, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (username, first_name, source, user_id, group_id))
                 existing_end = normalize_dt(existing["end_date"])
                 
-                # 1. Si aún está activo, no hacemos nada
                 if existing_end > now:
                     if existing["status"] != "active":
-                        cur.execute("UPDATE users SET status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+                        await cur.execute("UPDATE users SET status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s", (user_id, group_id))
                     else:
-                        cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
+                        await cur.execute("UPDATE users SET kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s AND kicked_at IS NOT NULL", (user_id, group_id))
                     return True, "activo", existing["end_date"]
 
-                # 2. Si expiró, verificamos si tiene derecho a Trial
                 if existing.get("trial_used"): 
                     return False, "sin_trial", None
                 
-                # 3. Si expiró y NO ha usado trial, se lo damos
                 end_date = now + timedelta(minutes=trial_minutes)
-                cur.execute("""UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s""", (now, end_date, user_id, group_id))
-                cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (user_id, group_id))
-                cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
+                await cur.execute("""UPDATE users SET plan='trial', start_date=%s, end_date=%s, trial_used=TRUE, status='active', kicked_at=NULL, updated_at=NOW() WHERE user_id=%s AND group_id=%s""", (now, end_date, user_id, group_id))
+                await cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+                await cur.execute("""INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date) VALUES (%s,%s,%s,%s,'trial',0,%s,%s)""", (user_id, group_id, username, first_name, trial_minutes, now))
                 return True, "trial_nuevo", end_date
         return await self._run(_register)
 
     async def register_free_user(self, chat_id: int, user_id: int, username: str, first_name: str, source: str = "Directo") -> bool:
-        def _reg(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM users WHERE user_id=%s AND group_id=%s", (user_id, chat_id))
-                if cur.fetchone():
+        async def _reg(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1 FROM users WHERE user_id=%s AND group_id=%s", (user_id, chat_id))
+                if await cur.fetchone():
                     return False
-                cur.execute("""
+                await cur.execute("""
                     INSERT INTO users (user_id, group_id, username, first_name, plan, start_date, end_date, status, trial_used, source)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (user_id, group_id) DO NOTHING
@@ -934,11 +914,9 @@ class Database:
                 return True
         return await self._run(_reg)
 
-    # --- Upsert unificado para add/renew ---
     async def _upsert_user(self, group_id: int, plan: str, identifier: str, is_id: bool,
                            first_name: str = "", custom_price: float = None, custom_days: int = None,
                            mode: str = "add") -> tuple:
-        """mode: 'add' (desde now) o 'renew' (desde end_date actual)."""
         if plan not in PLANS:
             return False, "❌ Plan inválido"
         config = get_group_plan_config(group_id, plan)
@@ -948,13 +926,13 @@ class Database:
             effective_mins = config.get('minutes', 1440)
         now = datetime.now(ZoneInfo("UTC"))
 
-        def _upsert(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        async def _upsert(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
                 if is_id:
-                    cur.execute("SELECT * FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (int(identifier), group_id))
+                    await cur.execute("SELECT * FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (int(identifier), group_id))
                 else:
-                    cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s FOR UPDATE", (identifier, group_id))
-                existing = cur.fetchone()
+                    await cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s FOR UPDATE", (identifier, group_id))
+                existing = await cur.fetchone()
                 if not existing:
                     return False, f"❌ No tengo registro de {'ID ' + identifier if is_id else '@' + identifier}. Pídele que envíe un mensaje al bot."
                 if plan == "trial" and existing.get('trial_used'):
@@ -976,25 +954,23 @@ class Database:
                     expiry_str = fmt_dt(end_date, include_time=False)
                 fn = first_name or existing.get('first_name', '') or ''
                 uname = existing.get('username', f"user_{existing['user_id']}")
-                cur.execute("""
+                await cur.execute("""
                     UPDATE users SET plan=%s, start_date=%s, end_date=%s, status='active', updated_at=NOW(),
                         first_name=%s, username=%s, trial_used = trial_used OR %s, kicked_at = NULL
                     WHERE user_id=%s AND group_id=%s
                 """, (plan, now if mode == "add" else existing['start_date'], end_date, fn, uname, plan == "trial", existing['user_id'], group_id))
-                cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (existing['user_id'], group_id))
-                cur.execute("""
+                await cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (existing['user_id'], group_id))
+                await cur.execute("""
                     INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (existing['user_id'], group_id, uname, fn, plan, effective_price, dur_minutes, now))
                 
-                # --- DISPARAR NOTIFY PARA OTROS BOTS ---
                 payload = json.dumps({
                     "user_id": existing['user_id'], 
                     "group_id": group_id, 
                     "plan": plan
                 })
-                cur.execute("NOTIFY vip_cache_invalidation, %s", (payload,))
-                # ---------------------------------------
+                await cur.execute("NOTIFY vip_cache_invalidation, %s", (payload,))
 
                 price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
                 display = fn if fn else uname
@@ -1014,87 +990,85 @@ class Database:
         return await self._upsert_user(group_id, plan, str(user_id), True, first_name, custom_price, custom_days, "renew")
 
     async def get_all_active_users(self, group_id: int, limit: int = 10, offset: int = 0):
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='active' AND end_date > NOW()", (group_id,))
-                total = cur.fetchone()[0]
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='active' AND end_date > NOW()", (group_id,))
+                total = await cur.fetchval()
                 
-                cur.execute("""
+                await cur.execute("""
                     SELECT user_id, username, first_name, plan, end_date,
                            EXTRACT(DAY FROM (end_date - NOW())) AS days_left
                     FROM users WHERE group_id=%s AND status='active' AND end_date > NOW() 
                     ORDER BY end_date ASC
                     LIMIT %s OFFSET %s
                 """, (group_id, limit, offset))
-                users = cur.fetchall()
+                users = await cur.fetchall()
                 return users, total
         return await self._run(_get)
 
     async def get_monthly_earnings(self, group_id: int):
         start_date = datetime.now(ZoneInfo("UTC")).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT plan, COUNT(*) AS count, COALESCE(SUM(amount),0) AS total FROM payments WHERE group_id=%s AND payment_date>=%s GROUP BY plan", (group_id, start_date))
-                summary = cur.fetchall()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT plan, COUNT(*) AS count, COALESCE(SUM(amount),0) AS total FROM payments WHERE group_id=%s AND payment_date>=%s GROUP BY plan", (group_id, start_date))
+                summary = await cur.fetchall()
                 total = sum(row['total'] for row in summary)
-                cur.execute("SELECT COUNT(*) AS new_users FROM users WHERE group_id=%s AND created_at>=%s", (group_id, start_date))
-                new_users = cur.fetchone()['new_users']
-                cur.execute("""
+                await cur.execute("SELECT COUNT(*) AS new_users FROM users WHERE group_id=%s AND created_at>=%s", (group_id, start_date))
+                new_users = await cur.fetchval()
+                await cur.execute("""
                     SELECT user_id, username, first_name, plan, amount, duration_minutes, payment_date
                     FROM payments WHERE group_id=%s AND payment_date >= date_trunc('month', NOW()) ORDER BY payment_date DESC LIMIT 10
                 """, (group_id,))
-                recent = cur.fetchall()
+                recent = await cur.fetchall()
                 return {"summary": summary, "total": total, "new_users": new_users, "recent": recent}
         return await self._run(_get)
 
     async def get_total_monthly_earnings(self):
         start_date = datetime.now(ZoneInfo("UTC")).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        def _get(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE payment_date>=%s", (start_date,))
-                return cur.fetchone()[0]
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE payment_date>=%s", (start_date,))
+                return await cur.fetchval()
         return await self._run(_get)
 
     async def get_expired_users(self, group_id: int):
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
                     SELECT user_id, username, first_name, plan, end_date
                     FROM users WHERE group_id=%s AND status='active' AND end_date < NOW() AND kicked_at IS NULL
                 """, (group_id,))
-                return cur.fetchall()
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def expire_user(self, user_id: int, group_id: int):
-        def _expire(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _expire(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     UPDATE users SET status='expired', kicked_at=NOW(), updated_at=NOW()
                     WHERE user_id=%s AND group_id=%s AND status='active' AND kicked_at IS NULL RETURNING user_id
                 """, (user_id, group_id))
-                return cur.fetchone() is not None
+                return await cur.fetchone() is not None
         return await self._run(_expire)
 
     async def expire_users_batch(self, user_ids: List[int], group_id: int):
-        """UPDATE masivo para expirar usuarios. Retorna lista de user_ids actualizados."""
         if not user_ids:
             return []
-        def _expire(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _expire(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     UPDATE users SET status='expired', kicked_at=NOW(), updated_at=NOW()
                     WHERE user_id = ANY(%s) AND group_id=%s AND status='active' AND kicked_at IS NULL
                     RETURNING user_id
                 """, (user_ids, group_id))
-                return [row[0] for row in cur.fetchall()]
+                return [row[0] for row in await cur.fetchall()]
         return await self._run(_expire)
 
     async def get_user_spins_anywhere(self, user_id: int) -> List[dict]:
-        """Busca si un usuario tiene giros de ruleta en cualquier grupo, aunque no esté en la tabla users."""
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM discount_spins WHERE user_id = %s", (user_id,))
-                return cur.fetchall()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT * FROM discount_spins WHERE user_id = %s", (user_id,))
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def get_potential_clients_stats(self, group_id: int):
@@ -1105,134 +1079,133 @@ class Database:
         else:
             start_last_month = now.replace(month=now.month-1, day=1, hour=0, minute=0, second=0, microsecond=0)
         end_last_month = start_of_month
-        def _get(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial' AND created_at>=%s", (group_id, start_of_month))
-                count_month = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial' AND created_at>=%s AND created_at<%s", (group_id, start_last_month, end_last_month))
-                count_last_month = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial'", (group_id,))
-                total_all = cur.fetchone()[0]
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial' AND created_at>=%s", (group_id, start_of_month))
+                count_month = await cur.fetchval()
+                await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial' AND created_at>=%s AND created_at<%s", (group_id, start_last_month, end_last_month))
+                count_last_month = await cur.fetchval()
+                await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial'", (group_id,))
+                total_all = await cur.fetchval()
                 return count_month, count_last_month, total_all
         return await self._run(_get)
 
     async def get_potential_clients_list(self, group_id: int):
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id, username, first_name, created_at FROM users WHERE group_id=%s AND status='potencial' ORDER BY created_at DESC", (group_id,))
-                return cur.fetchall()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT user_id, username, first_name, created_at FROM users WHERE group_id=%s AND status='potencial' ORDER BY created_at DESC", (group_id,))
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def get_export_data(self, group_id: int):
         start_date = datetime.now(ZoneInfo("UTC")).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
                     SELECT user_id, username, first_name, plan, amount, duration_minutes, payment_date
                     FROM payments WHERE group_id=%s AND payment_date>=%s ORDER BY payment_date DESC
                 """, (group_id, start_date))
-                return cur.fetchall()
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def update_group_fields(self, group_id: int, changes: dict):
         if not changes:
             return
-        def _upd(conn):
-            with conn.cursor() as cur:
+        async def _upd(conn):
+            async with conn.cursor() as cur:
                 if 'settings' in changes:
-                    cur.execute("UPDATE groups SET settings=%s WHERE group_id=%s", (json.dumps(changes['settings']), group_id))
+                    await cur.execute("UPDATE groups SET settings=%s WHERE group_id=%s", (json.dumps(changes['settings']), group_id))
                 if 'admin' in changes:
-                    cur.execute("UPDATE groups SET admin_id=%s WHERE group_id=%s", (changes['admin'], group_id))
+                    await cur.execute("UPDATE groups SET admin_id=%s WHERE group_id=%s", (changes['admin'], group_id))
                 if 'type' in changes:
-                    cur.execute("UPDATE groups SET group_type=%s WHERE group_id=%s", (changes['type'], group_id))
+                    await cur.execute("UPDATE groups SET group_type=%s WHERE group_id=%s", (changes['type'], group_id))
         await self._run(_upd)
 
     async def delete_group_from_db(self, group_id: int):
-        def _del(conn):
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM groups WHERE group_id=%s", (group_id,))
+        async def _del(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM groups WHERE group_id=%s", (group_id,))
         await self._run(_del)
 
     async def get_total_users_count(self):
-        def _get(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM users")
-                return cur.fetchone()[0]
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT COUNT(*) FROM users")
+                return await cur.fetchval()
         return await self._run(_get)
 
     async def get_trial_stats(self, group_id: int) -> dict:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT COUNT(*) as total_trial_users FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE)", (group_id,))
-                total_trial_users = cur.fetchone()['total_trial_users']
-                cur.execute("""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT COUNT(*) as total_trial_users FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE)", (group_id,))
+                total_trial_users = await cur.fetchval()
+                await cur.execute("""
                     SELECT user_id, username, first_name, end_date,
                            EXTRACT(EPOCH FROM (end_date - NOW())) / 86400 as days_left,
                            EXTRACT(EPOCH FROM (end_date - NOW())) / 3600 as hours_left
                     FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW() ORDER BY end_date ASC
                 """, (group_id,))
-                active_trials = cur.fetchall()
-                cur.execute("SELECT COUNT(*) as expired_from_trial FROM users WHERE group_id=%s AND plan='trial' AND status='expired' AND end_date < NOW()", (group_id,))
-                expired_from_trial = cur.fetchone()['expired_from_trial']
-                cur.execute("""
+                active_trials = await cur.fetchall()
+                await cur.execute("SELECT COUNT(*) as expired_from_trial FROM users WHERE group_id=%s AND plan='trial' AND status='expired' AND end_date < NOW()", (group_id,))
+                expired_from_trial = await cur.fetchval()
+                await cur.execute("""
                     SELECT COUNT(DISTINCT u.user_id) as converted_users
                     FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id
                     WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0
                 """, (group_id,))
-                converted_users = cur.fetchone()['converted_users']
+                converted_users = await cur.fetchval()
                 return {"total_trial_users": total_trial_users, "active_trials": list(active_trials),
                         "active_count": len(active_trials), "expired_from_trial": expired_from_trial, "converted_users": converted_users}
         return await self._run(_get)
 
-    # --- Broadcast ---
     async def get_broadcast_targets(self, group_id: int, filter_type: str) -> list:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
                 if filter_type == 'trial_only':
-                    cur.execute("""
+                    await cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id FROM users u
                         WHERE u.group_id = %s AND (u.plan = 'trial' OR u.trial_used = TRUE OR u.trial_used IS NULL)
                           AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.user_id = u.user_id AND p.group_id = u.group_id AND p.amount > 0)
                         ORDER BY u.user_id
                     """, (group_id,))
                 elif filter_type == 'subscribed_only':
-                    cur.execute("""
+                    await cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id FROM users u
                         WHERE u.group_id = %s AND u.plan != 'trial' AND u.status = 'active' AND u.end_date > NOW()
                         ORDER BY u.user_id
                     """, (group_id,))
                 elif filter_type == 'expired_only':
-                    cur.execute("""
+                    await cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id FROM users u
                         WHERE u.group_id = %s AND u.status = 'expired'
                           AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id = u.user_id AND p.group_id = u.group_id AND p.amount > 0)
                         ORDER BY u.user_id
                     """, (group_id,))
                 elif filter_type == 'all_trial':
-                    cur.execute("""
+                    await cur.execute("""
                         SELECT DISTINCT u.user_id, u.username, u.first_name, u.group_id FROM users u
                         WHERE u.group_id = %s AND (u.plan = 'trial' OR u.trial_used = TRUE OR u.trial_used IS NULL)
                         ORDER BY u.user_id
                     """, (group_id,))
                 else:
                     return []
-                return cur.fetchall()
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def log_broadcast_sent(self, group_id: int, filter_type: str, message_text: str, total: int, success: int, fail: int, sent_by: int):
         preview = message_text[:100] if message_text else ""
-        def _log(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _log(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO broadcast_logs (group_id, filter_type, message_preview, total_count, success_count, fail_count, sent_by)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (group_id, filter_type, preview, total, success, fail, sent_by))
         await self._run(_log)
 
     async def log_payment_lead(self, user_id: int, group_id: int):
-        def _log(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _log(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO payment_leads (user_id, group_id, cart_step) 
                     VALUES (%s, %s, 0)
                     ON CONFLICT (user_id, group_id) DO UPDATE SET 
@@ -1244,36 +1217,35 @@ class Database:
 
     async def get_pending_abandoned_carts_by_step(self, group_id: int, step: int, delay_minutes: int) -> list:
         threshold = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=delay_minutes)
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
                     SELECT user_id, group_id FROM payment_leads 
                     WHERE group_id = %s AND cart_step = %s 
                       AND COALESCE(cart_msg_sent_at, created_at) <= %s
                 """, (group_id, step, threshold))
-                return cur.fetchall()
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def update_cart_step(self, user_id: int, group_id: int, step: int):
-        def _upd(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     UPDATE payment_leads SET cart_step = %s, cart_msg_sent_at = NOW() 
                     WHERE user_id = %s AND group_id = %s
                 """, (step, user_id, group_id))
         await self._run(_upd)
 
     async def get_broadcast_history(self, group_id: int, limit: int = 10) -> list:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
                     SELECT filter_type, message_preview, total_count, success_count, fail_count, sent_at
                     FROM broadcast_logs WHERE group_id = %s ORDER BY sent_at DESC LIMIT %s
                 """, (group_id, limit))
-                return cur.fetchall()
+                return await cur.fetchall()
         return await self._run(_get)
 
-    # --- Avisos ---
     async def get_warning_config(self, group_id: int) -> dict:
         group = get_group_by_id(group_id)
         if group:
@@ -1289,27 +1261,26 @@ class Database:
         }
 
     async def save_warning_config(self, group_id: int, config: dict):
-        def _save(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT settings FROM groups WHERE group_id = %s", (group_id,))
-                row = cur.fetchone()
+        async def _save(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT settings FROM groups WHERE group_id = %s", (group_id,))
+                row = await cur.fetchone()
                 settings = row[0] if row and row[0] else {}
                 if isinstance(settings, str):
                     settings = json.loads(settings)
                 settings['warning_config'] = config
-                cur.execute("UPDATE groups SET settings = %s WHERE group_id = %s", (json.dumps(settings), group_id))
+                await cur.execute("UPDATE groups SET settings = %s WHERE group_id = %s", (json.dumps(settings), group_id))
         await self._run(_save)
         group = get_group_by_id(group_id)
         if group:
             group.setdefault('settings', {})['warning_config'] = config
 
     async def get_users_for_warning_multi(self, group_ids: List[int], minutes_before: int) -> list:
-        """Versión optimizada que busca avisos para múltiples grupos en 1 sola query."""
         warning_threshold = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=minutes_before)
         warning_type = f"warning_{minutes_before}min"
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
                     SELECT u.user_id, u.username, u.first_name, u.end_date, u.plan, u.group_id
                     FROM users u LEFT JOIN warning_logs w
                         ON u.user_id = w.user_id AND u.group_id = w.group_id AND w.warning_type = %s
@@ -1317,13 +1288,13 @@ class Database:
                       AND u.end_date <= %s AND u.end_date > NOW() AND w.id IS NULL
                     ORDER BY u.end_date ASC
                 """, (warning_type, group_ids, warning_threshold))
-                return cur.fetchall()
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def log_warning_sent(self, user_id: int, group_id: int, warning_type: str):
-        def _log(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _log(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO warning_logs (user_id, group_id, warning_type, sent_at)
                     VALUES (%s, %s, %s, NOW())
                     ON CONFLICT (user_id, group_id, warning_type) DO UPDATE SET sent_at = NOW()
@@ -1331,44 +1302,43 @@ class Database:
         await self._run(_log)
 
     async def get_warning_stats(self, group_id: int) -> list:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT warning_type, COUNT(*) as count FROM warning_logs WHERE group_id = %s GROUP BY warning_type", (group_id,))
-                return cur.fetchall()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT warning_type, COUNT(*) as count FROM warning_logs WHERE group_id = %s GROUP BY warning_type", (group_id,))
+                return await cur.fetchall()
         return await self._run(_get)
 
     async def clear_warning_logs(self, group_id: int = None):
-        def _clear(conn):
-            with conn.cursor() as cur:
+        async def _clear(conn):
+            async with conn.cursor() as cur:
                 if group_id:
-                    cur.execute("DELETE FROM warning_logs WHERE group_id = %s", (group_id,))
+                    await cur.execute("DELETE FROM warning_logs WHERE group_id = %s", (group_id,))
                 else:
-                    cur.execute("DELETE FROM warning_logs")
+                    await cur.execute("DELETE FROM warning_logs")
         await self._run(_clear)
 
-    # --- Ruleta VIP ---
     async def get_spin_data(self, user_id: int, group_id: int) -> dict:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM discount_spins WHERE user_id = %s AND group_id = %s", (user_id, group_id))
-                row = cur.fetchone()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT * FROM discount_spins WHERE user_id = %s AND group_id = %s", (user_id, group_id))
+                row = await cur.fetchone()
                 if not row:
                     return {"spin_count": 0, "used": False, "best_discount": 0}
                 return dict(row)
         return await self._run(_get)
 
     async def get_spin_data_batch(self, group_id: int, user_ids: List[int]) -> Dict[int, dict]:
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM discount_spins WHERE group_id = %s AND user_id = ANY(%s)", (group_id, user_ids))
-                rows = cur.fetchall()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT * FROM discount_spins WHERE group_id = %s AND user_id = ANY(%s)", (group_id, user_ids))
+                rows = await cur.fetchall()
                 return {r['user_id']: dict(r) for r in rows}
         return await self._run(_get)
 
     async def record_spin(self, user_id: int, group_id: int, discount: int):
-        def _save(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _save(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO discount_spins (user_id, group_id, spin_count, last_spin, best_discount)
                     VALUES (%s, %s, 1, NOW(), %s)
                     ON CONFLICT (user_id, group_id) DO UPDATE SET
@@ -1379,9 +1349,9 @@ class Database:
         await self._run(_save)
 
     async def mark_discount_used(self, user_id: int, group_id: int, plan: str = None):
-        def _upd(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     UPDATE discount_spins SET used = TRUE, applied_to_plan = %s
                     WHERE user_id = %s AND group_id = %s
                 """, (plan, user_id, group_id))
@@ -1392,10 +1362,10 @@ class Database:
             if group_id in GROUP_MESSAGES_CACHE:
                 return GROUP_MESSAGES_CACHE[group_id]
                 
-        def _get(conn):
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM group_messages WHERE group_id = %s", (group_id,))
-                row = cur.fetchone()
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT * FROM group_messages WHERE group_id = %s", (group_id,))
+                row = await cur.fetchone()
                 return dict(row) if row else None
         msg_data = await self._run(_get)
         
@@ -1409,9 +1379,9 @@ class Database:
                                    channel_select_msg: str = None, channel_desc: str = None,
                                    vip_menu_msg: str = None, fuego_notice_msg: str = None,
                                    expired_msg: str = None):
-        def _save(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _save(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO group_messages (group_id, welcome_message, welcome_buttons, rejection_message, rejection_buttons,
                                                 channel_select_message, channel_description, vip_menu_message,
                                                 fuego_notice_message, expired_message, updated_at)
@@ -1432,7 +1402,6 @@ class Database:
                       channel_select_msg, channel_desc, vip_menu_msg, fuego_notice_msg, expired_msg))
         await self._run(_save)
         
-        # Actualizar caché en RAM
         with GROUP_MESSAGES_LOCK:
             current = GROUP_MESSAGES_CACHE.get(group_id, {})
             if welcome_msg is not None: current['welcome_message'] = welcome_msg
@@ -1451,21 +1420,21 @@ class Database:
     }
     
     async def mark_fuego_notice_sent(self, user_id: int, group_id: int):
-        def _upd(conn):
-            with conn.cursor() as cur:
-                cur.execute("UPDATE users SET fuego_notice_sent=TRUE WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("UPDATE users SET fuego_notice_sent=TRUE WHERE user_id=%s AND group_id=%s", (user_id, group_id))
         await self._run(_upd)
 
     async def mark_muted(self, user_id: int, group_id: int):
-        def _upd(conn):
-            with conn.cursor() as cur:
-                cur.execute("UPDATE users SET restricted_at=NOW() WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("UPDATE users SET restricted_at=NOW() WHERE user_id=%s AND group_id=%s", (user_id, group_id))
         await self._run(_upd)
 
     async def clear_muted(self, user_id: int, group_id: int):
-        def _upd(conn):
-            with conn.cursor() as cur:
-                cur.execute("UPDATE users SET restricted_at=NULL WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("UPDATE users SET restricted_at=NULL WHERE user_id=%s AND group_id=%s", (user_id, group_id))
         await self._run(_upd)
 
     async def get_global_message(self, msg_type: str) -> Optional[str]:
@@ -1473,49 +1442,44 @@ class Database:
             logger.error(f"❌ Intento de inyección SQL o columna inválida bloqueado en get_global_message: {msg_type}")
             return None
             
-        def _get(conn):
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT {msg_type} FROM group_messages WHERE group_id = 0")
-                row = cur.fetchone()
-                return row[0] if row else None
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(f"SELECT {msg_type} FROM group_messages WHERE group_id = 0")
+                return await cur.fetchval()
         return await self._run(_get)
 
     async def save_global_message(self, msg_type: str, text: str):
         if msg_type not in self._VALID_MSG_COLUMNS:
             logger.error(f"❌ Intento de inyección SQL o columna inválida bloqueado en save_global_message: {msg_type}")
             return
-        def _save(conn):
-            with conn.cursor() as cur:
-                cur.execute(f"""
+        async def _save(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(f"""
                     INSERT INTO group_messages (group_id, {msg_type}) VALUES (0, %s)
                     ON CONFLICT (group_id) DO UPDATE SET {msg_type} = EXCLUDED.{msg_type}
                 """, (text,))
         await self._run(_save)
         
-        # Actualizar caché en RAM
         with GROUP_MESSAGES_LOCK:
             current = GROUP_MESSAGES_CACHE.get(0, {})
             current[msg_type] = text
             GROUP_MESSAGES_CACHE[0] = current
 
-    # --- Backup tracking en DB en vez de archivo local ---
     async def get_last_backup_date(self) -> Optional[datetime]:
-        def _get(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT MAX(sent_at) FROM broadcast_logs WHERE filter_type = 'auto_backup'")
-                row = cur.fetchone()
-                return row[0] if row and row[0] else None
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT MAX(sent_at) FROM broadcast_logs WHERE filter_type = 'auto_backup'")
+                return await cur.fetchval()
         return await self._run(_get)
 
     async def log_backup_sent(self):
-        def _log(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _log(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     INSERT INTO broadcast_logs (group_id, filter_type, message_preview, total_count, success_count, fail_count, sent_by)
                     VALUES (0, 'auto_backup', 'Backup automatico', 0, 0, 0, %s)
                 """, (SUPER_ADMIN_ID,))
         await self._run(_log)
-
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
