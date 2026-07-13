@@ -145,6 +145,27 @@ def get_group_by_id(group_id: int) -> Optional[dict]:
     with GROUPS_LOCK:
         return GROUPS.get(group_id)
 
+def find_group_by_admin_and_type(admin_id: int, group_type: str) -> Optional[dict]:
+    with GROUPS_LOCK:
+        for g in GROUPS.values():
+            if g.get("type", "VIP") == group_type and g["admin_id"] == admin_id:
+                return g
+    return None
+
+def find_linked_or_admin_group(start_group: dict, target_type: str) -> Optional[dict]:
+    link_key = {
+        "VIP":       "linked_vip_group_id",
+        "FREE":      "linked_free_group_id",
+        "COMUNIDAD": "linked_comunidad_group_id",
+    }.get(target_type)
+    if link_key:
+        linked_id = start_group.get("settings", {}).get(link_key)
+        if linked_id:
+            g = get_group_by_id(linked_id) 
+            if g and g.get("type", "VIP") == target_type:
+                return g
+    return find_group_by_admin_and_type(start_group["admin_id"], target_type)
+
 def get_all_groups_snapshot() -> List[Dict[str, Any]]:
     with GROUPS_LOCK:
         return list(GROUPS.values())
@@ -1973,18 +1994,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and context.args:
         start_param = context.args[0]
         if start_param.startswith("FREE_"):
-            free_group_id = int(start_param.replace("FREE_", ""))
-            free_group = get_group_by_id(free_group_id)
-            if free_group and free_group.get("type") == "FREE":
-                vip_group = None
-                for g in GROUPS.values():
-                    if g.get("type", "VIP") == "VIP" and g["admin_id"] == free_group["admin_id"]:
-                        vip_group = g
-                        break
-                if not vip_group:
-                    vip_id = free_group.get("settings", {}).get("linked_vip_group_id")
-                    if vip_id:
-                        vip_group = get_group_by_id(vip_id)
+                vip_group = find_linked_or_admin_group(free_group, "VIP")
                 if vip_group:
                     await _show_vip_info(send, user_id, vip_group)
                     return
@@ -2759,8 +2769,7 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # 2. Si se usa dentro del grupo FREE
     elif current_group and current_group.get("type") == "FREE":
-        # Buscamos el grupo VIP vinculado a este FREE
-        target_vip_group_id = current_group.get("settings", {}).get("linked_vip_group_id")
+        target_vip_group_id = (find_linked_or_admin_group(current_group, "VIP") or {}).get("group_id")
         if not target_vip_group_id:
             # Si no hay vinculación explícita, buscamos el VIP del mismo admin
             for g_id, g_obj in GROUPS.items():
@@ -2770,30 +2779,20 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
     # 3. Si se usa en el chat privado del bot
     else:
-        # OPTIMIZACIÓN: 1 sola query a la BD para obtener todos los grupos del usuario
         user_group_ids = await db.get_user_groups(user_id)
         if user_group_ids:
-            # Priorizar si ya está en un VIP
+            # 1. ¿Está en algún VIP?
             for gid in user_group_ids:
                 g_obj = get_group_by_id(gid)
                 if g_obj and g_obj.get("type") == "VIP":
                     target_vip_group_id = gid
                     break
-            
-            # Si no está en ningún VIP, buscar si está en un FREE y derivar al VIP del admin
+            # 2. ¿Está en algún FREE? Derivar al VIP del admin
             if not target_vip_group_id:
                 for gid in user_group_ids:
                     g_obj = get_group_by_id(gid)
                     if g_obj and g_obj.get("type") == "FREE":
-                        vip_id = g_obj.get("settings", {}).get("linked_vip_group_id")
-                        if vip_id and get_group_by_id(vip_id):
-                            target_vip_group_id = vip_id
-                            break
-                        # Fallback por admin
-                        for vg_obj in get_all_groups_snapshot():
-                            if vg_obj.get("type") == "VIP" and vg_obj["admin_id"] == g_obj["admin_id"]:
-                                target_vip_group_id = vg_obj["group_id"]
-                                break
+                        target_vip_group_id = (find_linked_or_admin_group(g_obj, "VIP") or {}).get("group_id")
                         if target_vip_group_id:
                             break
 
@@ -3254,18 +3253,25 @@ async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard.append(_back_button("menu_view_groups"))
     await query.edit_message_text(f"📋 *Grupos {group_type}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def menu_edit_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def menu_edit_group_select(update, context):
     query = update.callback_query
     await query.answer()
     groups_snapshot = get_all_groups_snapshot()
     if not groups_snapshot:
         await query.edit_message_text("📭 No hay grupos configurados")
         return
-        
-    keyboard = [[InlineKeyboardButton(f"{'👑' if g.get('type', 'VIP') == 'VIP' else '📋'} {g['group_name']}",
-                                      callback_data=f"edit_multiple_{g['group_id']}")] for g in GROUPS.values()]
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'👑' if g.get('type', 'VIP') == 'VIP' else '📋'} {g['group_name']}",
+            callback_data=f"edit_multiple_{g['group_id']}"
+        )] for g in groups_snapshot  # ✅ snapshot
+    ]
     keyboard.append(_back_button("menu_groups"))
-    await query.edit_message_text("✏️ *Selecciona el grupo que deseas editar*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(
+        "✏️ *Selecciona el grupo que deseas editar*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 async def menu_delete_group_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3569,12 +3575,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
     chat_link = f"tg://user?id={user_id}"
 
-    free_group = None
-    with GROUPS_LOCK:
-        for g in GROUPS.values():
-            if g.get("type") == "FREE" and g["admin_id"] == group["admin_id"]:
-                free_group = g
-                break
+    free_group = find_linked_or_admin_group(group, "FREE")
     if not free_group:
         vip_settings = group.get("settings", {})
         free_id = vip_settings.get("linked_free_group_id")
