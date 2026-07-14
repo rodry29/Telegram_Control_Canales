@@ -3937,7 +3937,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 return False
 
             # Mensaje estándar para intentos 1 y 2
-            expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
+            expired_msg = DEFAULT_EXPIRED_MESSAGE
             if custom_messages and custom_messages.get('expired_message'):
                 expired_msg = custom_messages['expired_message']
             expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
