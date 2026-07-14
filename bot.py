@@ -1233,9 +1233,9 @@ class Database:
     async def get_all_active_users(self, group_id: int, limit: int = 10, offset: int = 0):
         async def _get(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='active' AND end_date > NOW()", (group_id,))
+                await cur.execute("SELECT COUNT(*) AS count FROM users WHERE group_id=%s AND status='active' AND end_date > NOW()", (group_id,))
                 row = await cur.fetchone()
-                total = row[0] if row else 0
+                total = row['count'] if row else 0
                 
                 await cur.execute("""
                     SELECT user_id, username, first_name, plan, end_date,
@@ -1257,7 +1257,7 @@ class Database:
                 total = sum(row['total'] for row in summary)
                 await cur.execute("SELECT COUNT(*) AS new_users FROM users WHERE group_id=%s AND created_at>=%s", (group_id, start_date))
                 row = await cur.fetchone()
-                new_users = row[0] if row else 0
+                new_users = row['new_users'] if row else 0
                 await cur.execute("""
                     SELECT user_id, username, first_name, plan, amount, duration_minutes, payment_date
                     FROM payments WHERE group_id=%s AND payment_date >= date_trunc('month', NOW()) ORDER BY payment_date DESC LIMIT 10
@@ -1387,7 +1387,8 @@ class Database:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("SELECT COUNT(*) as total_trial_users FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE)", (group_id,))
                 row = await cur.fetchone()
-                total_trial_users = row[0] if row else 0
+                total_trial_users = row['total_trial_users'] if row else 0
+                
                 await cur.execute("""
                     SELECT user_id, username, first_name, end_date,
                            EXTRACT(EPOCH FROM (end_date - NOW())) / 86400 as days_left,
@@ -1395,16 +1396,19 @@ class Database:
                     FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW() ORDER BY end_date ASC
                 """, (group_id,))
                 active_trials = await cur.fetchall()
+                
                 await cur.execute("SELECT COUNT(*) as expired_from_trial FROM users WHERE group_id=%s AND plan='trial' AND status='expired' AND end_date < NOW()", (group_id,))
                 row = await cur.fetchone()
-                expired_from_trial = row[0] if row else 0
+                expired_from_trial = row['expired_from_trial'] if row else 0
+                
                 await cur.execute("""
                     SELECT COUNT(DISTINCT u.user_id) as converted_users
                     FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id
                     WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0
                 """, (group_id,))
                 row = await cur.fetchone()
-                converted_users = row[0] if row else 0
+                converted_users = row['converted_users'] if row else 0
+                
                 return {"total_trial_users": total_trial_users, "active_trials": list(active_trials),
                         "active_count": len(active_trials), "expired_from_trial": expired_from_trial, "converted_users": converted_users}
         return await self._run(_get)
@@ -3886,6 +3890,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             keyboard.append([InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")])
 
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            
+            attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else ""
             await _safe_send(
                 group["admin_id"],
                 f"🆕 *Nuevo usuario VIP*\n\n"
@@ -4009,7 +4015,7 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
         if custom_messages and custom_messages.get('expired_message'):
             muted_msg = custom_messages['expired_message']
             
-            expired_msg = format_message(muted_msg, {'group_name': group['group_name']}) 
+        expired_msg = format_message(muted_msg, {'group_name': group['group_name']})
         await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
         motivo = "Plan vencido" if result_code == "expirado" else "Trial ya utilizado"
         await _safe_send(
