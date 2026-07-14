@@ -5391,21 +5391,100 @@ async def _execute_spin(update: Update, context: ContextTypes.DEFAULT_TYPE, grou
 
 async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("🚫 Ya usaste tu ruleta. Si tienes dudas, contacta al admin.", show_alert=True)
     parts = query.data.split("_")
-    if len(parts) >= 4:
+    
+    # Extraer group_id y user_id de forma segura (formato: spin_used_-100123_456)
+    if len(parts) < 4:
+        await query.answer("❌ Error en datos", show_alert=True)
+        return
+        
+    try:
         group_id = int(parts[2])
-        group = get_group_by_id(group_id)
-        if group:
-            user = query.from_user
+        user_id = int(parts[3])
+    except ValueError:
+        await query.answer("❌ Error en ID", show_alert=True)
+        return
+
+    group = get_group_by_id(group_id)
+    if not group:
+        await query.answer("❌ Grupo no encontrado", show_alert=True)
+        return
+
+    spin_data = await db.get_spin_data(user_id, group_id)
+    status = get_discount_status(spin_data)
+    best = spin_data.get("best_discount", 0) if spin_data else 0
+    chat_link = f"tg://user?id={user_id}"
+    
+    user_name = query.from_user.first_name or "Usuario"
+    payment_contact = group.get('settings', {}).get('payment_contact', 'admin')
+
+    # 1. MANEJO DEL EMBUDO SEGÚN EL ESTADO
+    if status == "active":
+        # A) DESCUENTO ACTIVO: Este es el lead más caliente. Hay que cerrar YA.
+        await query.answer("🏆 Redirigiéndote a la info de pago con tu descuento...", show_alert=False)
+        
+        msg = (
+            f"🏆 *¡Tu descuento del {best}% está ACTIVO!*\n\n"
+            f"👉 *No pierdas esta oportunidad.* Estos son tus precios especiales:\n\n"
+            + _build_price_list(group_id, discounted_pct=best) + 
+            f"\n\n⏳ *Recuerda:* Tu descuento tiene tiempo límite. Úsalo ahora.\n"
+            f"📤 Envía tu comprobante a @{payment_contact} y diles: *'Quiero activar con mi descuento del {best}%'*."
+        )
+        
+        # Alerta al admin para cierre manual (Crítico para ventas)
+        try:
             await _safe_send(
                 group["admin_id"],
-                f"⚠️ *Intento de ruleta repetida (botón usado)*\n\n"
-                f"👤 [{user.first_name or 'Usuario'}](tg://user?id={user.id})\n"
-                f"🆔 `{user.id}` | 📌 {group['group_name']}\n\n"
-                f"Este usuario presionó el botón 'Ruleta ya usada'.",
+                f"🔥 *LEAD CALIENTE VIENDO SU DESCUENTO*\n\n"
+                f"👤 [{user_name}]({chat_link})\n"
+                f"🆔 `{user_id}`\n"
+                f"🏆 Descuento: *{best}% OFF*\n\n"
+                f"💡 *Acción recomendada:* Escríbele ahora para recordarle que pague y activarlo al instante.",
                 parse_mode="Markdown"
             )
+        except Exception:
+            pass
+
+    elif status == "used":
+        # B) RULETA USADA: Quiere saber opciones (renovación o compra normal)
+        await query.answer("ℹ️ Mostrando opciones de pago normales...", show_alert=False)
+        
+        msg = (
+            f"✅ *Ya utilizaste tu ruleta VIP*\n\n"
+            f"No te preocupes, ¡aún puedes acceder al contenido exclusivo de *{safe_name(group['group_name'])}*!\n\n"
+            f"💳 *Planes disponibles a precio normal:*\n"
+            + _build_price_list(group_id) + 
+            f"\n\n📤 Envía tu comprobante a @{payment_contact} para activar tu acceso inmediatamente."
+        )
+
+    elif status == "expired":
+        # C) DESCUENTO EXPIRADO: FOMO + Oportunidad de pago normal
+        await query.answer("⏰ Tu descuento expiró, pero aún puedes entrar...", show_alert=False)
+        
+        msg = (
+            f"⏰ *Tu descuento del {best}% ha expirado*\n\n"
+            f"El tiempo de la promo terminó, pero el contenido de *{safe_name(group['group_name'])}* sigue subiendo todos los días.\n\n"
+            f"💳 *Planes a precio normal:*\n"
+            + _build_price_list(group_id) + 
+            f"\n\n📤 Si quieres entrar ya, envía tu comprobante a @{payment_contact}."
+        )
+    else:
+        # D) Ninguno / Error
+        await query.answer()
+        return
+
+    # 2. EDITAR EL MENSAJE CON EL EMBUDO Y EL TECLADO DE PAGO
+    # Pasamos spin_data para que el teclado se adapte también (evita consultas extra)
+    keyboard = await get_payment_keyboard(group_id, user_id, spin_data=spin_data)
+    
+    try:
+        await query.edit_message_text(
+            msg,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.warning(f"No se pudo editar mensaje en spin_used_callback: {e}")
 
 # ==================== SISTEMA DE AVISOS ====================
 async def send_trial_warnings():
