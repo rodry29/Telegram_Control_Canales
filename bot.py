@@ -3049,6 +3049,8 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_reply_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message: return
     if not update.message.text or not update.message.text.startswith('/renew'): return
+    if not await _require_bot_reply(update, context):
+        return
         
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
