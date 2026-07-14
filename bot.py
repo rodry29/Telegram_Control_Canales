@@ -2016,21 +2016,19 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
         "📋 *Planes disponibles:*\n{price_list}\n\n"
     )
     
-    # Usar el mensaje personalizado si existe, si no, el por defecto
-    msg = format_message(msg, {
-        'group_name': group.get('group_name', 'VIP'), # <- Quitado safe_name
-        'price_list': price_lines,
-        'trial_duration': trial_str,
-        'expiry_time': 'Al unirte al grupo',
-        'user_name': 'Usuario'
-    })
+    # 1. Asignar el mensaje (personalizado o por defecto)
+    msg = default_msg
+    if custom and custom.get('welcome_message'):
+        msg = custom['welcome_message']
         
-    # Formatear variables de forma segura
+    # 2. Definir las variables necesarias ANTES de formatear
     cfg_t = get_group_plan_config(group_id, "trial")
     trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
     
+    # 3. Formatear el mensaje una sola vez. 
+    # No usamos safe_name() aquí porque format_message ya lo hace automáticamente.
     msg = format_message(msg, {
-        'group_name': safe_name(group.get('group_name', 'VIP')),
+        'group_name': group.get('group_name', 'VIP'),
         'price_list': price_lines,
         'trial_duration': trial_str,
         'expiry_time': 'Al unirte al grupo',
