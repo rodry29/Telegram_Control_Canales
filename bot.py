@@ -950,14 +950,9 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)",
                     "CREATE INDEX IF NOT EXISTS idx_broadcast_logs_group ON broadcast_logs(group_id, sent_at)",
                     "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
-                    "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)"
-                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder "
-                    "  ON discount_spins(expires_at) "
-                    "  WHERE used = FALSE AND reminder_sent = FALSE",
-                    
-                    "CREATE INDEX IF NOT EXISTS idx_users_rejoin "
-                    "  ON users(group_id, status, rejoin_attempts) "
-                    "  WHERE status IN ('active','expired')",
+                    "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder ON discount_spins(expires_at) WHERE used = FALSE AND reminder_sent = FALSE",
+                    "CREATE INDEX IF NOT EXISTS idx_users_rejoin ON users(group_id, status, rejoin_attempts) WHERE status IN ('active','expired')"
                 ]:
                     await cur.execute(idx_sql)
                 await cur.execute("""
