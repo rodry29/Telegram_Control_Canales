@@ -3871,7 +3871,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 'trial_duration': trial_str,
                 'expiry_time': expiry_str,
                 'group_name': group['group_name'],
-                'user_name': first_name or username e
+                'user_name': first_name or username
             })
 
             keyboard = []
