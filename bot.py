@@ -427,7 +427,7 @@ def format_message(template: str, variables: dict) -> str:
     return result
 
 # ==================== HELPERS DE PAGO ====================
-def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, vip_invite_link: str = None) -> InlineKeyboardMarkup:
+async def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, vip_invite_link: str = None) -> InlineKeyboardMarkup:
     group = get_group_by_id(group_id)
     if not group:
         return InlineKeyboardMarkup([])
