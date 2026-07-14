@@ -2184,16 +2184,14 @@ async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, v
     await send_payment_info(context.bot, user_id, vip_group_id, triggered_by="botón Información de Pago")
 
 async def vip_spin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
-    # Wrapper para spin_discount con callback diferente
     query = update.callback_query
     user_id = query.from_user.id
     group = get_group_by_id(vip_group_id)
     if not group or group.get("type", "VIP") != "VIP":
         await query.answer("❌ Grupo no válido", show_alert=True)
         return
-    # Llamar a spin_discount con datos sintéticos
-    query.data = f"spin_{vip_group_id}_{user_id}"
-    await spin_discount(update, context)
+
+    await _execute_spin(update, context, vip_group_id, user_id)
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5252,6 +5250,12 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     group_id = int(parts[1])
     user_id = query.from_user.id
+    
+    await _execute_spin(update, context, group_id, user_id)
+
+
+async def _execute_spin(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, user_id: int):
+    query = update.callback_query
     group = get_group_by_id(group_id)
     if not group or group.get("type", "VIP") != "VIP":
         await query.answer("❌ Grupo no válido", show_alert=True)
