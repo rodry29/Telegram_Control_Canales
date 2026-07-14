@@ -951,6 +951,13 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_broadcast_logs_group ON broadcast_logs(group_id, sent_at)",
                     "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
                     "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)"
+                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder "
+                    "  ON discount_spins(expires_at) "
+                    "  WHERE used = FALSE AND reminder_sent = FALSE",
+                    
+                    "CREATE INDEX IF NOT EXISTS idx_users_rejoin "
+                    "  ON users(group_id, status, rejoin_attempts) "
+                    "  WHERE status IN ('active','expired')",
                 ]:
                     await cur.execute(idx_sql)
                 await cur.execute("""
@@ -981,6 +988,40 @@ class Database:
                             THEN ALTER TABLE payment_leads ADD COLUMN cart_step INTEGER DEFAULT 0; END IF;
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='restricted_at')
                             THEN ALTER TABLE users ADD COLUMN restricted_at TIMESTAMP DEFAULT NULL; END IF;
+                        -- discount_spins.expires_at
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='discount_spins' AND column_name='expires_at')
+                        THEN
+                            ALTER TABLE discount_spins ADD COLUMN expires_at TIMESTAMP DEFAULT NULL;
+                        END IF;
+                
+                        -- discount_spins.reminder_sent
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='discount_spins' AND column_name='reminder_sent')
+                        THEN
+                            ALTER TABLE discount_spins ADD COLUMN reminder_sent BOOLEAN DEFAULT FALSE;
+                        END IF;
+                
+                        -- users.rejoin_attempts
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='users' AND column_name='rejoin_attempts')
+                        THEN
+                            ALTER TABLE users ADD COLUMN rejoin_attempts INTEGER DEFAULT 0;
+                        END IF;
+                
+                        -- users.last_rejoin_attempt
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='users' AND column_name='last_rejoin_attempt')
+                        THEN
+                            ALTER TABLE users ADD COLUMN last_rejoin_attempt TIMESTAMP DEFAULT NULL;
+                        END IF;
+                
+                        -- users.rejoin_promo_sent
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='users' AND column_name='rejoin_promo_sent')
+                        THEN
+                            ALTER TABLE users ADD COLUMN rejoin_promo_sent BOOLEAN DEFAULT FALSE;
+                        END IF;
                     END $$;
                 """)
                 await cur.execute("""
