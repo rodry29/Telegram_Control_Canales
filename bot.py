@@ -3755,6 +3755,8 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ==================== DETECCIÓN DE MIEMBROS ====================
 async def _process_new_vip_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
+    group_id = chat_id
+    
     display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
     chat_link = f"tg://user?id={user_id}"
 
@@ -3765,7 +3767,6 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         if free_id: free_group = get_group_by_id(free_id)
     free_link = free_group.get("settings", {}).get("invite_link") if free_group else None
 
-    # Grupo Comunidad vinculado (opcional) — solo invitación, NO otorga trial automático
     linked_comunidad_id = group.get("settings", {}).get("linked_comunidad_group_id")
     comm_group = get_group_by_id(linked_comunidad_id) if linked_comunidad_id else None
     comm_invite_link = comm_group.get("settings", {}).get("invite_link") if comm_group else None
@@ -3819,20 +3820,18 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     if not allow_access:
         motivo_admin = "Plan vencido" if result_code == "expirado" else "Trial VIP ya utilizado"
         
-        # NUEVO: Contar intentos de reingreso
         attempts = await db.increment_rejoin_attempt(user_id, group_id)
         kick_success = await _kick_user_with_retry(chat_id, user_id)
         if kick_success:
             custom_messages = await db.get_group_messages(chat_id)
 
-                        # NUEVO: Lógica de Promo en 3er intento
             if attempts >= 3 and not await db.is_rejoin_promo_sent(user_id, group_id):
                 await db.mark_rejoin_promo_sent(user_id, group_id)
-                await db.log_payment_lead(user_id, group_id) # Entra al flujo de carrito abandonado
+                await db.log_payment_lead(user_id, group_id) 
                 await db.update_cart_step(user_id, group_id, 0)
                 
                 settings = group.get("settings", {})
-                extra_discount = 25 # 25% de descuento de regreso
+                extra_discount = 25 
                 promo_msg = (
                     f"🎁 *¡Te extrañamos en {safe_name(group['group_name'])}!*\n\n"
                     f"Noté que has intentado regresar. Quiero darte algo especial:\n\n"
@@ -3876,6 +3875,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         return False
 # --- NUEVO HANDLER PARA COMUNIDAD ---
 async def _process_new_comunidad_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
+    group_id = chat_id
     display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
     chat_link = f"tg://user?id={user_id}"
 
