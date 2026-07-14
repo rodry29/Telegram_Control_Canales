@@ -3034,14 +3034,9 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # 2. Si se usa dentro del grupo FREE
     elif current_group and current_group.get("type") == "FREE":
-        target_vip_group_id = (find_linked_or_admin_group(current_group, "VIP") or {}).get("group_id")
-        if not target_vip_group_id:
-            # Si no hay vinculación explícita, buscamos el VIP del mismo admin
-            for g_id, g_obj in GROUPS.items():
-                if g_obj.get("type") == "VIP" and g_obj["admin_id"] == current_group["admin_id"]:
-                    target_vip_group_id = g_id
-                    break
-                    
+        vip_group = find_linked_or_admin_group(current_group, "VIP")
+        target_vip_group_id = vip_group.get("group_id") if vip_group else None
+            
     # 3. Si se usa en el chat privado del bot
     else:
         user_group_ids = await db.get_user_groups(user_id)
@@ -3057,8 +3052,9 @@ async def ruleta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for gid in user_group_ids:
                     g_obj = get_group_by_id(gid)
                     if g_obj and g_obj.get("type") == "FREE":
-                        target_vip_group_id = (find_linked_or_admin_group(g_obj, "VIP") or {}).get("group_id")
-                        if target_vip_group_id:
+                        vip_group = find_linked_or_admin_group(g_obj, "VIP")
+                        if vip_group:
+                            target_vip_group_id = vip_group.get("group_id")
                             break
 
     if not target_vip_group_id:
@@ -3871,18 +3867,13 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     chat_link = f"tg://user?id={user_id}"
 
     free_group = find_linked_or_admin_group(group, "FREE")
-    if not free_group:
-        vip_settings = group.get("settings", {})
-        free_id = vip_settings.get("linked_free_group_id")
-        if free_id: free_group = get_group_by_id(free_id)
     free_link = free_group.get("settings", {}).get("invite_link") if free_group else None
 
-    linked_comunidad_id = group.get("settings", {}).get("linked_comunidad_group_id")
-    comm_group = get_group_by_id(linked_comunidad_id) if linked_comunidad_id else None
+    comm_group = find_linked_or_admin_group(group, "COMUNIDAD")
     comm_invite_link = comm_group.get("settings", {}).get("invite_link") if comm_group else None
 
     allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name, source)
-
+    
     if allow_access:
         if result_code == "trial_nuevo":
             cfg_t = get_group_plan_config(chat_id, "trial")
