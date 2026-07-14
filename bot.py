@@ -543,7 +543,7 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
             user_id, 
             get_payment_info_text(group_id), 
             parse_mode="Markdown", 
-            reply_markup=get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link)
+            reply_markup=await get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link)
         )
 
         _PAYMENT_COOLDOWN[cooldown_key] = now
@@ -3797,7 +3797,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                     f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
                     f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
                 )
-                await _safe_send(user_id, promo_msg, reply_markup=get_payment_keyboard(chat_id, user_id, spin_used=False), parse_mode="Markdown")
+                await _safe_send(user_id, promo_msg, reply_markup=await get_payment_keyboard(chat_id, user_id, spin_used=False), parse_mode="Markdown")
                 
                 await _safe_send(
                     group["admin_id"],
@@ -3814,7 +3814,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             if custom_messages and custom_messages.get('expired_message'):
                 expired_msg = custom_messages['expired_message']
             expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
-            await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
+            await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
             
             attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else ""
             await _safe_send(
@@ -3879,7 +3879,7 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
             muted_msg = custom_messages['expired_message']
             
         expired_msg = format_message(muted_msg, {'group_name': safe_name(group['group_name'])})
-        await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
+        await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
         motivo = "Plan vencido" if result_code == "expirado" else "Trial ya utilizado"
         await _safe_send(
             group["admin_id"],
@@ -5294,7 +5294,7 @@ async def send_trial_warnings():
                     spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
                     await bot_app.bot.send_message(
                         user_id, message,
-                        reply_markup=get_payment_keyboard(gid, user_id, spin_used=spin_used, vip_invite_link=rule["vip_invite_link"]),
+                        reply_markup=await get_payment_keyboard(gid, user_id, spin_used=spin_used, vip_invite_link=rule["vip_invite_link"]),
                         parse_mode="Markdown"
                     )
                     _fire_and_forget(db.log_warning_sent(user_id, gid, warning_type), "log_warning")
@@ -5439,7 +5439,7 @@ async def test_warning(update: Update, context: ContextTypes.DEFAULT_TYPE, group
         await context.bot.send_message(
             query.from_user.id,
             f"🧪 *AVISO DE PRUEBA*\n\n---\n{message}\n---\n\nSi te gusta, los avisos están listos.",
-            reply_markup=get_payment_keyboard(group_id, query.from_user.id),
+            reply_markup=await get_payment_keyboard(group_id, query.from_user.id),
             parse_mode="Markdown"
         )
         await query.edit_message_text("✅ *Aviso de prueba enviado a tu chat privado*", parse_mode="Markdown")
@@ -5960,7 +5960,7 @@ async def process_discount_expiration_reminders():
             + _build_price_list(item['group_id'], discounted_pct=item['best_discount'])
         )
         try:
-            await bot_app.bot.send_message(item['user_id'], msg, reply_markup=get_payment_keyboard(item['group_id'], item['user_id'], spin_used=False), parse_mode="Markdown")
+            await bot_app.bot.send_message(item['user_id'], msg, reply_markup=await get_payment_keyboard(item['group_id'], item['user_id'], spin_used=False), parse_mode="Markdown")
             async def _mark(conn):
                 async with conn.cursor() as cur:
                     await cur.execute("UPDATE discount_spins SET reminder_sent = TRUE WHERE user_id=%s AND group_id=%s", (item['user_id'], item['group_id']))
@@ -6056,7 +6056,7 @@ async def check_expired_subscriptions():
                     parse_mode="Markdown"
                 )
                 expired_msg = format_message(expired_msg_template, {'group_name': safe_name(group['group_name'])})
-                await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
+                await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
 
     await asyncio.gather(*[_process_group(g) for g in groups_to_check], return_exceptions=True)
     
