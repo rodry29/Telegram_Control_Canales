@@ -2019,7 +2019,8 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
     """Muestra información del VIP cuando un usuario llega desde un enlace o canal."""
     group_id = group['group_id']
     spin_data = await db.get_spin_data(user_id, group_id)
-    spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+    status = get_discount_status(spin_data)  # Usar el helper centralizado
+    
     price_lines = _build_price_list(group_id)
     custom = await db.get_group_messages(group_id)
     vip_invite_link = group.get("settings", {}).get("vip_invite_link", "").strip()
@@ -2030,17 +2031,13 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
         "📋 *Planes disponibles:*\n{price_list}\n\n"
     )
     
-    # 1. Asignar el mensaje (personalizado o por defecto)
     msg = default_msg
     if custom and custom.get('welcome_message'):
         msg = custom['welcome_message']
         
-    # 2. Definir las variables necesarias ANTES de formatear
     cfg_t = get_group_plan_config(group_id, "trial")
     trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
     
-    # 3. Formatear el mensaje una sola vez. 
-    # No usamos safe_name() aquí porque format_message ya lo hace automáticamente.
     msg = format_message(msg, {
         'group_name': group.get('group_name', 'VIP'),
         'price_list': price_lines,
@@ -2052,8 +2049,17 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
     keyboard = []
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("🔥 Únete al VIP", url=vip_invite_link)])
-    if not spin_used:
+        
+    # Lógica de botones consistente con el estado real
+    if status == "none":
         keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
+    elif status == "active":
+        keyboard.append([InlineKeyboardButton("✅ Descuento activo (ver)", callback_data=f"spin_used_{group_id}_{user_id}")])
+    elif status == "expired":
+        keyboard.append([InlineKeyboardButton("⏰ Descuento expirado", callback_data=f"spin_used_{group_id}_{user_id}")])
+    else: # used
+        keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
+        
     keyboard.append([InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")])
     
     await send_func(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -2147,11 +2153,23 @@ async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_
         'group_name': vip['group_name'],
         'user_name': query.from_user.first_name or 'Usuario'
     })
+    
     spin_data = await db.get_spin_data(user_id, vip_group_id)
-    spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
+    status = get_discount_status(spin_data)  # Usar el helper centralizado
+    
+    # Lógica de botones consistente
+    if status == "none":
+        spin_btn = InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"vip_spin_{vip_group_id}")
+    elif status == "active":
+        spin_btn = InlineKeyboardButton("✅ Descuento activo (ver)", callback_data=f"spin_used_{vip_group_id}_{user_id}")
+    elif status == "expired":
+        spin_btn = InlineKeyboardButton("⏰ Descuento expirado", callback_data=f"spin_used_{vip_group_id}_{user_id}")
+    else: # used
+        spin_btn = InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{vip_group_id}_{user_id}")
+
     keyboard = [
         [InlineKeyboardButton("🔥 Entrar al VIP", callback_data=f"vip_enter_{vip_group_id}")],
-        [InlineKeyboardButton("🎰 Ruleta de Descuento", callback_data=f"vip_spin_{vip_group_id}")],
+        [spin_btn],
         [InlineKeyboardButton("💳 Información de Pago", callback_data=f"vip_pay_{vip_group_id}")]
     ]
     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
