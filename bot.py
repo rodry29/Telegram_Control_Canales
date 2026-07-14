@@ -436,7 +436,7 @@ def format_message(template: str, variables: dict) -> str:
 render_template = format_message
 
 # ==================== HELPERS DE PAGO ====================
-async def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, vip_invite_link: str = None) -> InlineKeyboardMarkup:
+async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[dict] = None, vip_invite_link: str = None) -> InlineKeyboardMarkup:
     group = get_group_by_id(group_id)
     if not group:
         return InlineKeyboardMarkup([])
@@ -449,19 +449,17 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = Fa
     # Lógica para determinar el enlace de contacto directo
     contact_url = None
     if payment_contact.isdigit():
-        # Si el admin configuró un ID numérico en payment_contact, lo usamos
         contact_url = f"tg://user?id={payment_contact}"
     elif admin_id:
-        # Si no, usamos el admin_id del grupo por defecto
         contact_url = f"tg://user?id={admin_id}"
     elif payment_contact.startswith("@"):
-        # Si por error configuró un @username, usamos el enlace normal
         contact_url = f"https://t.me/{payment_contact[1:]}"
 
     keyboard = []
     
-    # Lógica para el botón de la ruleta
-    spin_data = await db.get_spin_data(user_id, group_id)
+    # Lógica para el botón de la ruleta (usando el dato pasado o consultando como fallback)
+    if spin_data is None:
+        spin_data = await db.get_spin_data(user_id, group_id)
     status = get_discount_status(spin_data)
     
     if status == "none":
@@ -473,11 +471,11 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = Fa
     else: # used
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
     
-    # Botón 2: Contacto Directo con el Admin (NUEVO)
+    # Botón 2: Contacto Directo con el Admin
     if contact_url:
         keyboard.append([InlineKeyboardButton("📤 ENVIAR COMPROBANTE AQUÍ", url=contact_url)])
     
-    # Botón 3: Link al VIP (sin la palabra Trial)
+    # Botón 3: Link al VIP
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("🔥 Entrada al VIP", url=vip_invite_link)])
     
@@ -546,13 +544,12 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
 
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
-        spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
         
         await bot.send_message(
             user_id, 
             get_payment_info_text(group_id), 
             parse_mode="Markdown", 
-            reply_markup=await get_payment_keyboard(group_id, user_id, spin_used=spin_used, vip_invite_link=vip_invite_link)
+            reply_markup=await get_payment_keyboard(group_id, user_id, spin_data=spin_data, vip_invite_link=vip_invite_link)
         )
 
         _PAYMENT_COOLDOWN[cooldown_key] = now
@@ -3944,7 +3941,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                     f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
                     f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
                 )
-                await _safe_send(user_id, promo_msg, reply_markup=await get_payment_keyboard(chat_id, user_id, spin_used=False), parse_mode="Markdown")
+                
+                await _safe_send(user_id, promo_msg, reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data={}), parse_mode="Markdown")
                 
                 await _safe_send(
                     group["admin_id"],
@@ -3956,17 +3954,22 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 )
                 return False
 
-            # Mensaje estándar para intentos 1 y 2
             expired_msg = DEFAULT_EXPIRED_MESSAGE
             if custom_messages and custom_messages.get('expired_message'):
                 expired_msg = custom_messages['expired_message']
             expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
-            await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
+            
+            await _safe_send(
+                user_id, 
+                expired_msg, 
+                reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data={}), 
+                parse_mode="Markdown"
+            )
             
             attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else " (intento 3/3 — promo enviada)"
             await _safe_send(
                 group["admin_id"],
-                f"🚫 *Reingreso denegado (VIP)*\n\n"
+                f"🚫 *Reingreso denegado (VIP)*{attempt_warning}\n\n"
                 f"👤 [{display}]({chat_link})\n"
                 f"🆔 *ID:* `{user_id}`\n"
                 f"📌 {safe_name(group['group_name'])}\n"
@@ -5485,10 +5488,9 @@ async def send_trial_warnings():
                 
                 try:
                     spin_data = spin_data_map.get(gid, {}).get(user_id, {})
-                    spin_used = spin_data.get("used", False) if spin_data.get("spin_count", 0) > 0 else False
                     await bot_app.bot.send_message(
                         user_id, message,
-                        reply_markup=await get_payment_keyboard(gid, user_id, spin_used=spin_used, vip_invite_link=rule["vip_invite_link"]),
+                        reply_markup=await get_payment_keyboard(gid, user_id, spin_data=spin_data, vip_invite_link=rule["vip_invite_link"]),
                         parse_mode="Markdown"
                     )
                     _fire_and_forget(db.log_warning_sent(user_id, gid, warning_type), "log_warning")
@@ -6153,6 +6155,19 @@ async def process_discount_expiration_reminders():
             f"No pierdas este descuento. Paga ahora:\n\n"
             + _build_price_list(item['group_id'], discounted_pct=item['best_discount'])
         )
+        try:
+            # Construimos el diccionario a partir de la query masiva previa
+            spin_data = {
+                "spin_count": 1, 
+                "used": False, 
+                "best_discount": item['best_discount'], 
+                "expires_at": item['expires_at']
+            }
+            await bot_app.bot.send_message(
+                item['user_id'], msg, 
+                reply_markup=await get_payment_keyboard(item['group_id'], item['user_id'], spin_data=spin_data), 
+                parse_mode="Markdown"
+            )
         try:
             await bot_app.bot.send_message(item['user_id'], msg, reply_markup=await get_payment_keyboard(item['group_id'], item['user_id'], spin_used=False), parse_mode="Markdown")
             async def _mark(conn):
