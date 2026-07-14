@@ -1196,7 +1196,8 @@ class Database:
         async def _get(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='active' AND end_date > NOW()", (group_id,))
-                total = await cur.fetchval()
+                row = await cur.fetchone()
+                total = row[0] if row else 0
                 
                 await cur.execute("""
                     SELECT user_id, username, first_name, plan, end_date,
@@ -1217,7 +1218,8 @@ class Database:
                 summary = await cur.fetchall()
                 total = sum(row['total'] for row in summary)
                 await cur.execute("SELECT COUNT(*) AS new_users FROM users WHERE group_id=%s AND created_at>=%s", (group_id, start_date))
-                new_users = await cur.fetchval()
+                row = await cur.fetchone()
+                new_users = row[0] if row else 0
                 await cur.execute("""
                     SELECT user_id, username, first_name, plan, amount, duration_minutes, payment_date
                     FROM payments WHERE group_id=%s AND payment_date >= date_trunc('month', NOW()) ORDER BY payment_date DESC LIMIT 10
@@ -1231,7 +1233,8 @@ class Database:
         async def _get(conn):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE payment_date>=%s", (start_date,))
-                return await cur.fetchval()
+                row = await cur.fetchone()
+                return row[0] if row else 0
         return await self._run(_get)
 
     async def get_expired_users(self, group_id: int):
@@ -1285,11 +1288,14 @@ class Database:
         async def _get(conn):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial' AND created_at>=%s", (group_id, start_of_month))
-                count_month = await cur.fetchval()
+                row = await cur.fetchone()
+                count_month = row[0] if row else 0
                 await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial' AND created_at>=%s AND created_at<%s", (group_id, start_last_month, end_last_month))
-                count_last_month = await cur.fetchval()
+                row = await cur.fetchone()
+                count_last_month = row[0] if row else 0
                 await cur.execute("SELECT COUNT(*) FROM users WHERE group_id=%s AND status='potencial'", (group_id,))
-                total_all = await cur.fetchval()
+                row = await cur.fetchone()
+                total_all = row[0] if row else 0
                 return count_month, count_last_month, total_all
         return await self._run(_get)
 
@@ -1334,14 +1340,16 @@ class Database:
         async def _get(conn):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT COUNT(*) FROM users")
-                return await cur.fetchval()
+                row = await cur.fetchone()
+                return row[0] if row else 0
         return await self._run(_get)
 
     async def get_trial_stats(self, group_id: int) -> dict:
         async def _get(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("SELECT COUNT(*) as total_trial_users FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE)", (group_id,))
-                total_trial_users = await cur.fetchval()
+                row = await cur.fetchone()
+                total_trial_users = row[0] if row else 0
                 await cur.execute("""
                     SELECT user_id, username, first_name, end_date,
                            EXTRACT(EPOCH FROM (end_date - NOW())) / 86400 as days_left,
@@ -1350,13 +1358,15 @@ class Database:
                 """, (group_id,))
                 active_trials = await cur.fetchall()
                 await cur.execute("SELECT COUNT(*) as expired_from_trial FROM users WHERE group_id=%s AND plan='trial' AND status='expired' AND end_date < NOW()", (group_id,))
-                expired_from_trial = await cur.fetchval()
+                row = await cur.fetchone()
+                expired_from_trial = row[0] if row else 0
                 await cur.execute("""
                     SELECT COUNT(DISTINCT u.user_id) as converted_users
                     FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id
                     WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0
                 """, (group_id,))
-                converted_users = await cur.fetchval()
+                row = await cur.fetchone()
+                converted_users = row[0] if row else 0
                 return {"total_trial_users": total_trial_users, "active_trials": list(active_trials),
                         "active_count": len(active_trials), "expired_from_trial": expired_from_trial, "converted_users": converted_users}
         return await self._run(_get)
@@ -1695,7 +1705,8 @@ class Database:
         async def _get(conn):
             async with conn.cursor() as cur:
                 await cur.execute(f"SELECT {msg_type} FROM group_messages WHERE group_id = 0")
-                return await cur.fetchval()
+                row = await cur.fetchone()
+                return row[0] if row else None
         return await self._run(_get)
 
     async def save_global_message(self, msg_type: str, text: str):
@@ -1719,7 +1730,8 @@ class Database:
         async def _get(conn):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT MAX(sent_at) FROM broadcast_logs WHERE filter_type = 'auto_backup'")
-                return await cur.fetchval()
+                row = await cur.fetchone()
+                return row[0] if row else None
         return await self._run(_get)
 
     async def log_backup_sent(self):
@@ -3198,15 +3210,26 @@ async def show_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     start_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    def _get_stats(conn):
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Usamos "amount > 0" para ignorar los trials gratuitos
-            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0", (group_id, start_today))
-            today = cur.fetchone()
-            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0", (group_id, start_week))
-            week = cur.fetchone()
-            cur.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0", (group_id, start_month))
-            month = cur.fetchone()
+    async def _get_stats(conn):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total "
+                "FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0",
+                (group_id, start_today)
+            )
+            today = await cur.fetchone()
+            await cur.execute(
+                "SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total "
+                "FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0",
+                (group_id, start_week)
+            )
+            week = await cur.fetchone()
+            await cur.execute(
+                "SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total "
+                "FROM payments WHERE group_id=%s AND payment_date>=%s AND amount > 0",
+                (group_id, start_month)
+            )
+            month = await cur.fetchone()
             return today, week, month
 
     today, week, month = await db._run(_get_stats)
@@ -3586,72 +3609,87 @@ async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Solo disponible en grupos VIP o Comunidad")
         return
 
-    # Calcular fechas en hora de Ecuador
     now_ec = datetime.now(EC_TZ)
     start_today_ec = now_ec.replace(hour=0, minute=0, second=0, microsecond=0)
     start_week_ec = (start_today_ec - timedelta(days=start_today_ec.weekday()))
     start_month_ec = start_today_ec.replace(day=1)
 
-    # Convertir a UTC para la base de datos
     start_today = start_today_ec.astimezone(ZoneInfo("UTC"))
     start_week = start_week_ec.astimezone(ZoneInfo("UTC"))
     start_month = start_month_ec.astimezone(ZoneInfo("UTC"))
 
-    def _get_stats(conn):
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Trials
-            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_today))
-            t_today = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_week))
-            t_week = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s", (group_id, start_month))
-            t_month = cur.fetchone()['c']
-            
-            # Leads (Info de pago)
-            cur.execute("SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s", (group_id, start_today))
-            l_today = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s", (group_id, start_week))
-            l_week = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s", (group_id, start_month))
-            l_month = cur.fetchone()['c']
+    async def _get_stats(conn):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s",
+                (group_id, start_today)
+            )
+            t_today = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s",
+                (group_id, start_week)
+            )
+            t_week = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at>=%s",
+                (group_id, start_month)
+            )
+            t_month = (await cur.fetchone())['c']
 
-            # Ruletas
-            cur.execute("SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s", (group_id, start_today))
-            r_today = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s", (group_id, start_week))
-            r_week = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s", (group_id, start_month))
-            r_month = cur.fetchone()['c']
+            await cur.execute(
+                "SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s",
+                (group_id, start_today)
+            )
+            l_today = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s",
+                (group_id, start_week)
+            )
+            l_week = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(DISTINCT user_id) as c FROM payment_leads WHERE group_id=%s AND created_at>=%s",
+                (group_id, start_month)
+            )
+            l_month = (await cur.fetchone())['c']
 
-            # Convertidos y activos
-            cur.execute("SELECT COUNT(DISTINCT u.user_id) as c FROM users u JOIN payments p ON u.user_id = p.user_id AND u.group_id = p.group_id WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0", (group_id,))
-            converted = cur.fetchone()['c']
-            cur.execute("SELECT COUNT(*) as c FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW()", (group_id,))
-            active = cur.fetchone()['c']
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s",
+                (group_id, start_today)
+            )
+            r_today = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s",
+                (group_id, start_week)
+            )
+            r_week = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM discount_spins WHERE group_id=%s AND last_spin>=%s",
+                (group_id, start_month)
+            )
+            r_month = (await cur.fetchone())['c']
+
+            await cur.execute(
+                "SELECT COUNT(DISTINCT u.user_id) as c FROM users u JOIN payments p "
+                "ON u.user_id = p.user_id AND u.group_id = p.group_id "
+                "WHERE u.group_id=%s AND u.trial_used=TRUE AND p.amount > 0",
+                (group_id,)
+            )
+            converted = (await cur.fetchone())['c']
+            await cur.execute(
+                "SELECT COUNT(*) as c FROM users WHERE group_id=%s AND plan='trial' AND status='active' AND end_date > NOW()",
+                (group_id,)
+            )
+            active = (await cur.fetchone())['c']
             return t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active
 
     t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active = await db._run(_get_stats)
 
     msg = f"📊 *ESTADÍSTICAS DE VENTAS — {group['group_name']}*\n\n"
-    
-    msg += f"🆓 *NUEVOS TRIALS (Ingresos)*\n"
-    msg += f"• 📅 Hoy: *{t_today}*\n"
-    msg += f"• 📆 Semana: *{t_week}*\n"
-    msg += f"• 🗓 Mes: *{t_month}*\n\n"
-    
-    msg += f"💳 *LEADS DE PAGO (Interés)*\n"
-    msg += f"• 📅 Hoy: *{l_today}*\n"
-    msg += f"• 📆 Semana: *{l_week}*\n"
-    msg += f"• 🗓 Mes: *{l_month}*\n\n"
-    
-    msg += f"🎰 *GIROS DE RULETA*\n"
-    msg += f"• 📅 Hoy: *{r_today}*\n"
-    msg += f"• 📆 Semana: *{r_week}*\n"
-    msg += f"• 🗓 Mes: *{r_month}*\n\n"
-    
+    msg += f"🆓 *NUEVOS TRIALS (Ingresos)*\n• 📅 Hoy: *{t_today}*\n• 📆 Semana: *{t_week}*\n• 🗓 Mes: *{t_month}*\n\n"
+    msg += f"💳 *LEADS DE PAGO (Interés)*\n• 📅 Hoy: *{l_today}*\n• 📆 Semana: *{l_week}*\n• 🗓 Mes: *{l_month}*\n\n"
+    msg += f"🎰 *GIROS DE RULETA*\n• 📅 Hoy: *{r_today}*\n• 📆 Semana: *{r_week}*\n• 🗓 Mes: *{r_month}*\n\n"
     msg += f"🔥 *Trial Activos Ahora:* {active}\n"
     msg += f"💰 *Convertidos a pago (Histórico):* {converted}\n"
-    
     if t_month > 0:
         conversion = (converted / t_month) * 100
         msg += f"📈 *Conversión Histórica:* {conversion:.1f}%"
@@ -4533,8 +4571,9 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group_id:
         await update.message.reply_text("❌ Usa /fixtrial o /fixtrial GROUP_ID")
         return
-    def _diag(conn):
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+    async def _diag(conn):
+        async with conn.cursor() as cur:
             counts = {}
             for col, q in [
                 ('total', "SELECT COUNT(*) FROM users WHERE group_id=%s"),
@@ -4543,17 +4582,18 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ('trial_null', "SELECT COUNT(*) FROM users WHERE group_id=%s AND trial_used IS NULL"),
                 ('plan_trial', "SELECT COUNT(*) FROM users WHERE group_id=%s AND plan='trial'"),
             ]:
-                cur.execute(q, (group_id,))
-                counts[col] = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(DISTINCT user_id) FROM payments WHERE group_id=%s AND plan='trial'", (group_id,))
-            counts['payments_trial'] = cur.fetchone()[0]
-            cur.execute("""
+                await cur.execute(q, (group_id,))
+                counts[col] = (await cur.fetchone())[0]
+            await cur.execute("SELECT COUNT(DISTINCT user_id) FROM payments WHERE group_id=%s AND plan='trial'", (group_id,))
+            counts['payments_trial'] = (await cur.fetchone())[0]
+            await cur.execute("""
                 SELECT COUNT(*) FROM users u
                 WHERE u.group_id=%s AND (u.trial_used=FALSE OR u.trial_used IS NULL)
                   AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id=u.user_id AND p.group_id=u.group_id AND p.plan='trial')
             """, (group_id,))
-            counts['need_fix'] = cur.fetchone()[0]
+            counts['need_fix'] = (await cur.fetchone())[0]
             return counts
+
     diag = await db._run(_diag)
     msg = (f"🔍 *Diagnóstico trial_used — Grupo {group_id}*\n\n"
            f"• Total usuarios: {diag['total']}\n"
@@ -4564,9 +4604,9 @@ async def fix_trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
            f"• Con pago de trial: {diag['payments_trial']}\n"
            f"• *Necesitan corrección:* {diag['need_fix']}\n\n")
     if diag['need_fix'] > 0:
-        def _fix(conn):
-            with conn.cursor() as cur:
-                cur.execute("""
+        async def _fix(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
                     UPDATE users u SET trial_used=TRUE, updated_at=NOW()
                     WHERE u.group_id=%s AND (u.trial_used=FALSE OR u.trial_used IS NULL)
                       AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id=u.user_id AND p.group_id=u.group_id AND p.plan='trial')
