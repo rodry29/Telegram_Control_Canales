@@ -328,6 +328,18 @@ def _build_price_list(group_id: int, plans: list = None, discounted_pct: float =
         else:
             lines.append(f"• {_plan_emoji(p)} {p.capitalize()} ({days} días): *{fmt_price(cfg['price'])}*{daily_cost_str}")
     return "\n".join(lines)
+
+async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception(f"❌ Excepción no capturada: {context.error}")
+    # Notificar al Super Admin si el error vino de un update procesable
+    try:
+        await _safe_send(
+            SUPER_ADMIN_ID,
+            f"🔴 *Excepción no capturada*\n\n`{type(context.error).__name__}: {context.error}`",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 # ==================== MENSAJES CONFIGURABLES ====================
 DEFAULT_WELCOME_MESSAGE = (
     "🎉 *¡Bienvenido al VIP!*\n\n"
@@ -3891,7 +3903,6 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
 
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             
-            attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else ""
             await _safe_send(
                 group["admin_id"],
                 f"🆕 *Nuevo usuario VIP*\n\n"
@@ -3952,7 +3963,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
             await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
             
-            attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else ""
+            attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else " (intento 3/3 — promo enviada)"
             await _safe_send(
                 group["admin_id"],
                 f"🚫 *Reingreso denegado (VIP)*\n\n"
@@ -4088,13 +4099,31 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = new_member.first_name or ""
     
     group_type = group.get("type", "VIP")
-    
-    if group_type == "VIP": 
-        await _process_new_vip_member(chat_id, user_id, username, first_name, group, source)
-    elif group_type == "COMUNIDAD": 
-        await _process_new_comunidad_member(chat_id, user_id, username, first_name, group, source)
-    else: 
-        await _process_new_free_member(chat_id, user_id, username, first_name, group, source)
+    try:
+        if group_type == "VIP": 
+            await _process_new_vip_member(chat_id, user_id, username, first_name, group, source)
+        elif group_type == "COMUNIDAD": 
+            await _process_new_comunidad_member(chat_id, user_id, username, first_name, group, source)
+        else: 
+            await _process_new_free_member(chat_id, user_id, username, first_name, group, source)
+    except Exception as e:
+        logger.exception(
+            f"❌ Error procesando nuevo miembro {user_id} en {chat_id} ({group_type}): {e}"
+        )
+        # Notificar al admin para que tenga visibilidad manual
+        try:
+            admin_id = group.get("admin_id")
+            if admin_id:
+                await _safe_send(
+                    admin_id,
+                    f"⚠️ *Error procesando ingreso de usuario*\n\n"
+                    f"👤 ID: `{user_id}`\n📌 Grupo: {safe_name(group.get('group_name', 'VIP'))}\n"
+                    f"❌ `{type(e).__name__}: {e}`\n\n"
+                    f"Revisa el log del bot.",
+                    parse_mode="Markdown"
+                )
+        except Exception:
+            pass
 
 async def detect_active_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_chat.type not in ("group", "supergroup"):
@@ -6505,7 +6534,7 @@ async def main():
     bot_app.add_handler(CommandHandler("dbhealth", db_health_command))
     bot_app.add_handler(CommandHandler("respin", respin_command))
     bot_app.add_handler(CommandHandler("fixusers", fix_affected_users_command))
-
+    bot_app.add_error_handler(_global_error_handler)
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
 
