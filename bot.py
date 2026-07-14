@@ -1748,13 +1748,18 @@ scheduler = AsyncIOScheduler()
 bot_app = None
 
 # ==================== HELPERS INTERNOS ====================
-async def _fire_and_forget(coro, name="op"):
+def _fire_and_forget(coro, name="op"):
     async def _wrapper():
         try:
             await coro
         except Exception as e:
             logger.warning(f"Fire-and-forget '{name}' falló: {e}")
-    asyncio.create_task(_wrapper())
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_wrapper())
+    except RuntimeError:
+        logger.error(f"Fire-and-forget '{name}' llamado sin event loop — descartando.")
+        coro.close()
 
 async def db_health_command(update, context):
     retry_rate = db._retry_count / max(1, db._op_count)
@@ -5179,61 +5184,84 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
+        status = get_discount_status(spin_data)
+        best = spin_data.get("best_discount", 0) if spin_data else 0
+        chat_link = f"tg://user?id={user_id}"
+        payment_contact = group.get('settings', {}).get('payment_contact', 'admin')
 
-        if spin_data.get("spin_count", 0) >= 1:
-            best = spin_data.get("best_discount", 0)
-            chat_link = f"tg://user?id={user_id}"
+        # ──────────────────────────────────────────────
+        # CASO 1: ya giró antes (cualquier sub-estado)
+        # ──────────────────────────────────────────────
+        if status != "none":
+            # Notificación común al admin (una sola vez, sin importar el sub-estado)
+            admin_suffix_map = {
+                "used":    "✅ Descuento ya fue aplicado.",
+                "active":  "⏳ Descuento aún pendiente.",
+                "expired": "⏰ Descuento expirado sin usar.",
+            }
             await _safe_send(
                 group["admin_id"],
                 f"⚠️ *Intento de ruleta repetida*\n\n"
                 f"👤 Usuario: [{query.from_user.first_name or 'Usuario'}]({chat_link})\n"
                 f"🆔 ID: `{user_id}`\n📌 Grupo: {group['group_name']}\n\n"
-                f"🎰 Este usuario ya giró la ruleta ({best}% OFF).\n"
-                f"{'✅ Descuento ya fue aplicado.' if spin_data.get('used') else '⏳ Descuento aún pendiente.'}\n\n"
+                f"🎰 Ya giró la ruleta ({best}% OFF).\n"
+                f"{admin_suffix_map.get(status, '')}\n\n"
                 f"Verifica con: `/checkspin {user_id}`",
                 parse_mode="Markdown", disable_notification=True
             )
-            if spin_data.get("used"):
-                await query.edit_message_text(
-                    f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
-                    f"Ya usaste tu spin y tu descuento del *{best}%* fue aplicado.\n\n"
-                    f"🚫 *La ruleta es 1 vez por usuario.*\n"
-                    f"Para renovar, paga al precio normal:\n\n"
-                    + _build_price_list(group_id)
-                    + "\n\n💳 Presiona el botón para ver datos de pago:",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")]]),
-                    parse_mode="Markdown"
-                )
-            else:
-                await query.edit_message_text(
-                    f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
-                    f"Ya giraste la ruleta. Tu descuento es: *{best}% OFF*\n\n"
-                    f"⏳ ¿Aún no lo usaste? Contacta a @{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
-                    f"💳 Presiona para pagar con tu descuento:",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Info de Pago con Descuento", callback_data=f"pay_{group_id}_{user_id}")]]),
-                    parse_mode="Markdown"
-                )
+
+        # ── Sub-caso: descuento ya aplicado a un plan
+        if status == "used":
+            await query.edit_message_text(
+                f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
+                f"Ya usaste tu spin y tu descuento del *{best}%* fue aplicado.\n\n"
+                f"🚫 *La ruleta es 1 vez por usuario.*\n"
+                f"Para renovar, paga al precio normal:\n\n"
+                + _build_price_list(group_id)
+                + "\n\n💳 Presiona el botón para ver datos de pago:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("💳 Pagar Acceso", callback_data=f"pay_{group_id}_{user_id}")]]
+                ),
+                parse_mode="Markdown"
+            )
             return
 
-        if spin_data.get("spin_count", 0) >= 1:
-            status = get_discount_status(spin_data)
-            best = spin_data.get("best_discount", 0)
-            
-            if status == "expired":
-                await query.edit_message_text(
-                    f"⏰ *Tu descuento del {best}% HA EXPIRADO*\n\n"
-                    f"Ya no puedes usarlo. Precios normales:\n\n"
-                    + _build_price_list(group_id)
-                    + f"\n\n💡 ¿Quieres otra oportunidad? Pídele al admin `/respin {user_id}`",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pagar precio normal", callback_data=f"pay_{group_id}_{user_id}")]]),
-                    parse_mode="Markdown"
-                )
-                return
+        # ── Sub-caso: descuento vigente, aún no usado
+        if status == "active":
+            await query.edit_message_text(
+                f"🎰 *Ruleta VIP — {group['group_name']}*\n\n"
+                f"Ya giraste la ruleta. Tu descuento es: *{best}% OFF*\n\n"
+                f"⏳ ¿Aún no lo usaste? Contacta a @{payment_contact}\n\n"
+                f"💳 Presiona para pagar con tu descuento:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("💳 Info de Pago con Descuento", callback_data=f"pay_{group_id}_{user_id}")]]
+                ),
+                parse_mode="Markdown"
+            )
+            return
 
+        # ── Sub-caso: descuento expirado sin usar
+        if status == "expired":
+            await query.edit_message_text(
+                f"⏰ *Tu descuento del {best}% HA EXPIRADO*\n\n"
+                f"Ya no puedes usarlo. Precios normales:\n\n"
+                + _build_price_list(group_id)
+                + f"\n\n💡 ¿Quieres otra oportunidad? Pídele al admin `/respin {user_id}`",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("💳 Pagar precio normal", callback_data=f"pay_{group_id}_{user_id}")]]
+                ),
+                parse_mode="Markdown"
+            )
+            return
+
+        # ──────────────────────────────────────────────
+        # CASO 2: primer giro (status == "none")
+        # ──────────────────────────────────────────────
         discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
         discount = random.choice(discounts)
         _fire_and_forget(db.record_spin(user_id, group_id, discount, validity_hours=48), "record_spin")
 
+        # Animación de giro
         for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
             try:
                 await query.edit_message_text(msg)
@@ -5247,14 +5275,17 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"@{query.from_user.username or query.from_user.first_name} giró la ruleta...\n\n"
             f"🎉 *¡FELICIDADES!*\n\n🏆 *Descuento: {discount}% OFF*\n\n"
             f"💰 *Precios con tu descuento:*\n" + price_lines + "\n\n"
-            f"⏳ *Descuento permanente* — puedes usarlo cuando quieras\n"
+            f"⏳ *Descuento válido por 48 horas* — úsalo pronto\n"
             f"📤 Envía el comprobante + captura de este mensaje a:\n"
-            f"@{group.get('settings', {}).get('payment_contact', 'admin')}\n\n"
+            f"@{payment_contact}\n\n"
             f"_Solo puedes usar la ruleta 1 vez. ¡No lo pierdas!_",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💳 Información de Pago", callback_data=f"pay_{group_id}_{user_id}")]]
+            ),
             parse_mode="Markdown"
         )
-        # Alerta al Admin
+
+        # Alerta al admin
         await _safe_send(
             group["admin_id"],
             f"🎰 *ALERTA DE RULETA VIP*\n\n"
