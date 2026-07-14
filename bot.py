@@ -254,6 +254,27 @@ def get_group_plan_config(group_id: int, plan: str) -> dict:
     _plan_config_cache[cache_key] = dict(base)
     return base
 
+def is_discount_active(spin_data: dict) -> bool:
+    """Devuelve True solo si el descuento está vigente y no usado."""
+    if not spin_data or spin_data.get("spin_count", 0) == 0:
+        return False
+    if spin_data.get("used", False):
+        return False
+    expires_at = spin_data.get("expires_at")
+    if expires_at is None:
+        return True
+    return normalize_dt(expires_at) > now_utc()
+
+def get_discount_status(spin_data: dict) -> str:
+    """ Estados: none | active | expired | used """
+    if not spin_data or spin_data.get("spin_count", 0) == 0:
+        return "none"
+    if spin_data.get("used", False):
+        return "used"
+    if not is_discount_active(spin_data):
+        return "expired"
+    return "active"
+
 def fmt_price(amount) -> str:
     f = float(amount)
     return f"${f:.2f}" if f != int(f) else f"${int(f)}"
@@ -430,10 +451,17 @@ def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, v
 
     keyboard = []
     
-    # Botón 1: Ruleta
-    if not spin_used:
+    # Lógica para el botón de la ruleta
+    spin_data = await db.get_spin_data(user_id, group_id)
+    status = get_discount_status(spin_data)
+    
+    if status == "none":
         keyboard.append([InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{group_id}_{user_id}")])
-    else:
+    elif status == "active":
+        keyboard.append([InlineKeyboardButton("✅ Descuento activo (ver)", callback_data=f"spin_used_{group_id}_{user_id}")])
+    elif status == "expired":
+        keyboard.append([InlineKeyboardButton("⏰ Descuento expirado", callback_data=f"spin_used_{group_id}_{user_id}")])
+    else: # used
         keyboard.append([InlineKeyboardButton("✅ Ruleta ya usada", callback_data=f"spin_used_{group_id}_{user_id}")])
     
     # Botón 2: Contacto Directo con el Admin (NUEVO)
@@ -602,8 +630,9 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
     )
 
     if success:
-        await _mark_discount_if_any(target_user_id, group_id, plan)
-        await _send_subscription_notification(bot, target_user_id, group_id, plan, is_renewal=is_renewal)
+        await _mark_discount_if_any(target_user_id, current_group, plan)
+        await db.reset_rejoin_state(target_user_id, current_group)
+        await _send_subscription_notification(bot, target_user_id, current_group, plan, is_renewal=is_renewal)
 
 async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, target_user_id: int, plan: str,
                                             custom_price: float = None, custom_days: int = None, is_renewal: bool = False):
@@ -1485,17 +1514,21 @@ class Database:
                 return {r['user_id']: dict(r) for r in rows}
         return await self._run(_get)
 
-    async def record_spin(self, user_id: int, group_id: int, discount: int):
+    async def record_spin(self, user_id: int, group_id: int, discount: int, validity_hours: int = 48):
+        expires_at = now_utc() + timedelta(hours=validity_hours)
         async def _save(conn):
             async with conn.cursor() as cur:
                 await cur.execute("""
-                    INSERT INTO discount_spins (user_id, group_id, spin_count, last_spin, best_discount)
-                    VALUES (%s, %s, 1, NOW(), %s)
+                    INSERT INTO discount_spins (user_id, group_id, spin_count, last_spin, best_discount, expires_at)
+                    VALUES (%s, %s, 1, NOW(), %s, %s)
                     ON CONFLICT (user_id, group_id) DO UPDATE SET
                         spin_count = discount_spins.spin_count + 1,
                         last_spin = NOW(),
-                        best_discount = GREATEST(discount_spins.best_discount, EXCLUDED.best_discount)
-                """, (user_id, group_id, discount))
+                        best_discount = GREATEST(discount_spins.best_discount, EXCLUDED.best_discount),
+                        expires_at = EXCLUDED.expires_at,
+                        used = FALSE,
+                        reminder_sent = FALSE
+                """, (user_id, group_id, discount, expires_at))
         await self._run(_save)
 
     async def mark_discount_used(self, user_id: int, group_id: int, plan: str = None):
@@ -1575,6 +1608,49 @@ class Database:
                 await cur.execute("UPDATE users SET fuego_notice_sent=TRUE WHERE user_id=%s AND group_id=%s", (user_id, group_id))
         await self._run(_upd)
 
+    async def increment_rejoin_attempt(self, user_id: int, group_id: int) -> int:
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    UPDATE users 
+                    SET rejoin_attempts = COALESCE(rejoin_attempts, 0) + 1,
+                        last_rejoin_attempt = NOW()
+                    WHERE user_id = %s AND group_id = %s
+                    RETURNING rejoin_attempts
+                """, (user_id, group_id))
+                row = await cur.fetchone()
+                return row[0] if row else 1
+        return await self._run(_upd)
+
+    async def is_rejoin_promo_sent(self, user_id: int, group_id: int) -> bool:
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT rejoin_promo_sent FROM users WHERE user_id=%s AND group_id=%s",
+                    (user_id, group_id)
+                )
+                row = await cur.fetchone()
+                return row[0] if row else False
+        return await self._run(_get)
+
+    async def mark_rejoin_promo_sent(self, user_id: int, group_id: int):
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET rejoin_promo_sent = TRUE WHERE user_id=%s AND group_id=%s",
+                    (user_id, group_id)
+                )
+        await self._run(_upd)
+
+    async def reset_rejoin_state(self, user_id: int, group_id: int):
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET rejoin_attempts = 0, rejoin_promo_sent = FALSE WHERE user_id=%s AND group_id=%s",
+                    (user_id, group_id)
+                )
+        await self._run(_upd)
+    
     async def mark_muted(self, user_id: int, group_id: int):
         async def _upd(conn):
             async with conn.cursor() as cur:
@@ -3694,27 +3770,64 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             pass
         return True
 
-    motivo_admin = "Plan vencido" if result_code == "expirado" else "Trial VIP ya utilizado"
+    if not allow_access:
+        motivo_admin = "Plan vencido" if result_code == "expirado" else "Trial VIP ya utilizado"
+        
+        # NUEVO: Contar intentos de reingreso
+        attempts = await db.increment_rejoin_attempt(user_id, group_id)
+        kick_success = await _kick_user_with_retry(chat_id, user_id)
+        if kick_success:
+            custom_messages = await db.get_group_messages(chat_id)
 
-    kick_success = await _kick_user_with_retry(chat_id, user_id)
-    if kick_success:
-        custom_messages = await db.get_group_messages(chat_id)
-        expired_msg = DEFAULT_EXPIRED_MESSAGE
-        if custom_messages and custom_messages.get('expired_message'):
-            expired_msg = custom_messages['expired_message']
-        expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
-        await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
-        await _safe_send(
-            group["admin_id"],
-            f"🚫 *Reingreso denegado (VIP)*\n\n"
-            f"👤 [{display}]({chat_link})\n"
-            f"🆔 *ID:* `{user_id}`\n"
-            f"📌 *Grupo:* {safe_name(group['group_name'])}\n"
-            f"🌍 *Origen:* {safe_name(source)}\n"
-            f"⚠️ *Motivo:* {safe_name(motivo_admin)}",
-            parse_mode="Markdown", disable_notification=True
-        )
-    return False
+                        # NUEVO: Lógica de Promo en 3er intento
+            if attempts >= 3 and not await db.is_rejoin_promo_sent(user_id, group_id):
+                await db.mark_rejoin_promo_sent(user_id, group_id)
+                await db.log_payment_lead(user_id, group_id) # Entra al flujo de carrito abandonado
+                await db.update_cart_step(user_id, group_id, 0)
+                
+                settings = group.get("settings", {})
+                extra_discount = 25 # 25% de descuento de regreso
+                promo_msg = (
+                    f"🎁 *¡Te extrañamos en {safe_name(group['group_name'])}!*\n\n"
+                    f"Noté que has intentado regresar. Quiero darte algo especial:\n\n"
+                    f"🔥 *PROMO EXCLUSIVA DE REGRESO: {extra_discount}% OFF*\n\n"
+                    f"Precios con tu promo de regreso:\n"
+                    + _build_price_list(chat_id, discounted_pct=extra_discount)
+                    + f"\n\n⏰ *Esta promo es válida solo 24 horas.*\n"
+                    f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
+                    f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
+                )
+                await _safe_send(user_id, promo_msg, reply_markup=get_payment_keyboard(chat_id, user_id, spin_used=False), parse_mode="Markdown")
+                
+                await _safe_send(
+                    group["admin_id"],
+                    f"🚨 *WIN-BACK TRIGGERED (3er intento)*\n\n"
+                    f"👤 [{display}]({chat_link})\n🆔 `{user_id}`\n"
+                    f"🎁 Promo enviada: {extra_discount}% OFF\n\n"
+                    f"💡 _Si paga, activa con:_ `/add {user_id} mensual`",
+                    parse_mode="Markdown"
+                )
+                return False
+
+            # Mensaje estándar para intentos 1 y 2
+            expired_msg = DEFAULT_EXPIRED_MESSAGE
+            if custom_messages and custom_messages.get('expired_message'):
+                expired_msg = custom_messages['expired_message']
+            expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
+            await _safe_send(user_id, expired_msg, reply_markup=get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
+            
+            attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else ""
+            await _safe_send(
+                group["admin_id"],
+                f"🚫 *Reingreso denegado (VIP)*\n\n"
+                f"👤 [{display}]({chat_link})\n"
+                f"🆔 *ID:* `{user_id}`\n"
+                f"📌 {safe_name(group['group_name'])}\n"
+                f"🌍 *Origen:* {safe_name(source)}\n"
+                f"⚠️ {safe_name(motivo_admin)}",
+                parse_mode="Markdown", disable_notification=True
+            )
+        return False
 # --- NUEVO HANDLER PARA COMUNIDAD ---
 async def _process_new_comunidad_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
     display = safe_name(first_name or (f"@{username}" if username and not username.startswith('user_') else f"Usuario {user_id}"))
@@ -4538,6 +4651,47 @@ async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         msg += f"🚫 *Descuento ya fue aplicado a:* {spin_data.get('applied_to_plan', 'N/A')}\n💰 Precio normal para renovación."
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def respin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_group = await require_group(update, context)
+    if not current_group:
+        await update.message.reply_text("❌ No autorizado o no has seleccionado grupo con /start")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/respin @usuario` o `/respin ID`", parse_mode="Markdown")
+        return
+    
+    identifier = context.args[0].replace("@", "")
+    target_id = None
+    if identifier.isdigit():
+        target_id = int(identifier)
+    else:
+        user = await db.get_user_by_username(identifier, current_group)
+        target_id = user['user_id'] if user else None
+    
+    if not target_id:
+        await update.message.reply_text("❌ Usuario no encontrado en la base de datos.")
+        return
+    
+    async def _del(conn):
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM discount_spins WHERE user_id=%s AND group_id=%s", (target_id, current_group))
+            return cur.rowcount
+    deleted = await db._run(_del)
+    
+    if deleted:
+        try:
+            await context.bot.send_message(
+                target_id,
+                f"🎁 *¡El admin te ha dado otra oportunidad!*\n\n"
+                f"Puedes girar la ruleta nuevamente. ¡No la desperdicies!\n"
+                f"⏰ *Tu nuevo descuento tendrá validez de 48 horas.*",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎰 GIRAR RULETA VIP", callback_data=f"spin_{current_group}_{target_id}")]]),
+                parse_mode="Markdown"
+            )
+        except Exception: pass
+        await update.message.reply_text(f"✅ Spin reseteado para `{target_id}`. Mensaje enviado.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Ese usuario nunca giró la ruleta en este grupo.")
 
 async def _prompt_message_config(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, msg_type: str):
     """Función única para pedirle al admin que escriba un mensaje configurado."""
@@ -4975,9 +5129,24 @@ async def spin_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
+        if spin_data.get("spin_count", 0) >= 1:
+            status = get_discount_status(spin_data)
+            best = spin_data.get("best_discount", 0)
+            
+            if status == "expired":
+                await query.edit_message_text(
+                    f"⏰ *Tu descuento del {best}% HA EXPIRADO*\n\n"
+                    f"Ya no puedes usarlo. Precios normales:\n\n"
+                    + _build_price_list(group_id)
+                    + f"\n\n💡 ¿Quieres otra oportunidad? Pídele al admin `/respin {user_id}`",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pagar precio normal", callback_data=f"pay_{group_id}_{user_id}")]]),
+                    parse_mode="Markdown"
+                )
+                return
+
         discounts = [10]*50 + [15]*30 + [20]*15 + [25]*3 + [30]*1 + [50]*1
         discount = random.choice(discounts)
-        _fire_and_forget(db.record_spin(user_id, group_id, discount), "record_spin")
+        _fire_and_forget(db.record_spin(user_id, group_id, discount, validity_hours=48), "record_spin")
 
         for msg in ["🎰 Girando...", "🎰 Girando... 🎲", "🎰 Girando... 🎲 🎲"]:
             try:
@@ -5764,6 +5933,77 @@ async def process_abandoned_carts():
                         logger.warning(f"No se pudo enviar carrito paso {step} a {user_id}: {e}")
                         await db.update_cart_step(user_id, group_id, step)
 # ==================== TAREAS PROGRAMADAS ====================
+async def process_discount_expiration_reminders():
+    """Avisa 4h antes de que expire el descuento no usado."""
+    if not bot_app: return
+    threshold = now_utc() + timedelta(hours=4)
+    
+    async def _get(conn):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT ds.user_id, ds.group_id, ds.best_discount, ds.expires_at, g.group_name
+                FROM discount_spins ds
+                JOIN groups g ON g.group_id = ds.group_id
+                WHERE ds.used = FALSE AND ds.reminder_sent = FALSE
+                  AND ds.expires_at IS NOT NULL AND ds.expires_at <= %s AND ds.expires_at > NOW()
+            """, (threshold,))
+            return await cur.fetchall()
+    
+    pending = await db._run(_get)
+    for item in pending:
+        remaining = normalize_dt(item['expires_at']) - now_utc()
+        hours = max(1, int(remaining.total_seconds() // 3600))
+        msg = (
+            f"⏰ *¡Tu descuento del {item['best_discount']}% expira en {hours}h!*\n\n"
+            f"📌 Grupo: {safe_name(item['group_name'])}\n\n"
+            f"No pierdas este descuento. Paga ahora:\n\n"
+            + _build_price_list(item['group_id'], discounted_pct=item['best_discount'])
+        )
+        try:
+            await bot_app.bot.send_message(item['user_id'], msg, reply_markup=get_payment_keyboard(item['group_id'], item['user_id'], spin_used=False), parse_mode="Markdown")
+            async def _mark(conn):
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE discount_spins SET reminder_sent = TRUE WHERE user_id=%s AND group_id=%s", (item['user_id'], item['group_id']))
+            await db._run(_mark)
+        except Exception as e:
+            logger.warning(f"Reminder descuento falló para {item['user_id']}: {e}")
+
+async def process_no_spin_reminders():
+    """Recuerda a usuarios 30 min después de entrar que giren la ruleta."""
+    if not bot_app: return
+    threshold = now_utc() - timedelta(minutes=30)
+    
+    async def _get(conn):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT u.user_id, u.group_id, u.first_name, g.group_name
+                FROM users u
+                JOIN groups g ON g.group_id = u.group_id
+                LEFT JOIN discount_spins ds ON ds.user_id = u.user_id AND ds.group_id = u.group_id
+                LEFT JOIN warning_logs wl ON wl.user_id = u.user_id AND wl.group_id = u.group_id AND wl.warning_type = 'no_spin_reminder'
+                WHERE u.status = 'active' AND u.plan = 'trial' AND u.start_date <= %s AND u.end_date > NOW()
+                  AND g.group_type = 'VIP' AND ds.user_id IS NULL AND wl.id IS NULL
+            """, (threshold,))
+            return await cur.fetchall()
+            
+    targets = await db._run(_get)
+    for u in targets:
+        try:
+            msg = (
+                f"👋 *¡Hola {safe_name(u['first_name'] or 'Usuario')}!*\n\n"
+                f"Veo que aún no giras la *Ruleta VIP* de {safe_name(u['group_name'])}.\n"
+                f"🎰 *¡Gana hasta 50% OFF en tu membresía!*\n\n"
+                f"Toma 10 segundos y prueba tu suerte. ¡Es gratis!"
+            )
+            await bot_app.bot.send_message(
+                u['user_id'], msg,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎰 GIRAR RULETA AHORA", callback_data=f"spin_{u['group_id']}_{u['user_id']}")]]),
+                parse_mode="Markdown"
+            )
+            await db.log_warning_sent(u['user_id'], u['group_id'], 'no_spin_reminder')
+        except Exception as e:
+            logger.warning(f"Reminder no-spin falló para {u['user_id']}: {e}")
+
 async def check_expired_subscriptions():
     if not bot_app: return
     logger.info("🔍 Verificando suscripciones y trials expirados...")
@@ -6028,6 +6268,7 @@ async def main():
     bot_app.add_handler(CommandHandler("addcombo", addcombo_command))
     bot_app.add_handler(CommandHandler("renewcombo", renewcombo_command))
     bot_app.add_handler(CommandHandler("dbhealth", db_health_command))
+    bot_app.add_handler(CommandHandler("respin", respin_command))
 
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
@@ -6056,6 +6297,8 @@ async def main():
     scheduler.add_job(send_trial_warnings, 'interval', minutes=1, id='trial_warnings', replace_existing=True)
     scheduler.add_job(_cleanup_payment_cooldown, 'interval', hours=1, id='cleanup_payment', replace_existing=True)
     scheduler.add_job(process_abandoned_carts, 'interval', minutes=5, id='check_carts', replace_existing=True)
+    scheduler.add_job(process_discount_expiration_reminders, 'interval', minutes=15, id='discount_reminders', replace_existing=True)
+    scheduler.add_job(process_no_spin_reminders, 'interval', minutes=10, id='no_spin_reminders', replace_existing=True)
     scheduler.start()
 
     logger.info("🤖 Bot iniciado")
