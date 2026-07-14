@@ -2899,11 +2899,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id and context.args:
         if context.args[0].isdigit(): 
             target_id = int(context.args[0])
-        
-    # 2. Si no se encontró por respuesta, buscar en los argumentos
-    if not target_id and context.args:
-        if context.args[0].isdigit(): 
-            target_id = int(context.args[0])
             
     if not target_id:
         await update.message.reply_text("❌ Responde a un mensaje de alerta del bot o usa `/info ID`.", parse_mode="Markdown"); return
