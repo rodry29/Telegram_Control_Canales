@@ -329,17 +329,7 @@ def _build_price_list(group_id: int, plans: list = None, discounted_pct: float =
             lines.append(f"• {_plan_emoji(p)} {p.capitalize()} ({days} días): *{fmt_price(cfg['price'])}*{daily_cost_str}")
     return "\n".join(lines)
 
-async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception(f"❌ Excepción no capturada: {context.error}")
-    # Notificar al Super Admin si el error vino de un update procesable
-    try:
-        await _safe_send(
-            SUPER_ADMIN_ID,
-            f"🔴 *Excepción no capturada*\n\n`{type(context.error).__name__}: {context.error}`",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
+
 # ==================== MENSAJES CONFIGURABLES ====================
 DEFAULT_WELCOME_MESSAGE = (
     "🎉 *¡Bienvenido al VIP!*\n\n"
@@ -435,6 +425,17 @@ def format_message(template: str, variables: dict) -> str:
     
 render_template = format_message
 
+async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception(f"❌ Excepción no capturada: {context.error}")
+    # Notificar al Super Admin si el error vino de un update procesable
+    try:
+        await _safe_send(
+            SUPER_ADMIN_ID,
+            f"🔴 *Excepción no capturada*\n\n`{type(context.error).__name__}: {context.error}`",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 # ==================== HELPERS DE PAGO ====================
 async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[dict] = None, vip_invite_link: str = None) -> InlineKeyboardMarkup:
     group = get_group_by_id(group_id)
@@ -6168,8 +6169,7 @@ async def process_discount_expiration_reminders():
                 reply_markup=await get_payment_keyboard(item['group_id'], item['user_id'], spin_data=spin_data), 
                 parse_mode="Markdown"
             )
-        try:
-            await bot_app.bot.send_message(item['user_id'], msg, reply_markup=await get_payment_keyboard(item['group_id'], item['user_id'], spin_used=False), parse_mode="Markdown")
+        
             async def _mark(conn):
                 async with conn.cursor() as cur:
                     await cur.execute("UPDATE discount_spins SET reminder_sent = TRUE WHERE user_id=%s AND group_id=%s", (item['user_id'], item['group_id']))
