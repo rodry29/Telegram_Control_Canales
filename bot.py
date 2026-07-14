@@ -937,21 +937,8 @@ class Database:
                         updated_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
-                for idx_sql in [
-                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)",
-                    "CREATE INDEX IF NOT EXISTS idx_warning_logs_lookup ON warning_logs(user_id, group_id, warning_type)",
-                    "CREATE INDEX IF NOT EXISTS idx_warning_logs_group ON warning_logs(group_id, sent_at)",
-                    "CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)",
-                    "CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)",
-                    "CREATE INDEX IF NOT EXISTS idx_users_uid_gid ON users(user_id, group_id)",
-                    "CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)",
-                    "CREATE INDEX IF NOT EXISTS idx_broadcast_logs_group ON broadcast_logs(group_id, sent_at)",
-                    "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
-                    "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)",
-                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder ON discount_spins(expires_at) WHERE used = FALSE AND reminder_sent = FALSE",
-                    "CREATE INDEX IF NOT EXISTS idx_users_rejoin ON users(group_id, status, rejoin_attempts) WHERE status IN ('active','expired')"
-                ]:
-                    await cur.execute(idx_sql)
+                
+                # 1. PRIMERO: Ejecutar migraciones (ALTER TABLE) para asegurar que las columnas existan
                 await cur.execute("""
                     DO $$                     BEGIN
                         IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payments' AND column_name='amount' AND data_type='integer')
@@ -1016,6 +1003,24 @@ class Database:
                         END IF;
                     END $$;
                 """)
+                
+                # 2. SEGUNDO: Crear los índices (ahora las columnas ya existen garantizadamente)
+                for idx_sql in [
+                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_warning_logs_lookup ON warning_logs(user_id, group_id, warning_type)",
+                    "CREATE INDEX IF NOT EXISTS idx_warning_logs_group ON warning_logs(group_id, sent_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)",
+                    "CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)",
+                    "CREATE INDEX IF NOT EXISTS idx_users_uid_gid ON users(user_id, group_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)",
+                    "CREATE INDEX IF NOT EXISTS idx_broadcast_logs_group ON broadcast_logs(group_id, sent_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
+                    "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder ON discount_spins(expires_at) WHERE used = FALSE AND reminder_sent = FALSE",
+                    "CREATE INDEX IF NOT EXISTS idx_users_rejoin ON users(group_id, status, rejoin_attempts) WHERE status IN ('active','expired')"
+                ]:
+                    await cur.execute(idx_sql)
+
                 await cur.execute("""
                     UPDATE users SET trial_used = TRUE, updated_at = NOW()
                     WHERE (trial_used = FALSE OR trial_used IS NULL)
