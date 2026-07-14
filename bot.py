@@ -294,20 +294,6 @@ def safe_name(text: str) -> str:
         return ""
     return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('`', '\\`')
 
-def render_template(template: str, variables: dict) -> str:
-    """
-    Reemplaza variables en una plantilla.
-    Escapa automáticamente las variables de texto libre para Markdown v1.
-    """
-    safe_keys = {"user_name", "group_name", "username", "first_name"}
-    result = template
-    for key, value in variables.items():
-        str_val = str(value) if value is not None else ""
-        if key in safe_keys:
-            str_val = safe_name(str_val)
-        result = result.replace(f"{{{key}}}", str_val)
-    return result
-
 def fmt_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
     if h >= 24:
@@ -421,10 +407,21 @@ DEFAULT_COMUNIDAD_MUTED_MESSAGE = (
 def format_message(template: str, variables: dict) -> str:
     if not template:
         return ""
+    
+    safe_keys = {
+        "user_name", "group_name", "username", "first_name", 
+        "channel_name", "vip_group_name", "free_group_name", "comunidad_group_name"
+    }
+    
     result = template
     for key, value in variables.items():
-        result = result.replace(f"{{{key}}}", str(value))
+        str_val = str(value) if value is not None else ""
+        if key in safe_keys:
+            str_val = safe_name(str_val)
+        result = result.replace(f"{{{key}}}", str_val)
     return result
+    
+render_template = format_message
 
 # ==================== HELPERS DE PAGO ====================
 async def get_payment_keyboard(group_id: int, user_id: int, spin_used: bool = False, vip_invite_link: str = None) -> InlineKeyboardMarkup:
@@ -2015,9 +2012,13 @@ async def _show_vip_info(send_func, user_id: int, group: dict):
     )
     
     # Usar el mensaje personalizado si existe, si no, el por defecto
-    msg = default_msg
-    if custom and custom.get('welcome_message'):
-        msg = custom['welcome_message']
+    msg = format_message(msg, {
+        'group_name': group.get('group_name', 'VIP'), # <- Quitado safe_name
+        'price_list': price_lines,
+        'trial_duration': trial_str,
+        'expiry_time': 'Al unirte al grupo',
+        'user_name': 'Usuario'
+    })
         
     # Formatear variables de forma segura
     cfg_t = get_group_plan_config(group_id, "trial")
@@ -3869,8 +3870,8 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
             welcome_msg = format_message(welcome_msg, {
                 'trial_duration': trial_str,
                 'expiry_time': expiry_str,
-                'group_name': safe_name(group['group_name']),
-                'user_name': safe_name(first_name or username)
+                'group_name': group['group_name'],
+                'user_name': first_name or username e
             })
 
             keyboard = []
@@ -3936,7 +3937,7 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 return False
 
             # Mensaje estándar para intentos 1 y 2
-            expired_msg = DEFAULT_EXPIRED_MESSAGE
+            expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
             if custom_messages and custom_messages.get('expired_message'):
                 expired_msg = custom_messages['expired_message']
             expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
@@ -3977,8 +3978,8 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
             welcome_msg = format_message(welcome_msg, {
                 'trial_duration': trial_str,
                 'expiry_time': expiry_str,
-                'group_name': safe_name(group['group_name']),
-                'user_name': safe_name(first_name or username)
+                'group_name': group['group_name'], 
+                'user_name': first_name or username
             })
             keyboard = [[InlineKeyboardButton("💳 Ver Datos de Pago", callback_data=f"pay_{chat_id}_{user_id}")]]
             await _safe_send(user_id, welcome_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -4005,7 +4006,7 @@ async def _process_new_comunidad_member(chat_id: int, user_id: int, username: st
         if custom_messages and custom_messages.get('expired_message'):
             muted_msg = custom_messages['expired_message']
             
-        expired_msg = format_message(muted_msg, {'group_name': safe_name(group['group_name'])})
+            expired_msg = format_message(muted_msg, {'group_name': group['group_name']}) 
         await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(chat_id, user_id), parse_mode="Markdown")
         motivo = "Plan vencido" if result_code == "expirado" else "Trial ya utilizado"
         await _safe_send(
@@ -6210,7 +6211,7 @@ async def check_expired_subscriptions():
                     f"✅ Usuario {safe_name(action_text)}.",
                     parse_mode="Markdown"
                 )
-                expired_msg = format_message(expired_msg_template, {'group_name': safe_name(group['group_name'])})
+                expired_msg = format_message(expired_msg_template, {'group_name': group['group_name']})
                 await _safe_send(user_id, expired_msg, reply_markup=await get_payment_keyboard(group_id, user_id), parse_mode="Markdown")
 
     await asyncio.gather(*[_process_group(g) for g in groups_to_check], return_exceptions=True)
