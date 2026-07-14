@@ -2144,13 +2144,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and context.args:
         start_param = context.args[0]
         if start_param.startswith("FREE_"):
-                vip_group = find_linked_or_admin_group(free_group, "VIP")
-                if vip_group:
-                    await _show_vip_info(send, user_id, vip_group)
-                    return
-                else:
-                    await send("👋 *¡Bienvenido!*\n\nHas llegado desde *{free_group['group_name']}*.\n\n⚠️ No hay un grupo VIP configurado. Contacta al administrador.".format(free_group=free_group), parse_mode="Markdown")
-                    return
+            try:
+                free_group_id = int(start_param[5:])  
+            except ValueError:
+                await send("❌ Enlace inválido. Usa /start para ver los canales disponibles.")
+                return
+            free_group = get_group_by_id(free_group_id)
+            if not free_group or free_group.get("type") != "FREE":
+                await send("❌ Grupo no encontrado. Usa /start para ver los canales disponibles.")
+                return
+            vip_group = find_linked_or_admin_group(free_group, "VIP")
+            if vip_group:
+                await _show_vip_info(send, user_id, vip_group)
+                return
+            else:
+                free_name = safe_name(free_group.get('group_name', 'FREE'))
+                await send(
+                    f"👋 *¡Bienvenido!*\n\nHas llegado desde *{free_name}*.\n\n"
+                    f"⚠️ No hay un grupo VIP configurado. Contacta al administrador.",
+                    parse_mode="Markdown"
+                )
+                return
+
+
+
+
+
+
+
+        
         elif start_param.isdigit() or start_param.startswith("-100"):
             group_id = int(start_param)
             group = get_group_by_id(group_id)
