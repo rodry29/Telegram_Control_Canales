@@ -624,15 +624,28 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
     group_name = safe_name(group.get('group_name', 'VIP')) if group else 'VIP'
     group_type = group.get('type', 'VIP') if group else 'VIP'
     
+    header_emoji = "✅" if success else "⚠️"
+    
     await reply_func(
-        f"✅ *{action_text} de suscripción*\n\n📌 *Grupo:* {group_name} ({group_type})\n🆔 *ID:* `{group_id}`\n\n{msg}",
+        f"{header_emoji} *{action_text} de suscripción*\n\n📌 *Grupo:* {group_name} ({group_type})\n🆔 *ID:* `{group_id}`\n\n{msg}",
         parse_mode="Markdown"
     )
 
     if success:
-        await _mark_discount_if_any(target_user_id, current_group, plan)
-        await db.reset_rejoin_state(target_user_id, current_group)
-        await _send_subscription_notification(bot, target_user_id, current_group, plan, is_renewal=is_renewal)
+        try:
+            await _mark_discount_if_any(target_user_id, group_id, plan)
+        except Exception as e:
+            logger.warning(f"Error al marcar descuento para {target_user_id}: {e}")
+        
+        try:
+            await db.reset_rejoin_state(target_user_id, group_id)
+        except Exception as e:
+            logger.warning(f"Error al resetear rejoin_state para {target_user_id}: {e}")
+        
+        try:
+            await _send_subscription_notification(bot, target_user_id, group_id, plan, is_renewal=is_renewal)
+        except Exception as e:
+            logger.warning(f"Error al enviar notificación a {target_user_id}: {e}")
 
 async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, target_user_id: int, plan: str,
                                             custom_price: float = None, custom_days: int = None, is_renewal: bool = False):
@@ -704,6 +717,17 @@ async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, t
                     await db.clear_muted(target_user_id, gid)
                 except Exception:
                     pass
+                try:
+                    await db.reset_rejoin_state(target_user_id, gid)
+                except Exception as e:
+                    logger.warning(f"reset_rejoin_state falló en combo para {target_user_id}/{gid}: {e}")
+                
+                # La ruleta solo se marca en el grupo VIP
+                if gid == vip_group_id:
+                    try:
+                        await _mark_discount_if_any(target_user_id, gid, plan)
+                    except Exception as e:
+                        logger.warning(f"_mark_discount_if_any falló en combo para {target_user_id}/{gid}: {e}")
         
         vip_link = vip_group.get("settings", {}).get("vip_invite_link", "").strip()
         link_msg = f"\n\n🔗 *Enlace VIP:* {vip_link}" if vip_link else ""
@@ -6228,6 +6252,76 @@ async def _start_message_config(update: Update, context: ContextTypes.DEFAULT_TY
             return
             
     await _prompt_message_config(update, context, group_id, msg_type)
+
+async def fix_affected_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando de rescate para arreglar usuarios afectados por el bug de current_group."""
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ Solo el Super Admin puede usar este comando.")
+        return
+        
+    await update.message.reply_text("🔄 Iniciando reparación masiva de usuarios afectados...")
+    
+    fixed_muted = 0
+    fixed_rejoin = 0
+    fixed_spins = 0
+    
+    # 1. Buscar usuarios activos de pago que estén muteados o tengan reintentos pendientes
+    async def _get_affected(conn):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT u.user_id, u.group_id, u.restricted_at, u.rejoin_attempts
+                FROM users u
+                JOIN groups g ON u.group_id = g.group_id
+                WHERE u.status = 'active' AND u.plan != 'trial'
+                  AND (u.restricted_at IS NOT NULL OR u.rejoin_attempts > 0)
+            """)
+            return await cur.fetchall()
+            
+    affected_users = await db._run(_get_affected)
+    
+    for user in affected_users:
+        user_id = user['user_id']
+        group_id = user['group_id']
+        
+        # Desmutear en Telegram y en BD
+        if user['restricted_at'] is not None:
+            try:
+                await context.bot.restrict_chat_member(group_id, user_id, permissions=UNMUTE_PERMISSIONS)
+                await db.clear_muted(user_id, group_id)
+                fixed_muted += 1
+            except Exception:
+                pass # El bot podría no ser admin o el usuario ya salió del grupo
+                
+        # Reiniciar estado de reingreso
+        if user['rejoin_attempts'] > 0:
+            try:
+                await db.reset_rejoin_state(user_id, group_id)
+                fixed_rejoin += 1
+            except Exception:
+                pass
+                
+    # 2. Marcar ruletas como usadas si el usuario ya tiene un plan de pago activo
+    async def _fix_spins(conn):
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                UPDATE discount_spins ds
+                SET used = TRUE
+                FROM users u
+                WHERE ds.user_id = u.user_id AND ds.group_id = u.group_id
+                  AND u.status = 'active' AND u.plan != 'trial'
+                  AND ds.used = FALSE
+            """)
+            return cur.rowcount
+            
+    fixed_spins = await db._run(_fix_spins)
+    
+    await update.message.reply_text(
+        f"✅ *Reparación completada*\n\n"
+        f"🔇 Usuarios desmuteados: {fixed_muted}\n"
+        f"🔄 Reintentos reseteados: {fixed_rejoin}\n"
+        f"🎰 Ruletas marcadas como usadas: {fixed_spins}",
+        parse_mode="Markdown"
+    )
 # ==================== MAIN ====================
 async def main():
     global bot_app
@@ -6269,6 +6363,7 @@ async def main():
     bot_app.add_handler(CommandHandler("renewcombo", renewcombo_command))
     bot_app.add_handler(CommandHandler("dbhealth", db_health_command))
     bot_app.add_handler(CommandHandler("respin", respin_command))
+    bot_app.add_handler(CommandHandler("fixusers", fix_affected_users_command))
 
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
