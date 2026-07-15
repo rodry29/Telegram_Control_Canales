@@ -489,7 +489,7 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[
     
     return InlineKeyboardMarkup(keyboard)
     
-def get_payment_info_text(group_id: int) -> str:
+def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
     group = get_group_by_id(group_id)
     if not group:
         return "Grupo no encontrado"
@@ -499,9 +499,18 @@ def get_payment_info_text(group_id: int) -> str:
     paypal_data = settings.get("paypal_data", "").strip()
     vip_invite_link = settings.get("vip_invite_link", "").strip() 
     group_name = group.get("group_name", "VIP")
-    lines = [f"💰 *INFORMACIÓN DE PAGO — {group_name}*", "", "📋 *Planes disponibles:*"]
-    lines.append(_build_price_list(group_id))
+    
+    lines = [f"💰 *INFORMACIÓN DE PAGO — {group_name}*", ""]
+    
+    if discounted_pct > 0:
+        lines.append(f"🎁 *¡TU DESCUENTO DEL {int(discounted_pct)}% ESTÁ APLICADO!*\n")
+        lines.append("📋 *Planes con tu precio especial:*")
+    else:
+        lines.append("📋 *Planes disponibles:*")
+        
+    lines.append(_build_price_list(group_id, discounted_pct=discounted_pct))
     lines.append("")
+    
     if bank_data:
         lines += ["🏦 *Transferencia Bancaria:*", bank_data, ""]
     if paypal_data:
@@ -512,7 +521,7 @@ def get_payment_info_text(group_id: int) -> str:
         lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
     lines += [
         f"📤 *Después de pagar:*",
-        f"Envía el comprobante a @{payment_contact} Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", "",
+        f"Envía el comprobante a @{payment_contact}. Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", "",
         "⏱ *Tiempo de activación:*",
         "Tu acceso se activará cuando un administrador valide la transferencia.", "",
         "🔄 ¿No recibiste los datos? Presiona el botón de nuevo."
@@ -545,10 +554,15 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
 
     try:
         spin_data = await db.get_spin_data(user_id, group_id)
+        status = get_discount_status(spin_data)
+    
+        discounted_pct = spin_data.get("best_discount", 0) if status == "active" else 0
         
+        text_to_send = get_payment_info_text(group_id, discounted_pct=discounted_pct)
+
         await bot.send_message(
             user_id, 
-            get_payment_info_text(group_id), 
+            text_to_send, 
             parse_mode="Markdown", 
             reply_markup=await get_payment_keyboard(group_id, user_id, spin_data=spin_data, vip_invite_link=vip_invite_link)
         )
@@ -557,7 +571,20 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
         
         chat_link = f"tg://user?id={user_id}"
         group_name = group.get("group_name", "VIP")
-        await _safe_send(group["admin_id"], f"💳 *Nuevo lead de pago*\n\n👤 Usuario: [Usuario {user_id}]({chat_link})\n🆔 ID: `{user_id}`\n📌 Grupo: {group_name}\n🔔 Acción: *{triggered_by}*\n\n_Esperando comprobante._", parse_mode="Markdown")
+        
+        discount_warning = f"\n🎁 *¡TIENE DESCUENTO ACTIVO DEL {int(discounted_pct)}%!* ¡Cierra la venta ya!" if discounted_pct > 0 else ""
+        
+        await _safe_send(
+            group["admin_id"], 
+            f"💳 *Nuevo lead de pago*\n\n"
+            f"👤 Usuario: [Usuario {user_id}]({chat_link})\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📌 Grupo: {group_name}\n"
+            f"🔔 Acción: *{triggered_by}*"
+            f"{discount_warning}\n\n"
+            f"_Esperando comprobante._", 
+            parse_mode="Markdown"
+        )
         return True
     except Exception as e:
         logger.warning(f"No se pudo enviar info de pago a {user_id}: {e}")
