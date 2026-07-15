@@ -3951,8 +3951,14 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         
         attempts = await db.increment_rejoin_attempt(user_id, group_id)
         kick_success = await _kick_user_with_retry(chat_id, user_id)
+        
         if kick_success:
             custom_messages = await db.get_group_messages(chat_id)
+            
+            # ✅ Consultamos el estado real de la ruleta para mostrar el botón correcto
+            spin_data = await db.get_spin_data(user_id, group_id)
+            status = get_discount_status(spin_data)
+            best_discount = spin_data.get("best_discount", 0) if spin_data else 0
 
             if attempts >= 3 and not await db.is_rejoin_promo_sent(user_id, group_id):
                 await db.mark_rejoin_promo_sent(user_id, group_id)
@@ -3960,39 +3966,57 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 await db.update_cart_step(user_id, group_id, 0)
                 
                 settings = group.get("settings", {})
-                extra_discount = 25 
+                
+                # ✅ Lógica de ventas: usar el mayor descuento entre la promo (25%) y el que ya tenía vigente
+                winback_discount = 25
+                if status == "active" and best_discount > winback_discount:
+                    winback_discount = best_discount
+                    promo_intro = f"¡Aún tienes tu descuento del {winback_discount}% guardado de la ruleta! Úsalo ahora para reactivar tu acceso:"
+                else:
+                    promo_intro = (
+                        f"Noté que has intentado regresar. Quiero darte algo especial:\n\n"
+                        f"🔥 *PROMO EXCLUSIVA DE REGRESO: {winback_discount}% OFF*\n\n"
+                        f"Precios con tu promo de regreso:"
+                    )
+                
                 promo_msg = (
                     f"🎁 *¡Te extrañamos en {safe_name(group['group_name'])}!*\n\n"
-                    f"Noté que has intentado regresar. Quiero darte algo especial:\n\n"
-                    f"🔥 *PROMO EXCLUSIVA DE REGRESO: {extra_discount}% OFF*\n\n"
-                    f"Precios con tu promo de regreso:\n"
-                    + _build_price_list(chat_id, discounted_pct=extra_discount)
+                    f"{promo_intro}\n"
+                    + _build_price_list(chat_id, discounted_pct=winback_discount)
                     + f"\n\n⏰ *Esta promo es válida solo 24 horas.*\n"
                     f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
                     f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
                 )
                 
-                await _safe_send(user_id, promo_msg, reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data={}), parse_mode="Markdown")
+                # ✅ Pasamos el spin_data real, no vacío
+                await _safe_send(
+                    user_id, 
+                    promo_msg, 
+                    reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
+                    parse_mode="Markdown"
+                )
                 
                 await _safe_send(
                     group["admin_id"],
                     f"🚨 *WIN-BACK TRIGGERED (3er intento)*\n\n"
                     f"👤 [{display}]({chat_link})\n🆔 `{user_id}`\n"
-                    f"🎁 Promo enviada: {extra_discount}% OFF\n\n"
+                    f"🎁 Promo enviada: {winback_discount}% OFF\n\n"
                     f"💡 _Si paga, activa con:_ `/add {user_id} mensual`",
                     parse_mode="Markdown"
                 )
                 return False
 
+            # Mensaje estándar para intentos 1 y 2
             expired_msg = DEFAULT_EXPIRED_MESSAGE
             if custom_messages and custom_messages.get('expired_message'):
                 expired_msg = custom_messages['expired_message']
             expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
             
+            # ✅ Pasamos el spin_data real
             await _safe_send(
                 user_id, 
                 expired_msg, 
-                reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data={}), 
+                reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
                 parse_mode="Markdown"
             )
             
