@@ -530,15 +530,22 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
 
 # Rate limiting simple en memoria para /pagar y leads
 _PAYMENT_COOLDOWN: Dict[str, datetime] = {}
+_LEAD_ALERT_COOLDOWN: Dict[str, datetime] = {}
 
 async def _cleanup_payment_cooldown():
-    """Limpia entradas viejas del cooldown de pagos cada hora."""
+    """Limpia entradas viejas del cooldown de pagos y alertas cada hora."""
     now = datetime.now(ZoneInfo("UTC"))
-    old_keys = [k for k, v in _PAYMENT_COOLDOWN.items() if (now - v).total_seconds() > 3600]
-    for k in old_keys:
+    
+    old_pay_keys = [k for k, v in _PAYMENT_COOLDOWN.items() if (now - v).total_seconds() > 3600]
+    for k in old_pay_keys:
         _PAYMENT_COOLDOWN.pop(k, None)
-    if old_keys:
-        logger.info(f"🧹 Limpiadas {len(old_keys)} entradas de _PAYMENT_COOLDOWN")
+        
+    old_lead_keys = [k for k, v in _LEAD_ALERT_COOLDOWN.items() if (now - v).total_seconds() > 7200] # 2 horas para leads
+    for k in old_lead_keys:
+        _LEAD_ALERT_COOLDOWN.pop(k, None)
+        
+    if old_pay_keys or old_lead_keys:
+        logger.info(f"🧹 Limpiadas {len(old_pay_keys)} entradas de pago y {len(old_lead_keys)} de alertas cooldown")
 
 async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str = "comando"):
     group = get_group_by_id(group_id)
@@ -3952,85 +3959,94 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         attempts = await db.increment_rejoin_attempt(user_id, group_id)
         kick_success = await _kick_user_with_retry(chat_id, user_id)
         
-        if kick_success:
-            custom_messages = await db.get_group_messages(chat_id)
-            
-            # ✅ Consultamos el estado real de la ruleta para mostrar el botón correcto
-            spin_data = await db.get_spin_data(user_id, group_id)
-            status = get_discount_status(spin_data)
-            best_discount = spin_data.get("best_discount", 0) if spin_data else 0
+        # ✅ Consultamos el estado real de la ruleta y mensajes SIEMPRE, sin importar si se pudo expulsar
+        custom_messages = await db.get_group_messages(chat_id)
+        spin_data = await db.get_spin_data(user_id, group_id)
+        status = get_discount_status(spin_data)
+        best_discount = spin_data.get("best_discount", 0) if spin_data else 0
 
-            if attempts >= 3 and not await db.is_rejoin_promo_sent(user_id, group_id):
-                await db.mark_rejoin_promo_sent(user_id, group_id)
-                await db.log_payment_lead(user_id, group_id) 
-                await db.update_cart_step(user_id, group_id, 0)
-                
-                settings = group.get("settings", {})
-                
-                # ✅ Lógica de ventas: usar el mayor descuento entre la promo (25%) y el que ya tenía vigente
-                winback_discount = 25
-                if status == "active" and best_discount > winback_discount:
-                    winback_discount = best_discount
-                    promo_intro = f"¡Aún tienes tu descuento del {winback_discount}% guardado de la ruleta! Úsalo ahora para reactivar tu acceso:"
-                else:
-                    promo_intro = (
-                        f"Noté que has intentado regresar. Quiero darte algo especial:\n\n"
-                        f"🔥 *PROMO EXCLUSIVA DE REGRESO: {winback_discount}% OFF*\n\n"
-                        f"Precios con tu promo de regreso:"
-                    )
-                
-                promo_msg = (
-                    f"🎁 *¡Te extrañamos en {safe_name(group['group_name'])}!*\n\n"
-                    f"{promo_intro}\n"
-                    + _build_price_list(chat_id, discounted_pct=winback_discount)
-                    + f"\n\n⏰ *Esta promo es válida solo 24 horas.*\n"
-                    f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
-                    f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
-                )
-                
-                # ✅ Pasamos el spin_data real, no vacío
-                await _safe_send(
-                    user_id, 
-                    promo_msg, 
-                    reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
-                    parse_mode="Markdown"
-                )
-                
-                await _safe_send(
-                    group["admin_id"],
-                    f"🚨 *WIN-BACK TRIGGERED (3er intento)*\n\n"
-                    f"👤 [{display}]({chat_link})\n🆔 `{user_id}`\n"
-                    f"🎁 Promo enviada: {winback_discount}% OFF\n\n"
-                    f"💡 _Si paga, activa con:_ `/add {user_id} mensual`",
-                    parse_mode="Markdown"
-                )
-                return False
-
-            # Mensaje estándar para intentos 1 y 2
-            expired_msg = DEFAULT_EXPIRED_MESSAGE
-            if custom_messages and custom_messages.get('expired_message'):
-                expired_msg = custom_messages['expired_message']
-            expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
+        if attempts >= 3 and not await db.is_rejoin_promo_sent(user_id, group_id):
+            await db.mark_rejoin_promo_sent(user_id, group_id)
+            await db.log_payment_lead(user_id, group_id) 
+            await db.update_cart_step(user_id, group_id, 0)
             
-            # ✅ Pasamos el spin_data real
+            settings = group.get("settings", {})
+            
+            # Lógica de descuento inteligente
+            winback_discount = 25
+            if status == "active" and best_discount > winback_discount:
+                winback_discount = best_discount
+                promo_intro = f"¡Aún tienes tu descuento del {winback_discount}% guardado de la ruleta! Úsalo ahora para reactivar tu acceso:"
+            else:
+                promo_intro = (
+                    f"Noté que has intentado regresar. Quiero darte algo especial:\n\n"
+                    f"🔥 *PROMO EXCLUSIVA DE REGRESO: {winback_discount}% OFF*\n\n"
+                    f"Precios con tu promo de regreso:"
+                )
+            
+            promo_msg = (
+                f"🎁 *¡Te extrañamos en {safe_name(group['group_name'])}!*\n\n"
+                f"{promo_intro}\n"
+                + _build_price_list(chat_id, discounted_pct=winback_discount)
+                + f"\n\n⏰ *Esta promo es válida solo 24 horas.*\n"
+                f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
+                f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
+            )
+            
+            # 1. Enviar al usuario (siempre)
             await _safe_send(
                 user_id, 
-                expired_msg, 
+                promo_msg, 
                 reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
                 parse_mode="Markdown"
             )
             
-            attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else " (intento 3/3 — promo enviada)"
-            await _safe_send(
-                group["admin_id"],
-                f"🚫 *Reingreso denegado (VIP)*{attempt_warning}\n\n"
-                f"👤 [{display}]({chat_link})\n"
-                f"🆔 *ID:* `{user_id}`\n"
-                f"📌 {safe_name(group['group_name'])}\n"
-                f"🌍 *Origen:* {safe_name(source)}\n"
-                f"⚠️ {safe_name(motivo_admin)}",
-                parse_mode="Markdown", disable_notification=True
+            # 2. Enviar al admin (siempre, con advertencia si falló la expulsión)
+            admin_alert = (
+                f"🚨 *WIN-BACK TRIGGERED (3er intento)*\n\n"
+                f"👤 [{display}]({chat_link})\n🆔 `{user_id}`\n"
+                f"🎁 Promo enviada: {winback_discount}% OFF\n\n"
             )
+            if not kick_success:
+                admin_alert += "⚠️ *ALERTA:* No pude expulsarlo del grupo (¿falta de permisos?). Hazlo manualmente.\n\n"
+                
+            admin_alert += f"💡 _Si paga, activa con:_ `/add {user_id} mensual`"
+            
+            await _safe_send(group["admin_id"], admin_alert, parse_mode="Markdown")
+            return False
+
+        # Mensaje estándar para intentos 1 y 2
+        expired_msg = DEFAULT_EXPIRED_MESSAGE
+        if custom_messages and custom_messages.get('expired_message'):
+            expired_msg = custom_messages['expired_message']
+        expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
+        
+        # 3. Enviar al usuario (siempre)
+        await _safe_send(
+            user_id, 
+            expired_msg, 
+            reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
+            parse_mode="Markdown"
+        )
+        
+        # 4. Enviar al admin (siempre, con advertencia si falló la expulsión)
+        attempt_warning = f" (intento {attempts}/3)" if attempts < 3 else " (intento 3/3 — promo enviada)"
+        admin_alert = (
+            f"🚫 *Reingreso denegado (VIP)*{attempt_warning}\n\n"
+            f"👤 [{display}]({chat_link})\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"📌 {safe_name(group['group_name'])}\n"
+            f"🌍 *Origen:* {safe_name(source)}\n"
+            f"⚠️ {safe_name(motivo_admin)}"
+        )
+        if not kick_success:
+            admin_alert += "\n\n⚠️ *ALERTA:* No pude expulsarlo del grupo (¿falta de permisos?). Hazlo manualmente."
+            
+        await _safe_send(
+            group["admin_id"],
+            admin_alert,
+            parse_mode="Markdown", disable_notification=True
+        )
         return False
 # --- NUEVO HANDLER PARA COMUNIDAD ---
 async def _process_new_comunidad_member(chat_id: int, user_id: int, username: str, first_name: str, group: dict, source: str = "Directo"):
@@ -5444,7 +5460,6 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     parts = query.data.split("_")
     
-    # Extraer group_id y user_id de forma segura (formato: spin_used_-100123_456)
     if len(parts) < 4:
         await query.answer("❌ Error en datos", show_alert=True)
         return
@@ -5469,9 +5484,7 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_name = query.from_user.first_name or "Usuario"
     payment_contact = group.get('settings', {}).get('payment_contact', 'admin')
 
-    # 1. MANEJO DEL EMBUDO SEGÚN EL ESTADO
     if status == "active":
-        # A) DESCUENTO ACTIVO: Este es el lead más caliente. Hay que cerrar YA.
         await query.answer("🏆 Redirigiéndote a la info de pago con tu descuento...", show_alert=False)
         
         msg = (
@@ -5479,27 +5492,33 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"👉 *No pierdas esta oportunidad.* Estos son tus precios especiales:\n\n"
             + _build_price_list(group_id, discounted_pct=best) + 
             f"\n\n⏳ *Recuerda:* Tu descuento tiene tiempo límite. Úsalo ahora.\n"
-            f"📤 Envía tu comprobante a @{payment_contact} y diles: *'Quiero activar con mi descuento del {best}%'*."
+            f"📤 Envía tu comprobante a @{payment_contact} y diles: *'quiero activar con mi descuento del {best}%'*."
         )
         
-        # Alerta al admin para cierre manual (Crítico para ventas)
-        try:
-            await _safe_send(
-                group["admin_id"],
-                f"🔥 *LEAD CALIENTE VIENDO SU DESCUENTO*\n\n"
-                f"👤 [{user_name}]({chat_link})\n"
-                f"🆔 `{user_id}`\n"
-                f"🏆 Descuento: *{best}% OFF*\n\n"
-                f"💡 *Acción recomendada:* Escríbele ahora para recordarle que pague y activarlo al instante.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
+        # ✅ Verificar cooldown para no spamear al admin
+        now = datetime.now(ZoneInfo("UTC"))
+        cooldown_key = f"lead_{user_id}_{group_id}"
+        last_alert = _LEAD_ALERT_COOLDOWN.get(cooldown_key)
+        
+        if not last_alert or (now - last_alert).total_seconds() > 3600:
+            try:
+                await _safe_send(
+                    group["admin_id"],
+                    f"🔥 *LEAD CALIENTE VIENDO SU DESCUENTO*\n\n"
+                    f"👤 [{user_name}]({chat_link})\n"
+                    f"🆔 `{user_id}`\n"
+                    f"🏆 Descuento: *{best}% OFF*\n\n"
+                    f"💡 *Acción recomendada:* Escríbele ahora para recordarle que pague y activarlo al instante.",
+                    parse_mode="Markdown"
+                )
+                _LEAD_ALERT_COOLDOWN[cooldown_key] = now
+            except Exception:
+                pass
+        else:
+            logger.info(f"Alerta de lead caliente omitida por cooldown para {user_id}")
 
     elif status == "used":
-        # B) RULETA USADA: Quiere saber opciones (renovación o compra normal)
         await query.answer("ℹ️ Mostrando opciones de pago normales...", show_alert=False)
-        
         msg = (
             f"✅ *Ya utilizaste tu ruleta VIP*\n\n"
             f"No te preocupes, ¡aún puedes acceder al contenido exclusivo de *{safe_name(group['group_name'])}*!\n\n"
@@ -5509,9 +5528,7 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     elif status == "expired":
-        # C) DESCUENTO EXPIRADO: FOMO + Oportunidad de pago normal
         await query.answer("⏰ Tu descuento expiró, pero aún puedes entrar...", show_alert=False)
-        
         msg = (
             f"⏰ *Tu descuento del {best}% ha expirado*\n\n"
             f"El tiempo de la promo terminó, pero el contenido de *{safe_name(group['group_name'])}* sigue subiendo todos los días.\n\n"
@@ -5520,12 +5537,9 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"\n\n📤 Si quieres entrar ya, envía tu comprobante a @{payment_contact}."
         )
     else:
-        # D) Ninguno / Error
         await query.answer()
         return
 
-    # 2. EDITAR EL MENSAJE CON EL EMBUDO Y EL TECLADO DE PAGO
-    # Pasamos spin_data para que el teclado se adapte también (evita consultas extra)
     keyboard = await get_payment_keyboard(group_id, user_id, spin_data=spin_data)
     
     try:
@@ -5536,7 +5550,6 @@ async def spin_used_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception as e:
         logger.warning(f"No se pudo editar mensaje en spin_used_callback: {e}")
-
 # ==================== SISTEMA DE AVISOS ====================
 async def send_trial_warnings():
     if not bot_app:
