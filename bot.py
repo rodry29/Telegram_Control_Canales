@@ -1255,7 +1255,7 @@ class Database:
                     "group_id": group_id, 
                     "plan": plan
                 })
-                await cur.execute("NOTIFY vip_cache_invalidation, %s", (payload,))
+                await cur.execute("SELECT pg_notify('vip_cache_invalidation', %s)", (payload,))
 
                 price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
                 display = fn if fn else uname
