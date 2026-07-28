@@ -492,6 +492,7 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
     binance_address = settings.get("binance_address", "").strip()
     vip_invite_link = settings.get("vip_invite_link", "").strip() 
     group_name = group.get("group_name", "VIP")
+    payment_contact = settings.get("payment_contact", "administrador").strip() 
     
     lines = [f"💰 *INFORMACIÓN DE PAGO — {group_name}*", ""]
     
@@ -512,11 +513,20 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
                   "Contacta al administrador para más información.", ""]
     if vip_invite_link:
         lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
+    if payment_contact:
+        lines += [
+            f"📤 *Después de pagar:*",
+            f"Envía el TXID (hash) a @{payment_contact}. Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", ""
+        ]
+    else:
+        lines += [
+            f"📤 *Después de pagar:*",
+            f"Presiona el botón *'Enviar Comprobante'* para enviar tu TXID.", ""
+        ]
+        
     lines += [
-        f"📤 *Después de pagar:*",
-        f"Envía el comprobante a @{payment_contact}. Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", "",
         "⏱ *Tiempo de activación:*",
-        "Tu acceso se activará cuando se valide la transferencia.", "",
+        "Tu acceso se activará cuando se valide la transacción en la blockchain.", "",
         "🔄 ¿No recibiste los datos? Presiona el botón de nuevo."
     ]
     return "\n".join(lines)
