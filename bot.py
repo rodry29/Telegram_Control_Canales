@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Any, Callable
 from zoneinfo import ZoneInfo
 
 import psycopg
+import aiohttp
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
@@ -38,6 +39,8 @@ EXTRA_ADMINS = [int(x.strip()) for x in os.getenv("EXTRA_ADMINS", "").split(",")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 EC_TZ = ZoneInfo("America/Guayaquil")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "AyudanteVIP_bot")
+TRONGRID_API = "https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 if not TOKEN:
     logger.critical("❌ ERROR: No se encontró TELEGRAM_TOKEN")
@@ -98,6 +101,97 @@ def _mark_known_member(key: str):
         to_del = [k for k, v in _known_members_cache.items() if v < cutoff]
         for k in to_del:
             del _known_members_cache[k]
+
+async def check_crypto_payments():
+    if not bot_app: return
+    
+    groups_snapshot = get_all_groups_snapshot()
+    addresses_to_check = set()
+    for g in groups_snapshot:
+        addr = g.get("settings", {}).get("binance_address")
+        if addr:
+            addresses_to_check.add(addr)
+            
+    if not addresses_to_check:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        for address in addresses_to_check:
+            try:
+                url = TRONGRID_API.format(address=address)
+                params = {"limit": 20, "only_to": "true", "contract_address": USDT_CONTRACT}
+                async with session.get(url, params=params) as response:
+                    if response.status != 200: continue
+                    data = await response.json()
+                    
+                for tx in data.get("data", []):
+                    try:
+                        tx_id = tx.get("transaction_id")
+                        if await db.is_tx_processed(tx_id): continue
+                        
+                        value_str = tx.get("value", "0")
+                        amount_full = int(value_str) / 1_000_000.0
+                        amount_rounded = round(amount_full, 2)
+                        
+                        invoice = await db.get_pending_invoice_by_amount(amount_rounded)
+                        
+                        if invoice:
+                            await db.mark_invoice_paid(invoice['id'])
+                            await db.log_processed_tx(tx_id)
+                            
+                            # OBTENER PRECIO ACTUAL DEL PLAN
+                            cfg = get_group_plan_config(invoice['group_id'], invoice['plan'])
+                            current_base_price = cfg['price']
+                            
+                            # OBTENER DESCUENTO ACTUAL DEL USUARIO
+                            spin_data = await db.get_spin_data(invoice['user_id'], invoice['group_id'])
+                            status = get_discount_status(spin_data)
+                            discount_pct = spin_data.get("best_discount", 0) if status == "active" else 0
+                            
+                            current_expected_base = int(current_base_price * (1 - discount_pct / 100))
+                            
+                            # VALIDACIÓN CRUZADA
+                            if int(invoice['amount_base']) == current_expected_base:
+                                # El precio base pagado coincide con el precio actual. ¡Activar!
+                                custom_price = round(current_base_price * (1 - discount_pct / 100), 2)
+                                
+                                if discount_pct > 0:
+                                    await db.mark_discount_used(invoice['user_id'], invoice['group_id'], invoice['plan'])
+                                
+                                await _execute_subscription_flow(
+                                    bot_app.bot,
+                                    lambda text, **kw: None,
+                                    invoice['group_id'],
+                                    invoice['user_id'],
+                                    invoice['plan'],
+                                    custom_price=custom_price,
+                                    is_renewal=False
+                                )
+                                
+                                await _safe_send(invoice['user_id'], f"✅ *¡Pago confirmado automáticamente!*\n\nTu plan *{invoice['plan'].capitalize()}* ha sido activado.")
+                                await _safe_send(SUPER_ADMIN_ID, f"🤖 *Pago automático verificado*\n\n👤 ID: `{invoice['user_id']}`\n💰 Monto: `${amount_full:.2f}`\n📦 Plan: {invoice['plan']}")
+                            
+                            else:
+                                # EL PRECIO CAMBIÓ O EL DESCUENTO YA NO APLICA
+                                await _safe_send(invoice['user_id'], 
+                                    f"⚠️ *Pago detectado pero con monto incorrecto*\n\n"
+                                    f"Recibimos tu pago de ${amount_full:.2f}, pero el precio del plan o tu descuento han cambiado.\n"
+                                    f"Por favor, contacta al administrador para resolver esto manualmente.")
+                                
+                                await _safe_send(SUPER_ADMIN_ID, 
+                                    f"🚨 *ALERTA: Pago con monto desactualizado*\n\n"
+                                    f"👤 ID: `{invoice['user_id']}`\n"
+                                    f"💰 Pagó: ${amount_full:.2f}\n"
+                                    f"📦 Plan: {invoice['plan']}\n"
+                                    f"❌ El precio actual es ${current_expected_base}. Revisa si pagó una tarifa antigua.")
+                        else:
+                            await db.log_processed_tx(tx_id)
+                            
+                    except Exception as e:
+                        logger.error(f"Error procesando TX de cripto: {e}")
+                        
+            except Exception as e:
+                logger.error(f"Error consultando TronGrid para {address}: {e}")
 # ==================== UTILIDADES DE TIEMPO ====================
 def now_ec() -> datetime:
     """Retorna datetime naive en UTC (para DB) pero con contexto de Ecuador para display."""
@@ -1073,6 +1167,29 @@ class Database:
                     WHERE (trial_used = FALSE OR trial_used IS NULL)
                       AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id = users.user_id AND p.group_id = users.group_id AND p.plan = 'trial')
                 """)
+
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS crypto_invoices (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        group_id BIGINT NOT NULL,
+                        amount_base NUMERIC(10,2) NOT NULL,
+                        total_to_pay NUMERIC(10,2) NOT NULL,
+                        unique_suffix INTEGER NOT NULL,
+                        plan TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        status TEXT DEFAULT 'pending'
+                    )
+                """)
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_invoices_pending ON crypto_invoices(status, total_to_pay) WHERE status = 'pending'")
+
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS processed_txs (
+                        tx_id TEXT PRIMARY KEY,
+                        processed_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+
         await self._run(_init)
         logger.info("✅ Base de datos inicializada")
 
@@ -1831,6 +1948,47 @@ class Database:
                     VALUES (0, 'auto_backup', 'Backup automatico', 0, 0, 0, %s)
                 """, (SUPER_ADMIN_ID,))
         await self._run(_log)
+
+    async def create_crypto_invoice(self, user_id: int, group_id: int, amount_base: float, total_to_pay: float, suffix: int, plan: str):
+        async def _create(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("UPDATE crypto_invoices SET status='expired' WHERE user_id=%s AND group_id=%s AND status='pending'", (user_id, group_id))
+                await cur.execute("""
+                    INSERT INTO crypto_invoices (user_id, group_id, amount_base, total_to_pay, unique_suffix, plan)
+                    VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+                """, (user_id, group_id, amount_base, total_to_pay, suffix, plan))
+                return (await cur.fetchone())[0]
+        return await self._run(_create)
+
+    async def get_pending_invoice_by_amount(self, total_to_pay: float):
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
+                    SELECT * FROM crypto_invoices 
+                    WHERE total_to_pay=%s AND status='pending'
+                    ORDER BY created_at ASC LIMIT 1
+                """, (total_to_pay,))
+                return await cur.fetchone()
+        return await self._run(_get)
+
+    async def mark_invoice_paid(self, invoice_id: int):
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("UPDATE crypto_invoices SET status='paid' WHERE id=%s", (invoice_id,))
+        return await self._run(_upd)
+
+    async def is_tx_processed(self, tx_id: str) -> bool:
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1 FROM processed_txs WHERE tx_id=%s", (tx_id,))
+                return await cur.fetchone() is not None
+        return await self._run(_get)
+
+    async def log_processed_tx(self, tx_id: str):
+        async def _log(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("INSERT INTO processed_txs (tx_id) VALUES (%s) ON CONFLICT DO NOTHING", (tx_id,))
+        return await self._run(_log)
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
@@ -2234,9 +2392,70 @@ async def vip_enter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
-    await query.answer("💳 Enviando datos de pago...")
+    await query.answer()
     user_id = query.from_user.id
-    await send_payment_info(context.bot, user_id, vip_group_id, triggered_by="botón Información de Pago")
+    
+    spin_data = await db.get_spin_data(user_id, vip_group_id)
+    status = get_discount_status(spin_data)
+    discount_pct = spin_data.get("best_discount", 0) if status == "active" else 0
+    
+    keyboard = []
+    for plan in ["semanal", "mensual", "anual"]:
+        cfg = get_group_plan_config(vip_group_id, plan)
+        base_price = cfg['price']
+        final_price = base_price * (1 - discount_pct / 100)
+        
+        if discount_pct > 0:
+            text = f"{_plan_emoji(plan)} {plan.capitalize()} - ${final_price:.2f} (Descuento aplicado)"
+        else:
+            text = f"{_plan_emoji(plan)} {plan.capitalize()} - ${final_price:.2f}"
+            
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"gen_inv_{vip_group_id}_{plan}_{discount_pct}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data=f"channel_vip_{vip_group_id}")])
+    
+    msg = "💳 *Selección de Plan*\n\nElige el plan que deseas pagar. Se generará un monto exacto y único para validar tu pago automáticamente."
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    parts = query.data.split("_")
+    if len(parts) < 5: return
+    
+    group_id = int(parts[2])
+    plan = parts[3]
+    discount_pct = int(parts[4])
+    user_id = query.from_user.id
+    
+    cfg = get_group_plan_config(group_id, plan)
+    base_price = cfg['price']
+    final_price = round(base_price * (1 - discount_pct / 100), 2)
+    
+    amount_base = int(final_price) # Ej: 5 o 7
+    suffix = random.randint(10, 99)
+    total_to_pay = round(final_price + (suffix / 100), 2)
+    
+    # Guardamos el amount_base actual
+    invoice_id = await db.create_crypto_invoice(user_id, group_id, amount_base, total_to_pay, suffix, plan)
+    
+    group = get_group_by_id(group_id)
+    binance_address = group.get("settings", {}).get("binance_address", "")
+    
+    msg = (
+        f"🧾 *Factura de Pago Generada*\n\n"
+        f"📦 Plan: *{plan.capitalize()}*\n"
+        f"💰 Monto a pagar: *${total_to_pay:.2f} USDT*\n"
+        f"🔗 Red: *TRC20 (Tron)*\n\n"
+        f"📝 *Dirección:*\n`{binance_address}`\n\n"
+        f"⚠️ *Importante:* Debes enviar exactamente *${total_to_pay:.2f}* incluyendo los centavos. "
+        f"El bot detectará tu pago automáticamente en unos 1-3 minutos y te dará acceso.\n\n"
+        f"⏳ Esta factura expira en 2 horas."
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 Volver a planes", callback_data=f"vip_pay_{group_id}")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def vip_spin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
@@ -5196,14 +5415,14 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
             context.user_data.pop('config_payment_group_id', None)
             return
             
-        context.user_data['config_payment_step'] = 'vip_invite_link'
+        context.user_data['config_payment_step'] = 'payment_contact'
         group = get_group_by_id(group_id)
-        current_link = group.get("settings", {}).get("vip_invite_link", "") if group else ""
+        current_contact = group.get("settings", {}).get("payment_contact", "") if group else ""
         await update.message.reply_text(
-            f"✅ *Contacto guardado.*\n\nPaso 2/2: *Link de Invitación VIP*\n"
-            f"Envía el enlace del grupo VIP (debe empezar con https://).\n\n"
-            f"📋 *Actual:* `{current_link or 'No configurado'}`\n\n"
-            f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
+            f"✅ *Dirección Binance guardada.*\n\nPaso 2/3: *Contacto para comprobantes*\n"
+            f"Envía el username de Telegram donde los clientes enviarán su TXID.\n\n"
+            f"📋 *Actual:* `{current_contact or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual.*",
             parse_mode="Markdown"
         )
         
@@ -5218,13 +5437,14 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
             context.user_data.pop('config_payment_group_id', None)
             return
             
-        context.user_data['config_payment_step'] = 'paypal_data'
+        context.user_data['config_payment_step'] = 'vip_invite_link'
         group = get_group_by_id(group_id)
-        current_paypal = group.get("settings", {}).get("paypal_data", "") if group else ""
+        current_link = group.get("settings", {}).get("vip_invite_link", "") if group else ""
         await update.message.reply_text(
-            f"✅ *Contacto guardado.*\n\nPaso 3/3: *PayPal (opcional)*\n"
-            f"Envía los datos de PayPal o escribe 'saltar' / 'eliminar'.\n\n"
-            f"📋 *Actual:* `{current_paypal or 'No configurado'}`",
+            f"✅ *Contacto guardado.*\n\nPaso 3/3: *Link de Invitación VIP*\n"
+            f"Envía el enlace del grupo VIP (debe empezar con https://).\n\n"
+            f"📋 *Actual:* `{current_link or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
             parse_mode="Markdown"
         )
         
@@ -5275,13 +5495,13 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     context.user_data['config_payment_group_id'] = group_id
-    context.user_data['config_payment_step'] = 'bank_data'
+    context.user_data['config_payment_step'] = 'binance_address'
     settings = group.get("settings", {})
-    current_bank = settings.get("bank_data", "")
+    current_binance = settings.get("binance_address", "")
     await query.edit_message_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/4: *Datos bancarios*\nEnvía los datos de transferencia bancaria.\n\n"
-        f"📋 *Actual:*\n`{current_bank or 'No configurado'}`\n\n"
+        f"Paso 1/3: *Dirección USDT (Binance)*\nEnvía tu dirección TRC20.\n\n"
+        f"📋 *Actual:*\n`{current_binance or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
     )
@@ -6510,6 +6730,7 @@ CALLBACK_PREFIXES = [
     ("cfg_binance_", lambda u, c, d: cfg_binance_request(u, c, int(d.replace("cfg_binance_", "")))),
     ("cfg_cart_", lambda u, c, d: cfg_cart_request(u, c, int(d.replace("cfg_cart_", "")))),
     ("list_active", lambda u, c, d: list_active_users(u, c, d)),
+    ("gen_inv_", lambda u, c, d: generate_invoice_callback(u, c, d)),
 ]
 async def show_channel_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
@@ -6707,6 +6928,7 @@ async def main():
     scheduler.add_job(process_abandoned_carts, 'interval', minutes=5, id='check_carts', replace_existing=True)
     scheduler.add_job(process_discount_expiration_reminders, 'interval', minutes=15, id='discount_reminders', replace_existing=True)
     scheduler.add_job(process_no_spin_reminders, 'interval', minutes=10, id='no_spin_reminders', replace_existing=True)
+    scheduler.add_job(check_crypto_payments, 'interval', minutes=1, id='check_crypto', replace_existing=True)
     scheduler.start()
 
     logger.info("🤖 Bot iniciado")
