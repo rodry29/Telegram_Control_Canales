@@ -38,7 +38,7 @@ SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "5054216496"))
 EXTRA_ADMINS = [int(x.strip()) for x in os.getenv("EXTRA_ADMINS", "").split(",") if x.strip()]
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 EC_TZ = ZoneInfo("America/Guayaquil")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "AyudanteVIP_bot")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
 TRONGRID_API = "https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
