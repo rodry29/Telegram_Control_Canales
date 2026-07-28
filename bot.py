@@ -516,7 +516,7 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
         f"📤 *Después de pagar:*",
         f"Envía el comprobante a @{payment_contact}. Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", "",
         "⏱ *Tiempo de activación:*",
-        "Tu acceso se activará cuando un administrador valide la transferencia.", "",
+        "Tu acceso se activará cuando se valide la transferencia.", "",
         "🔄 ¿No recibiste los datos? Presiona el botón de nuevo."
     ]
     return "\n".join(lines)
@@ -4266,7 +4266,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton(f"💲 Anual: {fmt_price(cfg_anual['price'])}", callback_data=f"cfg_price_anual_{group_id}"),
             InlineKeyboardButton(f"📅 {cfg_anual.get('days', 365)} días", callback_data=f"cfg_dur_anual_{group_id}")
         ],
-        [InlineKeyboardButton("💳 Datos Bancarios y PayPal", callback_data=f"cfg_payment_{group_id}")],
+        [InlineKeyboardButton("🟡 Datos de Pago (USDT)", callback_data=f"cfg_payment_{group_id}")],
         [InlineKeyboardButton(f"🟡 Dirección Binance ({binance_status})", callback_data=f"cfg_binance_{group_id}")],
         [InlineKeyboardButton("🔔 Configurar Avisos", callback_data=f"cfg_warnings_{group_id}")],
     ]
@@ -5078,13 +5078,13 @@ async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     _clear_input_states(context)
     context.user_data['config_payment_group_id'] = group_id
-    context.user_data['config_payment_step'] = 'bank_data'
+    context.user_data['config_payment_step'] = 'binance_address'
     settings = group.get("settings", {})
-    current_bank = settings.get("bank_data", "")
+    current_binance = settings.get("binance_address", "")
     await update.message.reply_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/4: *Dirección de Binance*\nEnvía la dirección Binance.\n\n"
-        f"📋 *Actual:*\n`{current_bank or 'No configurado'}`\n\n"
+        f"Paso 1/3: *Dirección USDT (Binance)*\nEnvía tu dirección TRC20.\n\n"
+        f"📋 *Actual:*\n`{current_binance or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
     )
@@ -5186,13 +5186,14 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
             context.user_data.pop('config_payment_group_id', None)
             return
             
-        context.user_data['config_payment_step'] = 'payment_contact'
+        context.user_data['config_payment_step'] = 'vip_invite_link'
         group = get_group_by_id(group_id)
-        current_contact = group.get("settings", {}).get("payment_contact", "") if group else ""
+        current_link = group.get("settings", {}).get("vip_invite_link", "") if group else ""
         await update.message.reply_text(
-            f"✅ *Dirección Binance guardada.*\n\nPaso 2/3: *Contacto para comprobantes*\n"
-            f"Envía el username de Telegram.\n\n📋 *Actual:* `{current_contact or 'No configurado'}`\n\n"
-            f"*Escribe 'saltar' para dejar el valor actual.*",
+            f"✅ *Contacto guardado.*\n\nPaso 2/2: *Link de Invitación VIP*\n"
+            f"Envía el enlace del grupo VIP (debe empezar con https://).\n\n"
+            f"📋 *Actual:* `{current_link or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
             parse_mode="Markdown"
         )
         
