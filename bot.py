@@ -443,7 +443,6 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[
         return InlineKeyboardMarkup([])
         
     settings = group.get("settings", {})
-    deuna_link = settings.get("deuna_link")
     admin_id = group.get("admin_id")
     payment_contact = settings.get("payment_contact", "").strip()
     
@@ -479,12 +478,8 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[
     # Botón 3: Link al VIP
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("🔥 Entrada al VIP", url=vip_invite_link)])
-    
-    # Botón 4: Deuna
-    if deuna_link and deuna_link.startswith(("https://", "http://")):
-        keyboard.append([InlineKeyboardButton("⚡ PAGAR CON DEUNA", url=deuna_link)])
-    
-    # Botón 5: Volver
+        
+    # Botón 4: Volver
     keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_start")])
     
     return InlineKeyboardMarkup(keyboard)
@@ -494,9 +489,7 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
     if not group:
         return "Grupo no encontrado"
     settings = group.get("settings", {})
-    bank_data = settings.get("bank_data", "").strip()
-    payment_contact = settings.get("payment_contact", "admin").strip()
-    paypal_data = settings.get("paypal_data", "").strip()
+    binance_address = settings.get("binance_address", "").strip()
     vip_invite_link = settings.get("vip_invite_link", "").strip() 
     group_name = group.get("group_name", "VIP")
     
@@ -510,13 +503,13 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
         
     lines.append(_build_price_list(group_id, discounted_pct=discounted_pct))
     lines.append("")
-    
-    if bank_data:
-        lines += ["🏦 *Transferencia Bancaria:*", bank_data, ""]
-    if paypal_data:
-        lines += ["🅿️ *PayPal:*", paypal_data, ""]
-    if not bank_data and not paypal_data:
-        lines += ["⚠️ *Métodos de pago no configurados aún.*", "Contacta al administrador para más información.", ""]
+        
+    if binance_address:
+        lines += ["🟡 *Binance Pay / USDT:*", f"`{binance_address}`",
+                   "⚠️ *Verifica la red (BEP20/TRC20/etc.) antes de enviar.*", ""]
+    else:
+        lines += ["⚠️ *Dirección de Binance no configurada aún.*",
+                  "Contacta al administrador para más información.", ""]
     if vip_invite_link:
         lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
     lines += [
@@ -1863,7 +1856,7 @@ async def _safe_send(chat_id: int, text: str, disable_notification: bool = False
         logger.warning(f"No se pudo enviar mensaje a {chat_id}: {e}")
         return None
 
-async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def config_binance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2: 
         await update.message.reply_text("❌ Uso: `/configdeuna group_id link`", parse_mode="Markdown"); 
         return
@@ -1878,10 +1871,10 @@ async def config_deuna_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     link = context.args[1].strip()
     if not link.startswith("https://"): await update.message.reply_text("❌ El link debe empezar con https://"); return
-    if not await update_group_settings(group_id, {'deuna_link': link}):
+    if not await update_group_settings(group_id, {'binance_address': link}):
         await update.message.reply_text("❌ Grupo no encontrado")
         return
-    await update.message.reply_text("✅ Link Deuna guardado.")
+    await update.message.reply_text("✅ Link Binance guardado")
 
 async def config_cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
@@ -4257,7 +4250,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     cfg_anual = get_group_plan_config(group_id, "anual")
     
     trial_str = fmt_minutes(cfg_trial.get('minutes', 60))
-    deuna_status = "✅" if group.get("settings", {}).get("deuna_link") else "❌"
+    binance_status = "✅" if group.get("settings", {}).get("binance_address") else "❌"
     
     keyboard = [
         [InlineKeyboardButton(f"⏱ Trial: {trial_str}", callback_data=f"cfg_trial_{group_id}")],
@@ -4274,7 +4267,7 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton(f"📅 {cfg_anual.get('days', 365)} días", callback_data=f"cfg_dur_anual_{group_id}")
         ],
         [InlineKeyboardButton("💳 Datos Bancarios y PayPal", callback_data=f"cfg_payment_{group_id}")],
-        [InlineKeyboardButton(f"⚡ Link Deuna ({deuna_status})", callback_data=f"cfg_deuna_{group_id}")],
+        [InlineKeyboardButton(f"🟡 Dirección Binance ({binance_status})", callback_data=f"cfg_binance_{group_id}")],
         [InlineKeyboardButton("🔔 Configurar Avisos", callback_data=f"cfg_warnings_{group_id}")],
     ]
     if group.get("type", "VIP") == "VIP":
@@ -4337,14 +4330,14 @@ async def cfg_duration_request(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown"
     )
 
-async def cfg_deuna_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+async def cfg_binance_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
     query = update.callback_query
     await query.answer()
     _clear_input_states(context)
-    context.user_data['cfg_field'] = 'deuna_link'
+    context.user_data['cfg_field'] = 'binance_address'
     context.user_data['cfg_group_id'] = group_id
     group = get_group_by_id(group_id)
-    current_link = group.get("settings", {}).get("deuna_link", "")
+    current_link = group.get("settings", {}).get("binance_address", "")
     await query.edit_message_text(
         f"⚡ *Configurar Link Deuna*\n\nActual: `{current_link or 'No configurado'}`\n\nEnvía el nuevo link (debe empezar con https://).\n\n*Escribe 'cancelar' para salir.*",
         parse_mode="Markdown"
@@ -4429,16 +4422,16 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Deuna ──────────────────────────────────────────────────────────────
-    if field == 'deuna_link':
-        if not text.startswith("https://"):
-            await update.message.reply_text("❌ El link debe empezar con `https://`")
+    if field == 'binance_address':
+        if len(text) < 10:
+            await update.message.reply_text("❌ Dirección/ID demasiado corto, revísalo.")
             return
-        if not await update_group_settings(group_id, {'deuna_link': text}):
+        if not await update_group_settings(group_id, {'binance_address': text}):
             await update.message.reply_text("❌ Grupo no encontrado")
             _clear_input_states(context)
             return
         _clear_input_states(context)
-        await update.message.reply_text("✅ *Link Deuna guardado correctamente.*", parse_mode="Markdown")
+        await update.message.reply_text("✅ *Dirección Binance guardada correctamente.*", parse_mode="Markdown")
         return
 
     # ── Carrito abandonado ─────────────────────────────────────────────────
@@ -5090,7 +5083,7 @@ async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_T
     current_bank = settings.get("bank_data", "")
     await update.message.reply_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/4: *Datos bancarios*\nEnvía los datos de transferencia bancaria.\n\n"
+        f"Paso 1/4: *Dirección de Binance*\nEnvía la dirección Binance.\n\n"
         f"📋 *Actual:*\n`{current_bank or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
@@ -5179,13 +5172,13 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         return
     text = update.message.text.strip()
     
-    if step == 'bank_data':
+    if step == 'binance_address':
         changes = {}
         if text.lower() not in ('saltar',):
             if text.lower() == 'eliminar':
-                changes['bank_data'] = None
+                changes['binance_address'] = None
             else:
-                changes['bank_data'] = text
+                changes['binance_address'] = text
                 
         if changes and not await update_group_settings(group_id, changes):
             await update.message.reply_text("❌ Grupo no encontrado")
@@ -5197,7 +5190,7 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         group = get_group_by_id(group_id)
         current_contact = group.get("settings", {}).get("payment_contact", "") if group else ""
         await update.message.reply_text(
-            f"✅ *Datos bancarios guardados.*\n\nPaso 2/3: *Contacto para comprobantes*\n"
+            f"✅ *Dirección Binance guardada.*\n\nPaso 2/3: *Contacto para comprobantes*\n"
             f"Envía el username de Telegram.\n\n📋 *Actual:* `{current_contact or 'No configurado'}`\n\n"
             f"*Escribe 'saltar' para dejar el valor actual.*",
             parse_mode="Markdown"
@@ -5221,32 +5214,6 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
             f"✅ *Contacto guardado.*\n\nPaso 3/3: *PayPal (opcional)*\n"
             f"Envía los datos de PayPal o escribe 'saltar' / 'eliminar'.\n\n"
             f"📋 *Actual:* `{current_paypal or 'No configurado'}`",
-            parse_mode="Markdown"
-        )
-        
-    elif step == 'paypal_data':
-        changes = {}
-        if text.lower() not in ('saltar',):
-            if text.lower() == 'eliminar':
-                changes['paypal_data'] = None
-            else:
-                changes['paypal_data'] = text
-                
-        if changes and not await update_group_settings(group_id, changes):
-            await update.message.reply_text("❌ Grupo no encontrado")
-            context.user_data.pop('config_payment_step', None)
-            context.user_data.pop('config_payment_group_id', None)
-            return
-            
-        context.user_data['config_payment_step'] = 'vip_invite_link'
-        group = get_group_by_id(group_id)
-        current_vip_link = group.get("settings", {}).get("vip_invite_link", "") if group else ""
-        await update.message.reply_text(
-            f"✅ *PayPal guardado.*\n\nPaso 4/4: *Link de invitación al VIP*\n"
-            f"Envía el link de invitación al grupo VIP (para el botón 'Entrar al VIP').\n\n"
-            f"📋 *Actual:* `{current_vip_link or 'No configurado'}`\n\n"
-            f"*Escribe 'saltar' para dejar el valor actual, 'eliminar' para borrarlo, o pega el link de invitación.*\n\n"
-            f"💡 *Para obtener el link:* Ve al grupo VIP → Administradores → Invitar por link → Copiar",
             parse_mode="Markdown"
         )
         
@@ -5278,9 +5245,8 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         vip_link_status = settings.get('vip_invite_link', 'No configurado')
         await update.message.reply_text(
             f"✅ *Configuración de pago completada*\n\n📌 *Grupo:* {group['group_name'] if group else 'Desconocido'}\n\n"
-            f"🏦 *Bancaria:*\n`{settings.get('bank_data', 'No configurado')}`\n\n"
+            f"🟡 *Binance:*\n`{settings.get('binance_address', 'No configurado')}`\n\n"
             f"📤 *Contacto:* @{settings.get('payment_contact', 'No configurado')}\n\n"
-            f"🅿️ *PayPal:* `{settings.get('paypal_data', 'No configurado')}`\n\n"
             f"🔥 *Link VIP:* `{vip_link_status}`\n\n"
             f"Los usuarios verán el botón 'Entrar al VIP' en la información de pago.",
             parse_mode="Markdown"
@@ -6530,7 +6496,7 @@ CALLBACK_PREFIXES = [
     ("vip_enter_", lambda u, c, d: vip_enter_callback(u, c, int(d.replace("vip_enter_", "")))),
     ("vip_pay_", lambda u, c, d: vip_pay_callback(u, c, int(d.replace("vip_pay_", "")))),
     ("vip_spin_", lambda u, c, d: vip_spin_callback(u, c, int(d.replace("vip_spin_", "")))),
-    ("cfg_deuna_", lambda u, c, d: cfg_deuna_request(u, c, int(d.replace("cfg_deuna_", "")))),
+    ("cfg_binance_", lambda u, c, d: cfg_binance_request(u, c, int(d.replace("cfg_binance_", "")))),
     ("cfg_cart_", lambda u, c, d: cfg_cart_request(u, c, int(d.replace("cfg_cart_", "")))),
     ("list_active", lambda u, c, d: list_active_users(u, c, d)),
 ]
@@ -6693,7 +6659,7 @@ async def main():
     bot_app.add_handler(CommandHandler("configmsg", config_messages_command))
     bot_app.add_handler(CommandHandler("configfuego", config_fuego_command))
     bot_app.add_handler(CommandHandler("info", info_command))
-    bot_app.add_handler(CommandHandler("configdeuna", config_deuna_command))
+    bot_app.add_handler(CommandHandler("configbinance", config_binance_command))
     bot_app.add_handler(CommandHandler("configcart", config_cart_command))
     bot_app.add_handler(CommandHandler("addcombo", addcombo_command))
     bot_app.add_handler(CommandHandler("renewcombo", renewcombo_command))
