@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURACIÓN ====================
 DATABASE_URL = os.getenv("DATABASE_URL")
-SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "5054216496"))
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
 EXTRA_ADMINS = [int(x.strip()) for x in os.getenv("EXTRA_ADMINS", "").split(",") if x.strip()]
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 EC_TZ = ZoneInfo("America/Guayaquil")
