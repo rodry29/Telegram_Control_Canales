@@ -507,7 +507,7 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
         
     if binance_address:
         lines += ["🟡 *Binance Pay / USDT:*", f"`{binance_address}`",
-                   "⚠️ *Verifica la red (BEP20/TRC20/etc.) antes de enviar.*", ""]
+                   "⚠️ *Verifica la red (TRC20) antes de enviar.*", ""]
     else:
         lines += ["⚠️ *Dirección de Binance no configurada aún.*",
                   "Contacta al administrador para más información.", ""]
