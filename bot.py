@@ -4339,7 +4339,7 @@ async def cfg_binance_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     group = get_group_by_id(group_id)
     current_link = group.get("settings", {}).get("binance_address", "")
     await query.edit_message_text(
-        f"⚡ *Configurar Link Deuna*\n\nActual: `{current_link or 'No configurado'}`\n\nEnvía el nuevo link (debe empezar con https://).\n\n*Escribe 'cancelar' para salir.*",
+        f"⚡ *Configurar dirección Binance*\n\nActual: `{current_link or 'No configurado'}`\n\nEnvía la nueva dirección.\n\n*Escribe 'cancelar' para salir.*",
         parse_mode="Markdown"
     )
 
