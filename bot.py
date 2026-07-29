@@ -1971,6 +1971,18 @@ class Database:
                 return await cur.fetchone()
         return await self._run(_get)
 
+    async def get_pending_invoice_by_user(self, user_id: int, group_id: int):
+        """Obtiene la factura pendiente más reciente de un usuario para un grupo."""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
+                    SELECT * FROM crypto_invoices 
+                    WHERE user_id=%s AND group_id=%s AND status='pending'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (user_id, group_id))
+                return await cur.fetchone()
+        return await self._run(_get)
+
     async def mark_invoice_paid(self, invoice_id: int):
         async def _upd(conn):
             async with conn.cursor() as cur:
@@ -2421,6 +2433,7 @@ async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
     
+    # Usar data si se pasa por el lambda, sino usar query.data
     raw_data = data if data else query.data
     parts = raw_data.split("_")
     if len(parts) < 5: return
@@ -2434,13 +2447,21 @@ async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAUL
     base_price = cfg['price']
     final_price = round(base_price * (1 - discount_pct / 100), 2)
     
-    amount_base = int(final_price) # Ej: 5 o 7
-    suffix = random.randint(10, 99)
-    total_to_pay = round(final_price + (suffix / 100), 2)
+    expected_amount_base = int(final_price) # Ej: 5 o 7
     
-    # Guardamos el amount_base actual
-    invoice_id = await db.create_crypto_invoice(user_id, group_id, amount_base, total_to_pay, suffix, plan)
+    existing_invoice = await db.get_pending_invoice_by_user(user_id, group_id)
     
+    if existing_invoice:
+        if int(existing_invoice['amount_base']) != expected_amount_base:
+            existing_invoice = None # Al ser None, el código de abajo creará una nueva
+            
+    if not existing_invoice:
+        suffix = random.randint(10, 99)
+        total_to_pay = round(final_price + (suffix / 100), 2)
+        await db.create_crypto_invoice(user_id, group_id, expected_amount_base, total_to_pay, suffix, plan)
+    else:
+        total_to_pay = float(existing_invoice['total_to_pay'])
+        
     group = get_group_by_id(group_id)
     binance_address = group.get("settings", {}).get("binance_address", "")
     
