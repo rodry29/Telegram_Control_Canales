@@ -2417,11 +2417,12 @@ async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, v
     msg = "💳 *Selección de Plan*\n\nElige el plan que deseas pagar. Se generará un monto exacto y único para validar tu pago automáticamente."
     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str = None):
     query = update.callback_query
     await query.answer()
     
-    parts = query.data.split("_")
+    raw_data = data if data else query.data
+    parts = raw_data.split("_")
     if len(parts) < 5: return
     
     group_id = int(parts[2])
