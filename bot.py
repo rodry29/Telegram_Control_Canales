@@ -2334,6 +2334,7 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
         [InlineKeyboardButton("📌 Descripción Canal", callback_data=f"cfg_msg_edit_{group_id}_channel_description")],
         [InlineKeyboardButton("🔥 Menú VIP", callback_data=f"cfg_msg_edit_{group_id}_vip_menu")],
         [InlineKeyboardButton("🤖 Aviso Fuego", callback_data=f"cfg_msg_edit_{group_id}_fuego_notice")],
+        [InlineKeyboardButton("🤖 Contacto Bot Descargas (@)", callback_data=f"cfg_fuego_{group_id}")],
         [InlineKeyboardButton("⏰ Expiración", callback_data=f"cfg_msg_edit_{group_id}_expired")],
         [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 1)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_1")],
         [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 2)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_2")],
@@ -4655,6 +4656,23 @@ async def cfg_cart_request(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         parse_mode="Markdown"
     )
 
+async def cfg_fuego_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    _clear_input_states(context)
+    context.user_data['cfg_field'] = 'fuego_contact'
+    context.user_data['cfg_group_id'] = group_id
+    group = get_group_by_id(group_id)
+    current_fuego = group.get("settings", {}).get("fuego_contact", "")
+    
+    await query.edit_message_text(
+        f"🤖 *Configurar Bot de Descargas (Fuego)*\n\n"
+        f"Actual: `@{current_fuego or 'No configurado'}`\n\n"
+        f"Envía el @username del bot que enviará los archivos.\n\n"
+        f"*Escribe 'cancelar' para salir.*",
+        parse_mode="Markdown"
+    )
+
 async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -4672,7 +4690,17 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Configuración cancelada")
         return
 
-    # ── Deuna ──────────────────────────────────────────────────────────────
+    if field == 'fuego_contact':
+        fuego_username = text.lstrip('@').strip()
+        if not await update_group_settings(group_id, {'fuego_contact': fuego_username}):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            _clear_input_states(context)
+            return
+        _clear_input_states(context)
+        await update.message.reply_text(f"✅ *Bot de descargas configurado:* @{fuego_username}", parse_mode="Markdown")
+        return
+    
+    # ── Binance ──────────────────────────────────────────────────────────────
     if field == 'binance_address':
         if len(text) < 10:
             await update.message.reply_text("❌ Dirección/ID demasiado corto, revísalo.")
@@ -5401,13 +5429,16 @@ async def config_fuego_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not group or group.get("type") != "VIP":
         await update.message.reply_text("❌ Grupo no encontrado o no es VIP")
         return
+        
     fuego_username = context.args[1].lstrip('@').strip()
     if not await update_group_settings(group_id, {'fuego_contact': fuego_username}):
         await update.message.reply_text("❌ Grupo no encontrado")
         return
         
     await update.message.reply_text(
-        f"✅ *Contacto de Fuego configurado*\n\n📋 Grupo: {group['group_name']}\n🤖 Fuego: @{fuego_username}\n\n"
+        f"✅ *Contacto de Fuego configurado*\n\n"
+        f"📋 Grupo: {safe_name(group['group_name'])}\n"
+        f"🤖 Fuego: @{fuego_username}\n\n"
         f"Los usuarios recibirán este contacto cuando soliciten descargas.",
         parse_mode="Markdown"
     )
@@ -6751,6 +6782,7 @@ CALLBACK_PREFIXES = [
     ("vip_spin_", lambda u, c, d: vip_spin_callback(u, c, int(d.replace("vip_spin_", "")))),
     ("cfg_binance_", lambda u, c, d: cfg_binance_request(u, c, int(d.replace("cfg_binance_", "")))),
     ("cfg_cart_", lambda u, c, d: cfg_cart_request(u, c, int(d.replace("cfg_cart_", "")))),
+    ("cfg_fuego_", lambda u, c, d: cfg_fuego_request(u, c, int(d.replace("cfg_fuego_", "")))),
     ("list_active", lambda u, c, d: list_active_users(u, c, d)),
     ("gen_inv_", lambda u, c, d: generate_invoice_callback(u, c, d)),
 ]
