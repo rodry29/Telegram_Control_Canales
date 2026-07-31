@@ -51,6 +51,7 @@ if not DATABASE_URL:
 
 PLANS = {
     "trial":   {"minutes": 1440, "price": 0,   "name": "🎁 Trial"},
+    "referido":{"minutes": 300,  "price": 0,   "name": "🎯 Premio Referido"},
     "semanal": {"days": 7,       "price": 10,  "name": "📅 Semanal (7 días)"},
     "mensual": {"days": 30,      "price": 20,  "name": "📆 Mensual (30 días)"},
     "anual":   {"days": 365,     "price": 150, "name": "🏆 Anual (365 días)"}
@@ -329,17 +330,25 @@ def get_group_plan_config(group_id: int, plan: str) -> dict:
     if not group or not base:
         return base
     settings = group.get("settings", {})
-    if plan == "trial":
-        mins = settings.get("trial_minutes", base.get("minutes", 1440))
+    
+    if plan in ("trial", "referido"):
+        if plan == "trial":
+            mins = settings.get("trial_minutes", base.get("minutes", 1440))
+        else:
+            # Las horas de premio se guardan en settings, ej: 5 horas -> 300 mins
+            hours_cfg = float(settings.get("referral_reward_hours", 5))
+            mins = int(hours_cfg * 60)
+            
         base["minutes"] = mins
         h, m = divmod(mins, 60)
         if h >= 24:
             d = h // 24
-            base["name"] = f"🎁 Trial ({d} día{'s' if d != 1 else ''})"
+            base["name"] = f"🎯 Premio ({d} día{'s' if d != 1 else ''})"
         elif h > 0:
-            base["name"] = f"🎁 Trial ({h}h {m}m)" if m else f"🎁 Trial ({h}h)"
+            base["name"] = f"🎯 Premio ({h}h {m}m)" if m else f"🎯 Premio ({h}h)"
         else:
-            base["name"] = f"🎁 Trial ({m} min)"
+            base["name"] = f"🎯 Premio ({m} min)"
+            
     elif plan in ("semanal", "mensual", "anual"):
         base["days"]  = settings.get(f"duration_{plan}", base.get("days", 7))
         base["price"] = float(settings.get(f"price_{plan}", base.get("price", 10)))
@@ -1076,6 +1085,21 @@ class Database:
                         fuego_notice_message TEXT DEFAULT NULL,
                         expired_message TEXT DEFAULT NULL,
                         updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_referrals (
+                        user_id BIGINT PRIMARY KEY,
+                        referrer_id BIGINT NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS referral_points (
+                        referrer_id BIGINT NOT NULL,
+                        group_id BIGINT NOT NULL,
+                        points INTEGER DEFAULT 0,
+                        PRIMARY KEY (referrer_id, group_id)
                     )
                 """)
                 
@@ -2001,6 +2025,46 @@ class Database:
             async with conn.cursor() as cur:
                 await cur.execute("INSERT INTO processed_txs (tx_id) VALUES (%s) ON CONFLICT DO NOTHING", (tx_id,))
         return await self._run(_log)
+
+    async def set_pending_referral(self, user_id: int, referrer_id: int):
+        async def _set(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    INSERT INTO pending_referrals (user_id, referrer_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET referrer_id = EXCLUDED.referrer_id
+                """, (user_id, referrer_id))
+        await self._run(_set)
+
+    async def check_and_clear_pending_referral(self, user_id: int) -> Optional[int]:
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM pending_referrals WHERE user_id = %s RETURNING referrer_id", (user_id,))
+                row = await cur.fetchone()
+                return row[0] if row else None
+        return await self._run(_get)
+
+    async def process_referral_join(self, referrer_id: int, group_id: int) -> int:
+        async def _upd(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    INSERT INTO referral_points (referrer_id, group_id, points)
+                    VALUES (%s, %s, 1)
+                    ON CONFLICT (referrer_id, group_id) DO UPDATE
+                    SET points = referral_points.points + 1
+                    RETURNING points
+                """, (referrer_id, group_id))
+                row = await cur.fetchone()
+                return row[0] if row else 0
+        return await self._run(_upd)
+
+    async def get_referral_points(self, user_id: int, group_id: int) -> int:
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT points FROM referral_points WHERE referrer_id = %s AND group_id = %s", (user_id, group_id))
+                row = await cur.fetchone()
+                return row[0] if row else 0
+        return await self._run(_get)
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
 scheduler = AsyncIOScheduler()
@@ -2378,8 +2442,37 @@ async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_
     keyboard = [
         [InlineKeyboardButton("🔥 Entrar al VIP", callback_data=f"vip_enter_{vip_group_id}")],
         [spin_btn],
+        [InlineKeyboardButton("🎯 Invitar Amigos (VIP Gratis)", callback_data=f"ref_link_{vip_group_id}")],
         [InlineKeyboardButton("💳 Información de Pago", callback_data=f"vip_pay_{vip_group_id}")]
     ]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def ref_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    group = get_group_by_id(vip_group_id)
+    if not group:
+        await query.edit_message_text("❌ Grupo no encontrado")
+        return
+        
+    goal = group.get("settings", {}).get("referral_goal", 5)
+    ref_hours = group.get("settings", {}).get("referral_reward_hours", 5)
+    points = await db.get_referral_points(user_id, vip_group_id)
+    
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    
+    msg = (
+        f"🎯 *Programa de Referidos - {group['group_name']}*\n\n"
+        f"Invita a tus amigos a unirse al VIP usando tu enlace exclusivo.\n"
+        f"Por cada *{goal}* amigos que se unan, recibirás *{int(ref_hours)} horas de VIP GRATIS*.\n\n"
+        f"🔗 *Tu enlace de invitación:*\n`{link}`\n\n"
+        f"📊 *Tu progreso actual:*\n"
+        f"Amigos unidos: *{points}*\n"
+        f"Meta para recompensa: *{goal}*\n"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 Volver", callback_data=f"channel_vip_{vip_group_id}")]]
     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def vip_enter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
@@ -2506,10 +2599,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not send:
         return
 
-    # Procesar parámetros de inicio (FREE o VIP)
     if update.message and context.args:
         start_param = context.args[0]
-        if start_param.startswith("FREE_"):
+        
+        # NUEVO: Capturar referidos
+        if start_param.startswith("ref_"):
+            try:
+                referrer_id = int(start_param[4:])
+                if referrer_id != update.effective_user.id: # Evitar auto-referidos
+                    await db.set_pending_referral(update.effective_user.id, referrer_id)
+            except ValueError:
+                pass
+        
+        elif start_param.startswith("FREE_"):
             try:
                 free_group_id = int(start_param[5:])  
             except ValueError:
@@ -2532,13 +2634,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-
-
-
-
-
-
-        
         elif start_param.isdigit() or start_param.startswith("-100"):
             group_id = int(start_param)
             group = get_group_by_id(group_id)
@@ -4154,6 +4249,60 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
     allow_access, result_code, end_date = await db.register_user_auto(chat_id, user_id, username, first_name, source)
     
     if allow_access:
+        # === LÓGICA DE REFERIDOS ===
+        pending_referrer = await db.check_and_clear_pending_referral(user_id)
+        if pending_referrer:
+            group = get_group_by_id(chat_id)
+            goal = group.get("settings", {}).get("referral_goal", 5)
+            points = await db.process_referral_join(pending_referrer, chat_id)
+            
+            # 1. Notificar progreso al invitador
+            try:
+                await bot_app.bot.send_message(
+                    pending_referrer,
+                    f"🎉 *¡Nuevo referido unido!*\n\n"
+                    f"👤 *{first_name or 'Nuevo usuario'}* acaba de entrar al VIP con tu enlace.\n\n"
+                    f"📊 *Tu progreso:* {points}/{goal} referidos.",
+                    parse_mode="Markdown"
+                )
+            except Exception: pass
+            
+            # 2. Verificar si alcanzó la meta (acumulativo)
+            if points % goal == 0:
+                ref_user = await db.get_user_by_id(pending_referrer, chat_id)
+                is_active = (ref_user and ref_user.get('status') == 'active' and normalize_dt(ref_user['end_date']) > now_utc())
+                
+                # 3. Otorgar VIP automáticamente (Plan 'referido')
+                await _execute_subscription_flow(
+                    bot_app.bot,
+                    lambda text, **kw: None,
+                    chat_id,
+                    pending_referrer,
+                    "referido",
+                    custom_price=0,
+                    is_renewal=is_active
+                )
+                
+                ref_hours = group.get("settings", {}).get("referral_reward_hours", 5)
+                try:
+                    await bot_app.bot.send_message(
+                        pending_referrer,
+                        f"🏆 *¡META ALCANZADA!*\n\n"
+                        f"¡Felicidades! Has invitado a {goal} personas.\n"
+                        f"🎁 *Recompensa:* {int(ref_hours)} horas de VIP agregadas a tu cuenta.",
+                        parse_mode="Markdown"
+                    )
+                except Exception: pass
+                
+                await _safe_send(
+                    group["admin_id"],
+                    f"🏆 *Recompensa de Referidos Otorgada*\n\n"
+                    f"👤 Usuario: `{pending_referrer}`\n"
+                    f"🎁 Premio: {int(ref_hours)} horas VIP\n"
+                    f"📊 Total referidos: {points}",
+                    parse_mode="Markdown"
+                )
+
         if result_code == "trial_nuevo":
             cfg_t = get_group_plan_config(chat_id, "trial")
             trial_str = fmt_minutes(cfg_t.get('minutes', 1440))
@@ -4503,7 +4652,8 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     trial_str = fmt_minutes(cfg_trial.get('minutes', 60))
     binance_status = "✅" if group.get("settings", {}).get("binance_address") else "❌"
-    
+    ref_goal = group.get("settings", {}).get("referral_goal", 5)
+    ref_hours = group.get("settings", {}).get("referral_reward_hours", 5)
     keyboard = [
         [InlineKeyboardButton(f"⏱ Trial: {trial_str}", callback_data=f"cfg_trial_{group_id}")],
         [
@@ -4521,6 +4671,8 @@ async def menu_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("🟡 Datos de Pago (USDT)", callback_data=f"cfg_payment_{group_id}")],
         [InlineKeyboardButton(f"🟡 Dirección Binance ({binance_status})", callback_data=f"cfg_binance_{group_id}")],
         [InlineKeyboardButton("🔔 Configurar Avisos", callback_data=f"cfg_warnings_{group_id}")],
+        [InlineKeyboardButton(f"🎯 Meta Referidos: {ref_goal}", callback_data=f"cfg_refgoal_{group_id}")],
+        [InlineKeyboardButton(f"⏱ Horas Premio Referidos: {int(ref_hours)}h", callback_data=f"cfg_refhours_{group_id}")],
     ]
     if group.get("type", "VIP") == "VIP":
         linked_com = group.get("settings", {}).get("linked_comunidad_group_id")
@@ -4699,7 +4851,48 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _clear_input_states(context)
         await update.message.reply_text(f"✅ *Bot de descargas configurado:* @{fuego_username}", parse_mode="Markdown")
         return
-    
+
+    if field == 'referral_goal':
+        try:
+            value = int(text)
+            if value <= 0: raise ValueError
+            if not await update_group_settings(group_id, {'referral_goal': value}):
+                await update.message.reply_text("❌ Grupo no encontrado"); _clear_input_states(context); return
+            _clear_input_states(context)
+            await update.message.reply_text(f"✅ *Meta de referidos configurada a {value} personas.*", parse_mode="Markdown")
+            return
+        except ValueError:
+            await update.message.reply_text("❌ Debe ser un número entero positivo.")
+            return
+
+    if field == 'referral_reward_hours':
+        try:
+            value = int(float(text))
+            if value <= 0: raise ValueError
+            if not await update_group_settings(group_id, {'referral_reward_hours': value}):
+                await update.message.reply_text("❌ Grupo no encontrado"); _clear_input_states(context); return
+            _clear_input_states(context)
+            await update.message.reply_text(f"✅ *Horas de premio configuradas a {value} horas.*", parse_mode="Markdown")
+            return
+        except ValueError:
+            await update.message.reply_text("❌ Debe ser un número entero positivo.")
+            return
+
+async def cfg_refgoal_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    _clear_input_states(context)
+    context.user_data['cfg_field'] = 'referral_goal'
+    context.user_data['cfg_group_id'] = group_id
+    await query.edit_message_text("🎯 *Meta de Referidos*\n\nEnvía el número de personas requeridas para dar el premio (ej: `5`).\n\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
+
+async def cfg_refhours_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    _clear_input_states(context)
+    context.user_data['cfg_field'] = 'referral_reward_hours'
+    context.user_data['cfg_group_id'] = group_id
+    await query.edit_message_text("⏱ *Horas de Premio por Referidos*\n\nEnvía cuántas horas de VIP se otorgarán al alcanzar la meta (ej: `5`, `24`).\n\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
     # ── Binance ──────────────────────────────────────────────────────────────
     if field == 'binance_address':
         if len(text) < 10:
@@ -6785,6 +6978,9 @@ CALLBACK_PREFIXES = [
     ("cfg_fuego_", lambda u, c, d: cfg_fuego_request(u, c, int(d.replace("cfg_fuego_", "")))),
     ("list_active", lambda u, c, d: list_active_users(u, c, d)),
     ("gen_inv_", lambda u, c, d: generate_invoice_callback(u, c, d)),
+    ("cfg_refgoal_", lambda u, c, d: cfg_refgoal_request(u, c, int(d.replace("cfg_refgoal_", "")))),
+    ("cfg_refhours_", lambda u, c, d: cfg_refhours_request(u, c, int(d.replace("cfg_refhours_", "")))),
+    ("ref_link_", lambda u, c, d: ref_link_callback(u, c, int(d.replace("ref_link_", "")))),
 ]
 async def show_channel_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_group_id: int):
     query = update.callback_query
