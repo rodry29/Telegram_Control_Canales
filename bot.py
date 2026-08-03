@@ -186,7 +186,46 @@ async def check_crypto_payments():
                                     f"📦 Plan: {invoice['plan']}\n"
                                     f"❌ El precio actual es ${current_expected_base}. Revisa si pagó una tarifa antigua.")
                         else:
+                            # 1. Marcar la TX como procesada para no evaluarla de nuevo
                             await db.log_processed_tx(tx_id)
+                            
+                            # 2. Notificar a los administradores del pago huérfano
+                            admin_ids_to_notify = {SUPER_ADMIN_ID}
+                            for gid in group_ids:
+                                g_obj = get_group_by_id(gid)
+                                if g_obj and g_obj.get("admin_id"):
+                                    admin_ids_to_notify.add(g_obj["admin_id"])
+                            
+                            # Intentar obtener quién envió el pago (dirección TRON)
+                            sender_address = "Desconocido"
+                            try:
+                                sender_address = tx.get("from", "Desconocido")
+                            except Exception:
+                                pass
+                                
+                            alert_msg = (
+                                f"⚠️ *PAGO RECIBIDO SIN FACTURA ASOCIADA*\n\n"
+                                f"Se detectó un pago entrante pero no coincide con ninguna factura pendiente.\n\n"
+                                f"💰 *Monto recibido:* `${amount_full:.2f}` USDT\n"
+                                f"🔗 *Red:* TRC20\n"
+                                f"📤 *De (Wallet):* `{sender_address}`\n"
+                                f"📥 *A (Wallet):* `{address}`\n"
+                                f"🆔 *TXID:* `{tx_id}`\n\n"
+                                f"💡 *Acción requerida:*\n"
+                                f"Revisa si un cliente te escribió diciendo que pagó. Si es así, búscalo por su ID y actívalo manualmente con:\n"
+                                f"`/add ID_DE_TELEGRAM plan vip`"
+                            )
+                            
+                            for admin_id in admin_ids_to_notify:
+                                try:
+                                    await bot_app.bot.send_message(
+                                        admin_id, 
+                                        alert_msg, 
+                                        parse_mode="Markdown",
+                                        disable_web_page_preview=True
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"No se pudo enviar alerta de pago huérfano a {admin_id}: {e}")
                             
                     except Exception as e:
                         logger.error(f"Error procesando TX de cripto: {e}")
