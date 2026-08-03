@@ -107,17 +107,19 @@ async def check_crypto_payments():
     if not bot_app: return
     
     groups_snapshot = get_all_groups_snapshot()
-    addresses_to_check = set()
+    address_to_groups: Dict[str, List[int]] = {}
     for g in groups_snapshot:
         addr = g.get("settings", {}).get("binance_address")
         if addr:
-            addresses_to_check.add(addr)
+            if addr not in address_to_groups:
+                address_to_groups[addr] = []
+            address_to_groups[addr].append(g["group_id"])
             
-    if not addresses_to_check:
+    if not address_to_groups:
         return
 
     async with aiohttp.ClientSession() as session:
-        for address in addresses_to_check:
+        for address, group_ids in address_to_groups.items():
             try:
                 url = TRONGRID_API.format(address=address)
                 params = {"limit": 20, "only_to": "true", "contract_address": USDT_CONTRACT}
@@ -134,7 +136,7 @@ async def check_crypto_payments():
                         amount_full = int(value_str) / 1_000_000.0
                         amount_rounded = round(amount_full, 2)
                         
-                        invoice = await db.get_pending_invoice_by_amount(amount_rounded)
+                        invoice = await db.get_pending_invoice_by_amount(amount_rounded, group_ids)
                         
                         if invoice:
                             await db.mark_invoice_paid(invoice['id'])
@@ -1984,14 +1986,21 @@ class Database:
                 return (await cur.fetchone())[0]
         return await self._run(_create)
 
-    async def get_pending_invoice_by_amount(self, total_to_pay: float):
+    async def get_pending_invoice_by_amount(self, total_to_pay: float, group_ids: List[int] = None):
         async def _get(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute("""
-                    SELECT * FROM crypto_invoices 
-                    WHERE total_to_pay=%s AND status='pending'
-                    ORDER BY created_at ASC LIMIT 1
-                """, (total_to_pay,))
+                if group_ids:
+                    await cur.execute("""
+                        SELECT * FROM crypto_invoices 
+                        WHERE total_to_pay=%s AND status='pending' AND group_id = ANY(%s)
+                        ORDER BY created_at ASC LIMIT 1
+                    """, (total_to_pay, group_ids))
+                else:
+                    await cur.execute("""
+                        SELECT * FROM crypto_invoices 
+                        WHERE total_to_pay=%s AND status='pending'
+                        ORDER BY created_at ASC LIMIT 1
+                    """, (total_to_pay,))
                 return await cur.fetchone()
         return await self._run(_get)
 
