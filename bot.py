@@ -153,10 +153,8 @@ async def check_crypto_payments():
                             
                             current_expected_base = int(current_base_price * (1 - discount_pct / 100))
                             
-                            # VALIDACIÓN CRUZADA
                             if int(invoice['amount_base']) == current_expected_base:
-                                # El precio base pagado coincide con el precio actual. ¡Activar!
-                                custom_price = round(current_base_price * (1 - discount_pct / 100), 2)
+                                custom_price = float(invoice['amount_base'])
                                 
                                 if discount_pct > 0:
                                     await db.mark_discount_used(invoice['user_id'], invoice['group_id'], invoice['plan'])
@@ -2519,11 +2517,12 @@ async def vip_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, v
         cfg = get_group_plan_config(vip_group_id, plan)
         base_price = cfg['price']
         final_price = base_price * (1 - discount_pct / 100)
+        expected_base = int(final_price)
         
         if discount_pct > 0:
-            text = f"{_plan_emoji(plan)} {plan.capitalize()} - ${final_price:.2f} (Descuento aplicado)"
+            text = f"{_plan_emoji(plan)} {plan.capitalize()} - ${expected_base}.XX (Descuento aplicado)"
         else:
-            text = f"{_plan_emoji(plan)} {plan.capitalize()} - ${final_price:.2f}"
+            text = f"{_plan_emoji(plan)} {plan.capitalize()} - ${expected_base}.XX"
             
         keyboard.append([InlineKeyboardButton(text, callback_data=f"gen_inv_{vip_group_id}_{plan}_{discount_pct}")])
     
@@ -2548,19 +2547,19 @@ async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAUL
     
     cfg = get_group_plan_config(group_id, plan)
     base_price = cfg['price']
-    final_price = round(base_price * (1 - discount_pct / 100), 2)
+    final_price = base_price * (1 - discount_pct / 100)
     
-    expected_amount_base = int(final_price) # Ej: 5 o 7
+    expected_amount_base = int(final_price)
     
     existing_invoice = await db.get_pending_invoice_by_user(user_id, group_id)
     
     if existing_invoice:
         if int(existing_invoice['amount_base']) != expected_amount_base:
-            existing_invoice = None # Al ser None, el código de abajo creará una nueva
+            existing_invoice = None
             
     if not existing_invoice:
         suffix = random.randint(10, 99)
-        total_to_pay = round(final_price + (suffix / 100), 2)
+        total_to_pay = round(expected_amount_base + (suffix / 100), 2)
         await db.create_crypto_invoice(user_id, group_id, expected_amount_base, total_to_pay, suffix, plan)
     else:
         total_to_pay = float(existing_invoice['total_to_pay'])
