@@ -819,11 +819,6 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
 
     if success:
         try:
-            await _mark_discount_if_any(target_user_id, group_id, plan)
-        except Exception as e:
-            logger.warning(f"Error al marcar descuento para {target_user_id}: {e}")
-        
-        try:
             await db.reset_rejoin_state(target_user_id, group_id)
         except Exception as e:
             logger.warning(f"Error al resetear rejoin_state para {target_user_id}: {e}")
@@ -832,6 +827,12 @@ async def _execute_subscription_flow(bot, reply_func, group_id: int, target_user
             await _send_subscription_notification(bot, target_user_id, group_id, plan, is_renewal=is_renewal)
         except Exception as e:
             logger.warning(f"Error al enviar notificación a {target_user_id}: {e}")
+
+        try:
+            await _mark_discount_if_any(target_user_id, group_id, plan, custom_price)
+        except Exception as e:
+            logger.warning(f"Error al marcar descuento para {target_user_id}: {e}")
+
 
 async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, target_user_id: int, plan: str,
                                             custom_price: float = None, custom_days: int = None, is_renewal: bool = False):
@@ -911,7 +912,7 @@ async def _execute_combo_subscription_flow(bot, reply_func, vip_group_id: int, t
                 # La ruleta solo se marca en el grupo VIP
                 if gid == vip_group_id:
                     try:
-                        await _mark_discount_if_any(target_user_id, gid, plan)
+                        await _mark_discount_if_any(target_user_id, gid, plan, final_price)
                     except Exception as e:
                         logger.warning(f"_mark_discount_if_any falló en combo para {target_user_id}/{gid}: {e}")
         
@@ -2595,10 +2596,14 @@ async def vip_enter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.answer("❌ El admin no ha configurado el enlace de invitación VIP", show_alert=True)
         await _safe_send(vip["admin_id"], f"⚠️ Un usuario intentó entrar al VIP pero no hay link configurado. Configúralo con /configpago {vip_group_id}")
         return
+    
+    cfg_trial = get_group_plan_config(vip_group_id, "trial")
+    trial_str = fmt_minutes(cfg_trial.get('minutes', 1440))
+    
     await query.edit_message_text(
         f"🔥 *Enlace de invitación al VIP*\n\n"
         f"Únete ahora: [Click aquí]({vip_link})\n\n"
-        f"⚠️ *Recuerda:* Al entrar al grupo VIP, el bot te otorgará tu prueba de 1 hora automáticamente.",
+        f"⚠️ *Recuerda:* Al entrar al grupo VIP, el bot te otorgará tu prueba de *{trial_str}* automáticamente.",
         parse_mode="Markdown",
         disable_web_page_preview=True
     )
@@ -3326,11 +3331,32 @@ async def renewcombo_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _execute_combo_subscription_flow(context.bot, update.message.reply_text, current_group, target_user_id, plan, custom_price, custom_days, is_renewal=True)
 
 # ==================== HANDLER PARA REPLY CON /add ====================
-async def _mark_discount_if_any(target_user_id: int, current_group: int, plan: str):
-    """Verifica si el usuario tenía un descuento de ruleta sin usar y lo marca como usado."""
+async def _mark_discount_if_any(target_user_id: int, current_group: int, plan: str, custom_price: float = None):
+    """Verifica si el usuario tenía un descuento de ruleta sin usar y lo marca como usado SOLO si el precio pagado coincide con el descuento."""
     spin_data = await db.get_spin_data(target_user_id, current_group)
-    if spin_data and not spin_data.get("used") and spin_data.get("spin_count", 0) > 0:
+    if not spin_data or spin_data.get("used") or spin_data.get("spin_count", 0) == 0:
+        return
+        
+    if not is_discount_active(spin_data):
+        return
+        
+    best_discount = spin_data.get("best_discount", 0)
+    if best_discount <= 0:
+        return
+        
+    cfg = get_group_plan_config(current_group, plan)
+    base_price = cfg.get('price', 0)
+    expected_discounted_price = round(base_price * (1 - best_discount / 100), 2)
+    
+    if custom_price is None or custom_price == 0:
+        logger.info(f"Descuento NO consumido para {target_user_id} en {current_group}: no se aplicó precio con descuento (custom_price={custom_price}).")
+        return
+        
+    if abs(float(custom_price) - expected_discounted_price) < 0.01:
         await db.mark_discount_used(target_user_id, current_group, plan)
+        logger.info(f"Descuento de {best_discount}% consumido correctamente para {target_user_id} en {current_group}.")
+    else:
+        logger.warning(f"Descuento NO consumido para {target_user_id}: esperado ${expected_discounted_price}, cobrado ${custom_price}.")
 
 async def _send_subscription_notification(bot, target_user_id: int, current_group: int, plan: str, is_renewal: bool):
     """Envía un mensaje de confirmación al usuario dependiendo de si es activación o renovación."""
@@ -6920,6 +6946,27 @@ async def process_no_spin_reminders():
         except Exception as e:
             logger.warning(f"Reminder no-spin falló para {u['user_id']}: {e}")
 
+async def process_expired_crypto_invoices():
+    """Caduca facturas de cripto que llevan más de 2 horas sin pago."""
+    if not bot_app: return
+    
+    threshold = now_utc() - timedelta(hours=2)
+    
+    async def _expire(conn):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE crypto_invoices SET status='expired' WHERE status='pending' AND created_at <= %s",
+                (threshold,)
+            )
+            return cur.rowcount
+            
+    try:
+        expired_count = await db._run(_expire)
+        if expired_count > 0:
+            logger.info(f"⏰ {expired_count} facturas de cripto caducadas automáticamente.")
+    except Exception as e:
+        logger.error(f"Error caducando facturas de cripto: {e}")
+
 async def check_expired_subscriptions():
     if not bot_app: return
     logger.info("🔍 Verificando suscripciones y trials expirados...")
@@ -7292,6 +7339,7 @@ async def main():
     scheduler.add_job(process_discount_expiration_reminders, 'interval', minutes=15, id='discount_reminders', replace_existing=True)
     scheduler.add_job(process_no_spin_reminders, 'interval', minutes=10, id='no_spin_reminders', replace_existing=True)
     scheduler.add_job(check_crypto_payments, 'interval', minutes=1, id='check_crypto', replace_existing=True)
+    scheduler.add_job(process_expired_crypto_invoices, 'interval', minutes=30, id='expire_crypto_invoices', replace_existing=True)
     scheduler.start()
 
     logger.info("🤖 Bot iniciado")
