@@ -17,7 +17,7 @@ import aiohttp
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError, BadRequest, RetryAfter
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters, ChatMemberHandler,
@@ -6752,24 +6752,47 @@ async def execute_broadcast(bot, group_id: int, filter_type: str, message_text: 
                 "username": user.get('username', '')
             })
 
-            try:
-                await bot.send_message(
-                    user_id, personalized,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-                success_count += 1
-            except Exception:
-                # Fallback: si falla el Markdown (a pesar del safe_name), 
-                # intenta enviarlo como texto plano sin parse_mode
+            sent_successfully = False
+            
+            # Bucle de reintento para manejar el Flood Control (RetryAfter)
+            for attempt in range(3):
                 try:
                     await bot.send_message(
                         user_id, personalized,
+                        parse_mode="Markdown",
                         disable_web_page_preview=True,
                     )
-                    success_count += 1
+                    sent_successfully = True
+                    break # Éxito, salimos del bucle
+                    
+                except RetryAfter as e:
+                    logger.warning(f"⏳ Flood control en broadcast: esperando {e.retry_after}s para usuario {user_id}")
+                    await asyncio.sleep(e.retry_after + 1) # +1s de margen de seguridad
+                    
+                except BadRequest:
+                    # Si falla por Markdown inválido, intentamos sin parse_mode
+                    try:
+                        await bot.send_message(
+                            user_id, personalized,
+                            disable_web_page_preview=True,
+                        )
+                        sent_successfully = True
+                    except RetryAfter as e:
+                        logger.warning(f"⏳ Flood control (texto plano): esperando {e.retry_after}s para {user_id}")
+                        await asyncio.sleep(e.retry_after + 1)
+                    except Exception:
+                        pass # Falló definitivamente
+                    break # Salimos del bucle sea exitoso o fallido
+                    
                 except Exception:
-                    fail_count += 1
+                    # Cualquier otro error (ej. bot bloqueado por el usuario)
+                    break 
+
+            if sent_successfully:
+                success_count += 1
+            else:
+                fail_count += 1
+                
             processed += 1
     
     chunk_size = 100
