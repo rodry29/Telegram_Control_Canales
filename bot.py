@@ -4878,21 +4878,6 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Debe ser un número entero positivo.")
             return
 
-async def cfg_refgoal_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    query = update.callback_query
-    await query.answer()
-    _clear_input_states(context)
-    context.user_data['cfg_field'] = 'referral_goal'
-    context.user_data['cfg_group_id'] = group_id
-    await query.edit_message_text("🎯 *Meta de Referidos*\n\nEnvía el número de personas requeridas para dar el premio (ej: `5`).\n\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
-
-async def cfg_refhours_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
-    query = update.callback_query
-    await query.answer()
-    _clear_input_states(context)
-    context.user_data['cfg_field'] = 'referral_reward_hours'
-    context.user_data['cfg_group_id'] = group_id
-    await query.edit_message_text("⏱ *Horas de Premio por Referidos*\n\nEnvía cuántas horas de VIP se otorgarán al alcanzar la meta (ej: `5`, `24`).\n\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
     # ── Binance ──────────────────────────────────────────────────────────────
     if field == 'binance_address':
         if len(text) < 10:
@@ -4961,6 +4946,26 @@ async def cfg_refhours_request(update: Update, context: ContextTypes.DEFAULT_TYP
         label = labels.get(field, f"{field}: *{value}*")
     await update.message.reply_text(f"✅ *Configuración actualizada*\n\n• {label}", parse_mode="Markdown")
 
+async def cfg_refgoal_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    _clear_input_states(context)
+    context.user_data['cfg_field'] = 'referral_goal'
+    context.user_data['cfg_group_id'] = group_id
+    await query.edit_message_text("🎯 *Meta de Referidos*\n\nEnvía el número de personas requeridas para dar el premio (ej: `5`).\n\n*Escribe 'cancelar' para cancelar.*", parse_mode="Markdown")
+
+async def cfg_refhours_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    _clear_input_states(context)
+    context.user_data['cfg_field'] = 'referral_reward_hours'
+    context.user_data['cfg_group_id'] = group_id
+    await query.edit_message_text(
+        "⏱ *Horas de Premio por Referidos*\n\n"
+        "Envía cuántas horas de VIP se otorgarán al alcanzar la meta (ej: `5`, `24`).\n\n"
+        "*Escribe 'cancelar' para cancelar.*",
+        parse_mode="Markdown"
+    )
 async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID and update.effective_user.id not in EXTRA_ADMINS:
         await update.message.reply_text("❌ Solo Super Admin")
