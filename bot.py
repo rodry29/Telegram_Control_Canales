@@ -1390,9 +1390,70 @@ class Database:
         config = get_group_plan_config(group_id, plan)
         effective_price = custom_price if custom_price is not None else config.get('price', 0)
         effective_days = custom_days if custom_days is not None else config.get('days', 7)
-        if plan == "trial":
-            effective_mins = config.get('minutes', 1440)
+        # FIX: 'referido' también usa minutos, no days
+        if plan in ("trial", "referido"):
+            effective_mins = config.get('minutes', 1440 if plan == "trial" else 300)
         now = datetime.now(ZoneInfo("UTC"))
+
+        async def _upsert(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                if is_id:
+                    await cur.execute("SELECT * FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (int(identifier), group_id))
+                else:
+                    await cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s FOR UPDATE", (identifier, group_id))
+                existing = await cur.fetchone()
+                if not existing:
+                    return False, f"❌ No tengo registro de {'ID ' + identifier if is_id else '@' + identifier}. Pídele que envíe un mensaje al bot."
+                if plan == "trial" and existing.get('trial_used'):
+                    return False, "❌ Este usuario ya usó su prueba gratuita"
+                existing_end = normalize_dt(existing['end_date'])
+                if mode == "renew" and existing['status'] == 'active' and existing_end > now:
+                    base_date = existing_end
+                    action = "RENOVADO"
+                else:
+                    base_date = now
+                    action = "REACTIVADO" if existing['status'] != 'active' else "ACTIVADO"
+                
+                # FIX: 'referido' usa minutos
+                if plan in ("trial", "referido"):
+                    end_date = base_date + timedelta(minutes=effective_mins)
+                    dur_minutes = effective_mins
+                    expiry_str = fmt_dt(end_date)
+                else:
+                    end_date = base_date + timedelta(days=effective_days)
+                    dur_minutes = effective_days * 1440
+                    expiry_str = fmt_dt(end_date, include_time=False)
+                    
+                fn = first_name or existing.get('first_name', '') or ''
+                uname = existing.get('username', f"user_{existing['user_id']}")
+                
+                # FIX: Si recibe horas de referido pero tiene plan de pago activo, NO sobreescribir el plan
+                final_plan = plan
+                if plan == "referido" and existing.get('plan') in ('semanal', 'mensual', 'anual'):
+                    final_plan = existing['plan']
+                
+                await cur.execute("""
+                    UPDATE users SET plan=%s, start_date=%s, end_date=%s, status='active', updated_at=NOW(),
+                        first_name=%s, username=%s, trial_used = trial_used OR %s, kicked_at = NULL
+                    WHERE user_id=%s AND group_id=%s
+                """, (final_plan, now if mode == "add" else existing['start_date'], end_date, fn, uname, plan == "trial", existing['user_id'], group_id))
+                await cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (existing['user_id'], group_id))
+                await cur.execute("""
+                    INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (existing['user_id'], group_id, uname, fn, plan, effective_price, dur_minutes, now))
+                
+                payload = json.dumps({
+                    "user_id": existing['user_id'], 
+                    "group_id": group_id, 
+                    "plan": final_plan
+                })
+                await cur.execute("SELECT pg_notify('vip_cache_invalidation', %s)", (payload,))
+
+                price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
+                display = fn if fn else uname
+                return True, f"✅ *{display}* {action}\n📋 Plan: {final_plan} | 💰 {price_str}\n📅 Expira: {expiry_str}"
+        return await self._run(_upsert)
 
         async def _upsert(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -3851,7 +3912,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         admin_id = int(row[3])
                     except (ValueError, IndexError):
                         continue
-                    if group_type not in ("VIP", "FREE"):
+                    if group_type not in ("VIP", "FREE", "COMUNIDAD"):
                         continue
                     existing = get_group_by_id(group_id)
                     if existing:
