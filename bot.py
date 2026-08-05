@@ -4,7 +4,6 @@ import asyncio
 import logging
 import re
 import json
-import threading
 import random
 import time as _time
 from io import StringIO
@@ -70,9 +69,7 @@ UNMUTE_PERMISSIONS = ChatPermissions(
 )
 GROUPS_CONFIG = os.getenv("GROUPS_CONFIG", "")
 GROUPS: Dict[int, Dict[str, Any]] = {}
-GROUPS_LOCK = threading.RLock()
 GROUP_MESSAGES_CACHE: Dict[int, dict] = {}
-GROUP_MESSAGES_LOCK = threading.RLock()
 
 for _group_config in GROUPS_CONFIG.split(","):
     if _group_config.strip():
@@ -118,6 +115,8 @@ async def check_crypto_payments():
     if not address_to_groups:
         return
 
+    request_timeout = aiohttp.ClientTimeout(total=30, connect=10)
+
     async with aiohttp.ClientSession() as session:
         for address, group_ids in address_to_groups.items():
             try:
@@ -153,7 +152,7 @@ async def check_crypto_payments():
                             
                             current_expected_base = int(current_base_price * (1 - discount_pct / 100))
                             
-                            if int(invoice['amount_base']) == current_expected_base:
+                            if abs(float(invoice['amount_base']) - current_expected_base) < 0.001:
                                 custom_price = float(invoice['amount_base'])
                                 
                                 if discount_pct > 0:
@@ -278,39 +277,39 @@ async def update_group_settings(group_id: int, changes: dict) -> bool:
     """Único punto autorizado para mutar settings. Maneja RAM, DB y caché automáticamente."""
     PRICE_FIELDS = {
         "trial_minutes",
+        "referral_reward_hours",
+        "referral_goal", 
         "price_semanal", "price_mensual", "price_anual",
         "duration_semanal", "duration_mensual", "duration_anual",
         "combo_price_semanal", "combo_price_mensual", "combo_price_anual",
     }
-    with GROUPS_LOCK:
-        group = GROUPS.get(group_id)
-        if not group:
-            return False
-        settings = dict(group.get("settings", {}))
-        for k, v in changes.items():
-            if v is None:
-                settings.pop(k, None)
-            else:
-                settings[k] = v
-        group["settings"] = settings
-        
+ 
+    group = GROUPS.get(group_id)
+    if not group:
+        return False
+    settings = dict(group.get("settings", {}))
+    for k, v in changes.items():
+        if v is None:
+            settings.pop(k, None)
+        else:
+            settings[k] = v
+    group["settings"] = settings
+
     await db.update_group_fields(group_id, {'settings': settings})
-    
-    # Invalidar caché SOLO si se modificó un campo que afecta precios/duraciones
-    if any(k in PRICE_FIELDS for k in changes):
+
+    # Invalidar caché SOLO si se modificó un campo que afecta plan config
+    if any(k in CACHE_INVALIDATING_FIELDS for k in changes):
         _invalidate_price_cache(group_id)
     return True
 
 # ==================== UTILIDADES ====================
 def get_group_by_id(group_id: int) -> Optional[dict]:
-    with GROUPS_LOCK:
-        return GROUPS.get(group_id)
+    return GROUPS.get(group_id)
 
 def find_group_by_admin_and_type(admin_id: int, group_type: str) -> Optional[dict]:
-    with GROUPS_LOCK:
-        for g in GROUPS.values():
-            if g.get("type", "VIP") == group_type and g["admin_id"] == admin_id:
-                return g
+    for g in GROUPS.values():
+        if g.get("type", "VIP") == group_type and g["admin_id"] == admin_id:
+            return g
     return None
 
 def find_linked_or_admin_group(start_group: dict, target_type: str) -> Optional[dict]:
@@ -328,15 +327,16 @@ def find_linked_or_admin_group(start_group: dict, target_type: str) -> Optional[
     return find_group_by_admin_and_type(start_group["admin_id"], target_type)
 
 def get_all_groups_snapshot() -> List[Dict[str, Any]]:
-    with GROUPS_LOCK:
-        return list(GROUPS.values())
+    return list(GROUPS.values())
 
 def get_groups_by_admin(admin_id: int, group_type: str = None) -> list:
-    with GROUPS_LOCK:
-        groups = list(GROUPS.values()) if admin_id == SUPER_ADMIN_ID or admin_id in EXTRA_ADMINS else [g for g in GROUPS.values() if g["admin_id"] == admin_id]
-        if group_type:
-            groups = [g for g in groups if g.get("type", "VIP") == group_type]
-        return groups
+    if admin_id == SUPER_ADMIN_ID or admin_id in EXTRA_ADMINS:
+        groups = list(GROUPS.values())
+    else:
+        groups = [g for g in GROUPS.values() if g["admin_id"] == admin_id]
+    if group_type:
+        groups = [g for g in groups if g.get("type", "VIP") == group_type]
+    return groups
 
 def can_manage_group(user_id: int, group_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID or user_id in EXTRA_ADMINS:
@@ -420,15 +420,6 @@ def get_discount_status(spin_data: dict) -> str:
 def fmt_price(amount) -> str:
     f = float(amount)
     return f"${f:.2f}" if f != int(f) else f"${int(f)}"
-
-def escape_md_v2(text: str) -> str:
-    """Escapa caracteres especiales de MarkdownV2 para Telegram."""
-    if not text:
-        return ""
-    chars = r'_*[]()~`>#+-=|{}.!'
-    for ch in chars:
-        text = text.replace(ch, '\\' + ch)
-    return text
 
 def safe_name(text: str) -> str:
     """Sanitiza texto para Markdown v1 (parse_mode='Markdown')."""
@@ -1211,12 +1202,10 @@ class Database:
                 
                 # 2. SEGUNDO: Crear los índices (ahora las columnas ya existen garantizadamente)
                 for idx_sql in [
-                    "CREATE INDEX IF NOT EXISTS idx_discount_spins_user ON discount_spins(user_id, group_id)",
                     "CREATE INDEX IF NOT EXISTS idx_warning_logs_lookup ON warning_logs(user_id, group_id, warning_type)",
                     "CREATE INDEX IF NOT EXISTS idx_warning_logs_group ON warning_logs(group_id, sent_at)",
                     "CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id, status)",
                     "CREATE INDEX IF NOT EXISTS idx_users_end_date ON users(group_id, end_date)",
-                    "CREATE INDEX IF NOT EXISTS idx_users_uid_gid ON users(user_id, group_id)",
                     "CREATE INDEX IF NOT EXISTS idx_payments_group ON payments(group_id, payment_date)",
                     "CREATE INDEX IF NOT EXISTS idx_broadcast_logs_group ON broadcast_logs(group_id, sent_at)",
                     "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
@@ -1264,12 +1253,11 @@ class Database:
                 return await cur.fetchall()
         rows = await self._run(_load)
         if rows:
-            with GROUPS_LOCK:
-                GROUPS.clear()
-                for g in rows:
-                    settings = g["settings"] if isinstance(g["settings"], dict) else {}
-                    GROUPS[g["group_id"]] = {"group_id": g["group_id"], "group_name": g["group_name"],
-                                   "admin_id": g["admin_id"], "type": g["group_type"], "settings": settings}
+            GROUPS.clear()
+            for g in rows:
+                settings = g["settings"] if isinstance(g["settings"], dict) else {}
+                GROUPS[g["group_id"]] = {"group_id": g["group_id"], "group_name": g["group_name"],
+                               "admin_id": g["admin_id"], "type": g["group_type"], "settings": settings}
             logger.info(f"📦 {len(GROUPS)} grupos cargados desde BD")
             return True
         return False
@@ -1280,10 +1268,9 @@ class Database:
                 await cur.execute("SELECT * FROM group_messages")
                 return await cur.fetchall()
         rows = await self._run(_load)
-        with GROUP_MESSAGES_LOCK:
-            GROUP_MESSAGES_CACHE.clear()
-            for r in rows:
-                GROUP_MESSAGES_CACHE[r['group_id']] = dict(r)
+        GROUP_MESSAGES_CACHE.clear()
+        for r in rows:
+            GROUP_MESSAGES_CACHE[r['group_id']] = dict(r)
         logger.info(f"📨 {len(GROUP_MESSAGES_CACHE)} mensajes de grupo cargados en caché")
 
     async def save_group(self, group_id: int, group_name: str, admin_id: int, group_type: str = "VIP"):
@@ -1454,57 +1441,6 @@ class Database:
                 price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
                 display = fn if fn else uname
                 return True, f"✅ *{display}* {action}\n📋 Plan: {final_plan} | 💰 {price_str}\n📅 Expira: {expiry_str}"
-        return await self._run(_upsert)
-
-        async def _upsert(conn):
-            async with conn.cursor(row_factory=dict_row) as cur:
-                if is_id:
-                    await cur.execute("SELECT * FROM users WHERE user_id=%s AND group_id=%s FOR UPDATE", (int(identifier), group_id))
-                else:
-                    await cur.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(%s) AND group_id=%s FOR UPDATE", (identifier, group_id))
-                existing = await cur.fetchone()
-                if not existing:
-                    return False, f"❌ No tengo registro de {'ID ' + identifier if is_id else '@' + identifier}. Pídele que envíe un mensaje al bot."
-                if plan == "trial" and existing.get('trial_used'):
-                    return False, "❌ Este usuario ya usó su prueba gratuita"
-                existing_end = normalize_dt(existing['end_date'])
-                if mode == "renew" and existing['status'] == 'active' and existing_end > now:
-                    base_date = existing_end
-                    action = "RENOVADO"
-                else:
-                    base_date = now
-                    action = "REACTIVADO" if existing['status'] != 'active' else "ACTIVADO"
-                if plan == "trial":
-                    end_date = base_date + timedelta(minutes=effective_mins)
-                    dur_minutes = effective_mins
-                    expiry_str = fmt_dt(end_date)
-                else:
-                    end_date = base_date + timedelta(days=effective_days)
-                    dur_minutes = effective_days * 1440
-                    expiry_str = fmt_dt(end_date, include_time=False)
-                fn = first_name or existing.get('first_name', '') or ''
-                uname = existing.get('username', f"user_{existing['user_id']}")
-                await cur.execute("""
-                    UPDATE users SET plan=%s, start_date=%s, end_date=%s, status='active', updated_at=NOW(),
-                        first_name=%s, username=%s, trial_used = trial_used OR %s, kicked_at = NULL
-                    WHERE user_id=%s AND group_id=%s
-                """, (plan, now if mode == "add" else existing['start_date'], end_date, fn, uname, plan == "trial", existing['user_id'], group_id))
-                await cur.execute("DELETE FROM warning_logs WHERE user_id=%s AND group_id=%s", (existing['user_id'], group_id))
-                await cur.execute("""
-                    INSERT INTO payments (user_id, group_id, username, first_name, plan, amount, duration_minutes, payment_date)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (existing['user_id'], group_id, uname, fn, plan, effective_price, dur_minutes, now))
-                
-                payload = json.dumps({
-                    "user_id": existing['user_id'], 
-                    "group_id": group_id, 
-                    "plan": plan
-                })
-                await cur.execute("SELECT pg_notify('vip_cache_invalidation', %s)", (payload,))
-
-                price_str = fmt_price(effective_price) if effective_price > 0 else "gratis"
-                display = fn if fn else uname
-                return True, f"✅ *{display}* {action}\n📋 Plan: {plan} | 💰 {price_str}\n📅 Expira: {expiry_str}"
         return await self._run(_upsert)
 
     async def add_or_update_user(self, group_id: int, username: str, plan: str, first_name: str = "",
@@ -1906,9 +1842,8 @@ class Database:
         await self._run(_upd)
 
     async def get_group_messages(self, group_id: int) -> Optional[dict]:
-        with GROUP_MESSAGES_LOCK:
-            if group_id in GROUP_MESSAGES_CACHE:
-                return GROUP_MESSAGES_CACHE[group_id]
+        if group_id in GROUP_MESSAGES_CACHE:
+            return GROUP_MESSAGES_CACHE[group_id]
                 
         async def _get(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -1918,8 +1853,7 @@ class Database:
         msg_data = await self._run(_get)
         
         if msg_data:
-            with GROUP_MESSAGES_LOCK:
-                GROUP_MESSAGES_CACHE[group_id] = msg_data
+            GROUP_MESSAGES_CACHE[group_id] = msg_data
         return msg_data
 
     async def save_group_messages(self, group_id: int, welcome_msg: str = None, welcome_buttons: list = None,
@@ -1950,16 +1884,15 @@ class Database:
                       channel_select_msg, channel_desc, vip_menu_msg, fuego_notice_msg, expired_msg))
         await self._run(_save)
         
-        with GROUP_MESSAGES_LOCK:
-            current = GROUP_MESSAGES_CACHE.get(group_id, {})
-            if welcome_msg is not None: current['welcome_message'] = welcome_msg
-            if rejection_msg is not None: current['rejection_message'] = rejection_msg
-            if channel_select_msg is not None: current['channel_select_message'] = channel_select_msg
-            if channel_desc is not None: current['channel_description'] = channel_desc
-            if vip_menu_msg is not None: current['vip_menu_message'] = vip_menu_msg
-            if fuego_notice_msg is not None: current['fuego_notice_message'] = fuego_notice_msg
-            if expired_msg is not None: current['expired_message'] = expired_msg
-            GROUP_MESSAGES_CACHE[group_id] = current
+        current = GROUP_MESSAGES_CACHE.get(group_id, {})
+        if welcome_msg is not None: current['welcome_message'] = welcome_msg
+        if rejection_msg is not None: current['rejection_message'] = rejection_msg
+        if channel_select_msg is not None: current['channel_select_message'] = channel_select_msg
+        if channel_desc is not None: current['channel_description'] = channel_desc
+        if vip_menu_msg is not None: current['vip_menu_message'] = vip_menu_msg
+        if fuego_notice_msg is not None: current['fuego_notice_message'] = fuego_notice_msg
+        if expired_msg is not None: current['expired_message'] = expired_msg
+        GROUP_MESSAGES_CACHE[group_id] = current
 
     _VALID_MSG_COLUMNS = {
         "welcome_message", "rejection_message", "channel_select_message",
@@ -2052,10 +1985,9 @@ class Database:
                 """, (text,))
         await self._run(_save)
         
-        with GROUP_MESSAGES_LOCK:
-            current = GROUP_MESSAGES_CACHE.get(0, {})
-            current[msg_type] = text
-            GROUP_MESSAGES_CACHE[0] = current
+        current = GROUP_MESSAGES_CACHE.get(0, {})
+        current[msg_type] = text
+        GROUP_MESSAGES_CACHE[0] = current
 
     async def get_last_backup_date(self) -> Optional[datetime]:
         async def _get(conn):
@@ -2113,6 +2045,17 @@ class Database:
                     ORDER BY created_at DESC LIMIT 1
                 """, (user_id, group_id))
                 return await cur.fetchone()
+        return await self._run(_get)
+
+    async def get_active_suffixes_for_amount(self, amount_base: float) -> List[int]:
+        """Obtiene los sufijos (fees) en uso para facturas pendientes de un monto base específico."""
+        async def _get(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT unique_suffix FROM crypto_invoices 
+                    WHERE amount_base = %s AND status = 'pending'
+                """, (amount_base,))
+                return [row[0] for row in await cur.fetchall()]
         return await self._run(_get)
 
     async def mark_invoice_paid(self, invoice_id: int):
@@ -2499,7 +2442,6 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
     if not can_manage_group(query.from_user.id, group_id): return
     group = get_group_by_id(group_id)
     if not group: return
-    cart_mins = group.get("settings", {}).get("cart_delay_minutes", 30)
     keyboard = [
         [InlineKeyboardButton("🎉 Bienvenida", callback_data=f"cfg_msg_edit_{group_id}_welcome")],
         [InlineKeyboardButton("🚫 Rechazo", callback_data=f"cfg_msg_edit_{group_id}_rejection")],
@@ -2511,7 +2453,7 @@ async def config_messages_callback(update: Update, context: ContextTypes.DEFAULT
         [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 1)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_1")],
         [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 2)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_2")],
         [InlineKeyboardButton("🛒 Carrito Abandonado (Paso 3)", callback_data=f"cfg_msg_edit_{group_id}_abandoned_3")],
-        [InlineKeyboardButton(f"⏱ Tiempo Carrito ({cart_mins} min)", callback_data=f"cfg_cart_{group_id}")],
+        [InlineKeyboardButton("⏱ Tiempos de Espera Carrito", callback_data=f"cfg_cart_menu_{group_id}")],
         _back_button(f"select_group_{group_id}"),
     ]
     await query.edit_message_text(f"📝 *Configurar Mensajes — {group['group_name']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -2640,7 +2582,6 @@ async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
     
-    # Usar data si se pasa por el lambda, sino usar query.data
     raw_data = data if data else query.data
     parts = raw_data.split("_")
     if len(parts) < 5: return
@@ -2654,33 +2595,74 @@ async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAUL
     base_price = cfg['price']
     final_price = base_price * (1 - discount_pct / 100)
     
-    expected_amount_base = int(final_price)
+    # Redondear el precio base a 2 decimales exactos
+    amount_base = round(final_price, 2)
     
+    # Lógica de expiración: si tiene factura pendiente vigente, usar esa
     existing_invoice = await db.get_pending_invoice_by_user(user_id, group_id)
     
     if existing_invoice:
-        if int(existing_invoice['amount_base']) != expected_amount_base:
+        if float(existing_invoice['amount_base']) == amount_base:
+            # La factura existente sigue siendo válida, mantenemos el mismo fee
+            total_to_pay = float(existing_invoice['total_to_pay'])
+            suffix = int(existing_invoice['unique_suffix'])
+        else:
+            # El precio cambió o el descuento ya no aplica, invalidamos la vieja
             existing_invoice = None
             
     if not existing_invoice:
-        suffix = random.randint(10, 99)
-        total_to_pay = round(expected_amount_base + (suffix / 100), 2)
-        await db.create_crypto_invoice(user_id, group_id, expected_amount_base, total_to_pay, suffix, plan)
-    else:
-        total_to_pay = float(existing_invoice['total_to_pay'])
+        # 1. Calcular el rango máximo permitido sin aumentar el entero
+        cents = int(round(amount_base * 100)) % 100
+        if cents == 0 or cents == 99:
+            max_suffix_no_rollover = 99
+        else:
+            # Ejemplo: 9.50 -> cents=50 -> max=49. Para que máximo llegue a 9.99
+            max_suffix_no_rollover = 100 - cents - 1
+            
+        # 2. Obtener sufijos ya en uso para este monto exacto
+        used_suffixes = await db.get_active_suffixes_for_amount(amount_base)
+        
+        # 3. Generar pools de sufijos disponibles
+        pool_no_rollover = [i for i in range(1, max_suffix_no_rollover + 1) if i not in used_suffixes]
+        pool_rollover = [i for i in range(max_suffix_no_rollover + 1, 100) if i not in used_suffixes]
+        
+        # 4. Seleccionar el sufijo aleatorio priorizando NO aumentar el entero
+        if pool_no_rollover:
+            suffix = random.choice(pool_no_rollover)
+        elif pool_rollover:
+            suffix = random.choice(pool_rollover)
+        else:
+            # Fallback extremo: si por algún milagro están tomados los 99, reusar aleatorio
+            suffix = random.randint(1, 99)
+            
+        total_to_pay = round(amount_base + (suffix / 100), 2)
+        await db.create_crypto_invoice(user_id, group_id, amount_base, total_to_pay, suffix, plan)
         
     group = get_group_by_id(group_id)
     binance_address = group.get("settings", {}).get("binance_address", "")
     
+    fee_amount = suffix / 100
+    
+    # Copywriting final con el desglose solicitado
+    if discount_pct > 0:
+        price_label = f"🏷️ Precio con {discount_pct}% OFF: *${amount_base:.2f} USDT*"
+    else:
+        price_label = f"🏷️ Precio del plan: *${amount_base:.2f} USDT*"
+    
     msg = (
         f"🧾 *Factura de Pago Generada*\n\n"
         f"📦 Plan: *{plan.capitalize()}*\n"
-        f"💰 Monto a pagar: *${total_to_pay:.2f} USDT*\n"
+        f"{price_label}\n"
+        f"⚡ Fee Activación Inmediata: *${fee_amount:.2f} USDT*\n"
+        f"-------------------------\n"
+        f"💰 *Total a pagar: ${total_to_pay:.2f} USDT*\n"
         f"🔗 Red: *TRC20 (Tron)*\n\n"
-        f"📝 *Dirección:*\n`{binance_address}`\n\n"
-        f"⚠️ *Importante:* Debes enviar exactamente *${total_to_pay:.2f}* incluyendo los centavos. "
-        f"El bot detectará tu pago automáticamente en unos 1-3 minutos y te dará acceso.\n\n"
-        f"⏳ Esta factura expira en 2 horas."
+        f"📝 *Dirección Binance:*\n`{binance_address}`\n\n"
+        f"🔒 *¿Por qué este fee exacto?*\n"
+        f"Los centavos exactos de tu total actúan como tu *código de seguridad único*. "
+        f"Nos permite identificar tu pago al instante entre miles de transacciones y activar tu acceso automáticamente, sin esperar a que un admin lo haga manualmente.\n\n"
+        f"✅ *Solo envía esta cantidad exacta y serás VIP en minutos.*\n\n"
+        f"⏳ *Esta factura expira en 2 horas.*"
     )
     
     keyboard = [[InlineKeyboardButton("🔙 Volver a planes", callback_data=f"vip_pay_{group_id}")]]
@@ -3928,37 +3910,37 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         restored_count = 0
         to_save_db = []
-        with GROUPS_LOCK:
-            for row in reader:
-                if len(row) >= 4:
-                    try:
-                        group_id = int(row[0])
-                        group_name = row[1]
-                        group_type = row[2]
-                        admin_id = int(row[3])
-                    except (ValueError, IndexError):
+ 
+        for row in reader:
+            if len(row) >= 4:
+                try:
+                    group_id = int(row[0])
+                    group_name = row[1]
+                    group_type = row[2]
+                    admin_id = int(row[3])
+                except (ValueError, IndexError):
+                    continue
+                if group_type not in ("VIP", "FREE", "COMUNIDAD"):
+                    continue
+                existing = get_group_by_id(group_id)
+                if existing:
+                    if existing['admin_id'] != admin_id and update.effective_user.id != SUPER_ADMIN_ID:
+                        logger.warning(
+                            f"Restore: saltando grupo {group_id} — "
+                            f"cambio de admin_id de {existing['admin_id']} a {admin_id} "
+                            f"requiere Super Admin"
+                        )
                         continue
-                    if group_type not in ("VIP", "FREE", "COMUNIDAD"):
-                        continue
-                    existing = get_group_by_id(group_id)
-                    if existing:
-                        if existing['admin_id'] != admin_id and update.effective_user.id != SUPER_ADMIN_ID:
-                            logger.warning(
-                                f"Restore: saltando grupo {group_id} — "
-                                f"cambio de admin_id de {existing['admin_id']} a {admin_id} "
-                                f"requiere Super Admin"
-                            )
-                            continue
-                        for g in GROUPS.values():
-                            if g["group_id"] == group_id:
-                                g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
-                                break
-                        to_save_db.append((group_id, {'admin': admin_id, 'type': group_type}))
-                    else:
-                        GROUPS[group_id] = {"group_id": group_id, "group_name": group_name, "type": group_type,
-                                       "admin_id": admin_id, "settings": {}}
-                        to_save_db.append((group_id, group_name, admin_id, group_type))
-                    restored_count += 1
+                    for g in GROUPS.values():
+                        if g["group_id"] == group_id:
+                            g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
+                            break
+                    to_save_db.append((group_id, {'admin': admin_id, 'type': group_type}))
+                else:
+                    GROUPS[group_id] = {"group_id": group_id, "group_name": group_name, "type": group_type,
+                                   "admin_id": admin_id, "settings": {}}
+                    to_save_db.append((group_id, group_name, admin_id, group_type))
+                restored_count += 1
         for item in to_save_db:
             if len(item) == 2:
                 group_id, changes = item
@@ -4003,11 +3985,10 @@ async def add_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_type not in ["VIP", "FREE", "COMUNIDAD"]:
             await update.message.reply_text("❌ TIPO debe ser VIP, FREE o COMUNIDAD")
             return
-        with GROUPS_LOCK:
-            if group_id in GROUPS:
-                await update.message.reply_text(f"⚠️ El grupo {group_id} ya existe. Usa editar para cambiarlo.")
-                return
-            GROUPS[group_id] = {"group_id": group_id, "type": group_type, "group_name": group_name, "admin_id": admin_id, "settings": {}}
+        if group_id in GROUPS:
+            await update.message.reply_text(f"⚠️ El grupo {group_id} ya existe. Usa editar para cambiarlo.")
+            return
+        GROUPS[group_id] = {"group_id": group_id, "type": group_type, "group_name": group_name, "admin_id": admin_id, "settings": {}}
         await db.save_group(group_id, group_name, admin_id, group_type)
         await update.message.reply_text(f"✅ Grupo {group_name} agregado")
     except Exception as e:
@@ -4025,8 +4006,8 @@ async def view_comunidad_groups(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_groups_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE, group_type: str, select_mode: bool = False):
     query = update.callback_query
     await query.answer()
-    with GROUPS_LOCK:
-        groups = [g for g in GROUPS.values() if g.get("type", "VIP") == group_type]
+   
+    groups = [g for g in GROUPS.values() if g.get("type", "VIP") == group_type]
     if not groups:
         await query.edit_message_text(f"📭 No hay grupos {group_type}")
         return
@@ -4089,8 +4070,8 @@ async def delete_group_execute(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     group_name = group['group_name']
-    with GROUPS_LOCK:
-        GROUPS.pop(group_id, None)
+   
+    GROUPS.pop(group_id, None)
     await db.delete_group_from_db(group_id)
     await query.edit_message_text(f"✅ *Grupo eliminado*\n\n📌 {group_name}\n🆔 ID: `{group_id}`", parse_mode="Markdown")
     await asyncio.sleep(2)
@@ -4353,13 +4334,13 @@ async def multi_apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Grupo no encontrado")
         return
     changes_made = []
-    with GROUPS_LOCK:
-        for g in GROUPS.values():
-            if g["group_id"] == group_id:
-                if 'name' in pending: g["group_name"] = pending['name']; changes_made.append(f"📝 Nombre → {pending['name']}")
-                if 'admin' in pending: g["admin_id"] = pending['admin']; changes_made.append(f"👤 Admin → {pending['admin']}")
-                if 'type' in pending: g["type"] = pending['type']; changes_made.append(f"🔄 Tipo → {pending['type']}")
-                break
+    
+    for g in GROUPS.values():
+        if g["group_id"] == group_id:
+            if 'name' in pending: g["group_name"] = pending['name']; changes_made.append(f"📝 Nombre → {pending['name']}")
+            if 'admin' in pending: g["admin_id"] = pending['admin']; changes_made.append(f"👤 Admin → {pending['admin']}")
+            if 'type' in pending: g["type"] = pending['type']; changes_made.append(f"🔄 Tipo → {pending['type']}")
+            break
     await db.update_group_fields(group_id, pending)
     for key in ('pending_changes', 'editing_mode', 'editing_group_id'):
         context.user_data.pop(key, None)
@@ -4929,16 +4910,56 @@ async def cfg_combo_nolink_notice(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer("❌ Vincula un grupo Comunidad primero con /linkcomunidad", show_alert=True)
 
-async def cfg_cart_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+async def cfg_cart_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    query = update.callback_query
+    await query.answer()
+    group = get_group_by_id(group_id)
+    step1 = group.get("settings", {}).get("cart_delay_minutes", 30)
+    step2 = group.get("settings", {}).get("cart_step2_delay", 1440)
+    step3 = group.get("settings", {}).get("cart_step3_delay", 4320)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"⏱ Paso 1 ({step1} min)", callback_data=f"cfg_cart_step1_{group_id}")],
+        [InlineKeyboardButton(f"⏱ Paso 2 ({step2} min)", callback_data=f"cfg_cart_step2_{group_id}")],
+        [InlineKeyboardButton(f"⏱ Paso 3 ({step3} min)", callback_data=f"cfg_cart_step3_{group_id}")],
+        _back_button(f"cfg_messages_{group_id}")
+    ]
+    await query.edit_message_text(
+        "🛒 *Tiempos de Carrito Abandonado*\n\n"
+        "Configura cuántos minutos esperará el bot antes de enviar cada recordatorio.\n\n"
+        "• *Paso 1:* Mensaje inicial.\n"
+        "• *Paso 2:* Segundo recordatorio.\n"
+        "• *Paso 3:* Última oportunidad.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def cfg_cart_step_request(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, step: int):
     query = update.callback_query
     await query.answer()
     _clear_input_states(context)
-    context.user_data['cfg_field'] = 'cart_delay_minutes'
+    
+    if step == 1:
+        field = "cart_delay_minutes"
+        default = 30
+    elif step == 2:
+        field = "cart_step2_delay"
+        default = 1440
+    else:
+        field = "cart_step3_delay"
+        default = 4320
+        
+    context.user_data['cfg_field'] = field
     context.user_data['cfg_group_id'] = group_id
+    
     group = get_group_by_id(group_id)
-    current_mins = group.get("settings", {}).get("cart_delay_minutes", 30)
+    current_mins = group.get("settings", {}).get(field, default)
+    
     await query.edit_message_text(
-        f"🛒 *Configurar Carrito Abandonado*\n\nActual: *{current_mins} minutos*\n\nEnvía el número de minutos (ej. `30`).\n\n*Escribe 'cancelar' para salir.*",
+        f"⏱ *Carrito Abandonado - Paso {step}*\n\n"
+        f"Actual: *{current_mins} minutos*\n\n"
+        f"Envía el nuevo tiempo en minutos (ej. `30`, `1440` para 24h, `4320` para 3 días).\n\n"
+        f"*Escribe 'cancelar' para salir.*",
         parse_mode="Markdown"
     )
 
@@ -5024,24 +5045,6 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _clear_input_states(context)
         await update.message.reply_text("✅ *Dirección Binance guardada correctamente.*", parse_mode="Markdown")
         return
-
-    # ── Carrito abandonado ─────────────────────────────────────────────────
-    if field == 'cart_delay_minutes':
-        try:
-            minutes = int(text)
-            if minutes <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("❌ Debe ser un número entero positivo (ej. `30`).")
-            return
-        if not await update_group_settings(group_id, {'cart_delay_minutes': minutes}):
-            await update.message.reply_text("❌ Grupo no encontrado")
-            _clear_input_states(context)
-            return
-        _clear_input_states(context)
-        await update.message.reply_text(f"✅ *Carrito abandonado configurado a {minutes} minutos.*", parse_mode="Markdown")
-        return
-
     # ── Precios y duraciones ───────────────────────────────────────────────
     is_price = field.startswith("price_") or field.startswith("combo_price_")
     try:
@@ -5072,6 +5075,9 @@ async def handle_cfg_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "duration_semanal": f"Duración semanal: *{value} días*",
         "duration_mensual": f"Duración mensual: *{value} días*",
         "duration_anual":   f"Duración anual: *{value} días*",
+        "cart_delay_minutes": f"Carrito Paso 1: *{value} minutos*",
+        "cart_step2_delay":   f"Carrito Paso 2: *{value} minutos*",
+        "cart_step3_delay":  f"Carrito Paso 3: *{value} minutos*",
     }
     if field.startswith("combo_price_"):
         plan_name = field.replace("combo_price_", "")
@@ -5108,8 +5114,8 @@ async def search_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Usa: `/searchgrupo nombre`", parse_mode="Markdown")
         return
     search_term = " ".join(context.args).lower()
-    with GROUPS_LOCK:
-        results = [g for g in GROUPS.values() if search_term in g['group_name'].lower()]
+    
+    results = [g for g in GROUPS.values() if search_term in g['group_name'].lower()]
     if not results:
         await update.message.reply_text(f"📭 No se encontraron grupos con '{search_term}'")
         return
@@ -6845,10 +6851,11 @@ async def process_abandoned_carts():
         group_id = group["group_id"]
         custom_msgs = group.get("settings", {}).get("abandoned_cart_messages", DEFAULT_CART_MESSAGES)
         
-        # Paso 1: Usa el delay configurado por el admin (por defecto 30 si no hay)
         step1_delay = group.get("settings", {}).get("cart_delay_minutes", 30)
-        # Paso 2: 24 horas después del paso 1. Paso 3: 72 horas después del paso 2.
-        step_delays = {1: step1_delay, 2: 1440, 3: 4320}
+        step2_delay = group.get("settings", {}).get("cart_step2_delay", 1440)  
+        step3_delay = group.get("settings", {}).get("cart_step3_delay", 4320)  
+        
+        step_delays = {1: step1_delay, 2: step2_delay, 3: step3_delay}
         
         for step, delay in step_delays.items():
             pending_carts = await db.get_pending_abandoned_carts_by_step(group_id, step - 1, delay)
@@ -6858,7 +6865,7 @@ async def process_abandoned_carts():
             for cart in pending_carts:
                 user_id = cart['user_id']
                 
-                # 1. Verificar si ya pagó (si está activo y no es trial)
+                # 1. Verificar si ya pagó
                 user = await db.get_user_by_id(user_id, group_id)
                 if user and user.get('status') == 'active' and user.get('plan') not in ('trial', 'FREE'):
                     await db.update_cart_step(user_id, group_id, 99)
@@ -7157,7 +7164,8 @@ CALLBACK_PREFIXES = [
     ("vip_pay_", lambda u, c, d: vip_pay_callback(u, c, int(d.replace("vip_pay_", "")))),
     ("vip_spin_", lambda u, c, d: vip_spin_callback(u, c, int(d.replace("vip_spin_", "")))),
     ("cfg_binance_", lambda u, c, d: cfg_binance_request(u, c, int(d.replace("cfg_binance_", "")))),
-    ("cfg_cart_", lambda u, c, d: cfg_cart_request(u, c, int(d.replace("cfg_cart_", "")))),
+    ("cfg_cart_menu_", lambda u, c, d: cfg_cart_menu(u, c, int(d.replace("cfg_cart_menu_", "")))),
+    ("cfg_cart_step", lambda u, c, d: cfg_cart_step_request(u, c, int(d.split("_")[3]), int(d.split("_")[2].replace("step", "")))),
     ("cfg_fuego_", lambda u, c, d: cfg_fuego_request(u, c, int(d.replace("cfg_fuego_", "")))),
     ("list_active", lambda u, c, d: list_active_users(u, c, d)),
     ("gen_inv_", lambda u, c, d: generate_invoice_callback(u, c, d)),
@@ -7295,8 +7303,8 @@ async def main():
     await db.init_tables()
     await db.load_groups_from_db()
     await db.load_group_messages() 
-    with GROUPS_LOCK:
-        logger.info(f"📦 {len(GROUPS)} grupos disponibles")
+    
+    logger.info(f"📦 {len(GROUPS)} grupos disponibles")
 
     bot_app = ApplicationBuilder().token(TOKEN).build()
 
