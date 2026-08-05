@@ -1218,7 +1218,6 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
                     "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)",
                     "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder ON discount_spins(expires_at) WHERE used = FALSE AND reminder_sent = FALSE",
-                    "CREATE INDEX IF NOT EXISTS idx_crypto_invoices_amount_pending ON crypto_invoices(amount_base, status) WHERE status = 'pending'",
                     "CREATE INDEX IF NOT EXISTS idx_users_rejoin ON users(group_id, status, rejoin_attempts) WHERE status IN ('active','expired')"
                 ]:
                     await cur.execute(idx_sql)
@@ -1243,6 +1242,7 @@ class Database:
                     )
                 """)
                 await cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_invoices_pending ON crypto_invoices(status, total_to_pay) WHERE status = 'pending'")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_invoices_amount_pending ON crypto_invoices(amount_base, status) WHERE status = 'pending'")
 
                 await cur.execute("""
                     CREATE TABLE IF NOT EXISTS processed_txs (
