@@ -117,7 +117,7 @@ async def check_crypto_payments():
 
     request_timeout = aiohttp.ClientTimeout(total=30, connect=10)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=request_timeout) as session:
         for address, group_ids in address_to_groups.items():
             try:
                 url = TRONGRID_API.format(address=address)
@@ -141,16 +141,14 @@ async def check_crypto_payments():
                             await db.mark_invoice_paid(invoice['id'])
                             await db.log_processed_tx(tx_id)
                             
-                            # OBTENER PRECIO ACTUAL DEL PLAN
                             cfg = get_group_plan_config(invoice['group_id'], invoice['plan'])
                             current_base_price = cfg['price']
                             
-                            # OBTENER DESCUENTO ACTUAL DEL USUARIO
                             spin_data = await db.get_spin_data(invoice['user_id'], invoice['group_id'])
                             status = get_discount_status(spin_data)
                             discount_pct = spin_data.get("best_discount", 0) if status == "active" else 0
                             
-                            current_expected_base = int(current_base_price * (1 - discount_pct / 100))
+                            current_expected_base = round(current_base_price * (1 - discount_pct / 100), 2)
                             
                             if abs(float(invoice['amount_base']) - current_expected_base) < 0.001:
                                 custom_price = float(invoice['amount_base'])
@@ -183,7 +181,7 @@ async def check_crypto_payments():
                                     f"👤 ID: `{invoice['user_id']}`\n"
                                     f"💰 Pagó: ${amount_full:.2f}\n"
                                     f"📦 Plan: {invoice['plan']}\n"
-                                    f"❌ El precio actual es ${current_expected_base}. Revisa si pagó una tarifa antigua.")
+                                    f"❌ El precio actual es ${current_expected_base:.2f}. Revisa si pagó una tarifa antigua.")
                         else:
                             # 1. Marcar la TX como procesada para no evaluarla de nuevo
                             await db.log_processed_tx(tx_id)
@@ -275,7 +273,7 @@ def _invalidate_price_cache(group_id: int):
 
 async def update_group_settings(group_id: int, changes: dict) -> bool:
     """Único punto autorizado para mutar settings. Maneja RAM, DB y caché automáticamente."""
-    PRICE_FIELDS = {
+    CACHE_INVALIDATING_FIELDS = {
         "trial_minutes",
         "referral_reward_hours",
         "referral_goal", 
