@@ -108,9 +108,7 @@ async def check_crypto_payments():
     for g in groups_snapshot:
         addr = g.get("settings", {}).get("binance_address")
         if addr:
-            if addr not in address_to_groups:
-                address_to_groups[addr] = []
-            address_to_groups[addr].append(g["group_id"])
+            address_to_groups.setdefault(addr, []).append(g["group_id"])
             
     if not address_to_groups:
         return
@@ -230,10 +228,6 @@ async def check_crypto_payments():
             except Exception as e:
                 logger.error(f"Error consultando TronGrid para {address}: {e}")
 # ==================== UTILIDADES DE TIEMPO ====================
-def now_ec() -> datetime:
-    """Retorna datetime naive en UTC (para DB) pero con contexto de Ecuador para display."""
-    return datetime.now(ZoneInfo("UTC"))
-
 def fmt_dt(dt: datetime, include_time: bool = True) -> str:
     if dt is None:
         return "N/A"
@@ -335,6 +329,21 @@ def get_groups_by_admin(admin_id: int, group_type: str = None) -> list:
     if group_type:
         groups = [g for g in groups if g.get("type", "VIP") == group_type]
     return groups
+
+def get_groups_sharing_wallet(group_id: int) -> List[int]:
+    """Retorna la lista de group_ids que comparten la misma binance_address que el grupo dado.
+    Esto define el scope correcto del pool de sufijos crypto."""
+    group = get_group_by_id(group_id)
+    if not group:
+        return [group_id]
+    addr = group.get("settings", {}).get("binance_address")
+    if not addr:
+        return [group_id]
+    return [
+        g["group_id"]
+        for g in get_all_groups_snapshot()
+        if g.get("settings", {}).get("binance_address") == addr
+    ]
 
 def can_manage_group(user_id: int, group_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID or user_id in EXTRA_ADMINS:
@@ -1209,6 +1218,7 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_users_expired ON users(group_id, status, end_date) WHERE status = 'active'",
                     "CREATE INDEX IF NOT EXISTS idx_payment_leads_group ON payment_leads(group_id, created_at)",
                     "CREATE INDEX IF NOT EXISTS idx_discount_spins_reminder ON discount_spins(expires_at) WHERE used = FALSE AND reminder_sent = FALSE",
+                    "CREATE INDEX IF NOT EXISTS idx_crypto_invoices_amount_pending ON crypto_invoices(amount_base, status) WHERE status = 'pending'",
                     "CREATE INDEX IF NOT EXISTS idx_users_rejoin ON users(group_id, status, rejoin_attempts) WHERE status IN ('active','expired')"
                 ]:
                     await cur.execute(idx_sql)
@@ -2045,14 +2055,21 @@ class Database:
                 return await cur.fetchone()
         return await self._run(_get)
 
-    async def get_active_suffixes_for_amount(self, amount_base: float) -> List[int]:
-        """Obtiene los sufijos (fees) en uso para facturas pendientes de un monto base específico."""
+    async def get_active_suffixes_for_amount(self, amount_base: float, group_ids: List[int] = None) -> List[int]:
+        """Obtiene los sufijos (fees) en uso para facturas pendientes de un monto base específico.
+        Filtra por los group_ids que comparten la misma wallet (binance_address)."""
         async def _get(conn):
             async with conn.cursor() as cur:
-                await cur.execute("""
-                    SELECT unique_suffix FROM crypto_invoices 
-                    WHERE amount_base = %s AND status = 'pending'
-                """, (amount_base,))
+                if group_ids:
+                    await cur.execute("""
+                        SELECT unique_suffix FROM crypto_invoices 
+                        WHERE amount_base = %s AND status = 'pending' AND group_id = ANY(%s)
+                    """, (amount_base, group_ids))
+                else:
+                    await cur.execute("""
+                        SELECT unique_suffix FROM crypto_invoices 
+                        WHERE amount_base = %s AND status = 'pending'
+                    """, (amount_base,))
                 return [row[0] for row in await cur.fetchall()]
         return await self._run(_get)
 
@@ -2113,6 +2130,27 @@ class Database:
                 await cur.execute("SELECT points FROM referral_points WHERE referrer_id = %s AND group_id = %s", (user_id, group_id))
                 row = await cur.fetchone()
                 return row[0] if row else 0
+        return await self._run(_get)
+
+    async def get_spin_revenue_stats(self, group_id: int) -> List[dict]:
+        """Cruza discount_spins con payments para ver qué nivel de descuento genera más ingresos reales."""
+        async def _get(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
+                    SELECT 
+                        ds.best_discount, 
+                        COUNT(DISTINCT ds.user_id) as users_with_spin,
+                        COUNT(DISTINCT p.user_id) as users_who_paid,
+                        COALESCE(SUM(p.amount), 0) as total_revenue
+                    FROM discount_spins ds
+                    LEFT JOIN payments p ON ds.user_id = p.user_id 
+                        AND ds.group_id = p.group_id 
+                        AND p.amount > 0
+                    WHERE ds.group_id = %s
+                    GROUP BY ds.best_discount
+                    ORDER BY ds.best_discount ASC
+                """, (group_id,))
+                return await cur.fetchall()
         return await self._run(_get)
 # ==================== INSTANCIAS GLOBALES ====================
 db = Database(DATABASE_URL)
@@ -2617,8 +2655,9 @@ async def generate_invoice_callback(update: Update, context: ContextTypes.DEFAUL
             # Ejemplo: 9.50 -> cents=50 -> max=49. Para que máximo llegue a 9.99
             max_suffix_no_rollover = 100 - cents - 1
             
-        # 2. Obtener sufijos ya en uso para este monto exacto
-        used_suffixes = await db.get_active_suffixes_for_amount(amount_base)
+        # 2. Obtener sufijos ya en uso PARA ESTA WALLET (no global)
+        wallet_group_ids = get_groups_sharing_wallet(group_id)
+        used_suffixes = await db.get_active_suffixes_for_amount(amount_base, wallet_group_ids)
         
         # 3. Generar pools de sufijos disponibles
         pool_no_rollover = [i for i in range(1, max_suffix_no_rollover + 1) if i not in used_suffixes]
@@ -3929,10 +3968,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"requiere Super Admin"
                         )
                         continue
-                    for g in GROUPS.values():
-                        if g["group_id"] == group_id:
-                            g.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
-                            break
+                    existing.update({"group_name": group_name, "type": group_type, "admin_id": admin_id})
                     to_save_db.append((group_id, {'admin': admin_id, 'type': group_type}))
                 else:
                     GROUPS[group_id] = {"group_id": group_id, "group_name": group_name, "type": group_type,
@@ -4235,9 +4271,41 @@ async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (group_id,)
             )
             active = (await cur.fetchone())['c']
-            return t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active
+            
+            # --- NUEVO: DATOS PARA EL EMBUDO DE CONVERSIÓN (MES) ---
+            await cur.execute("""
+                SELECT
+                  (SELECT COUNT(DISTINCT user_id) FROM users WHERE group_id=%s AND (plan='trial' OR trial_used=TRUE) AND created_at >= %s) as trials,
+                  (SELECT COUNT(DISTINCT user_id) FROM discount_spins WHERE group_id=%s AND last_spin >= %s) as spins,
+                  (SELECT COUNT(DISTINCT user_id) FROM payment_leads WHERE group_id=%s AND created_at >= %s) as leads,
+                  (SELECT COUNT(DISTINCT user_id) FROM crypto_invoices WHERE group_id=%s AND created_at >= %s) as invoices,
+                  (SELECT COUNT(DISTINCT p.user_id) FROM payments p JOIN users u ON p.user_id=u.user_id AND p.group_id=u.group_id WHERE p.group_id=%s AND p.amount > 0 AND p.payment_date >= %s AND u.trial_used = TRUE) as paid
+            """, (group_id, start_month, group_id, start_month, group_id, start_month, group_id, start_month, group_id, start_month))
+            funnel_row = await cur.fetchone()
+            funnel = dict(funnel_row) if funnel_row else {}
 
-    t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active = await db._run(_get_stats)
+            return t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active, funnel
+
+    t_today, t_week, t_month, l_today, l_week, l_month, r_today, r_week, r_month, converted, active, funnel = await db._run(_get_stats)
+
+    # Helpers para calcular el embudo
+    def _pct(part, whole):
+        if whole == 0: return "0.0%"
+        return f"{(part / whole * 100):.1f}%"
+        
+    def _drop(prev, curr):
+        if prev == 0: return ""
+        lost = prev - curr
+        if lost <= 0: return ""
+        rate = (lost / prev) * 100
+        return f"📉 -{rate:.1f}%"
+
+    # Valores del embudo
+    f_trials = funnel.get('trials', 0)
+    f_spins = funnel.get('spins', 0)
+    f_leads = funnel.get('leads', 0)
+    f_invoices = funnel.get('invoices', 0)
+    f_paid = funnel.get('paid', 0)
 
     msg = f"📊 *ESTADÍSTICAS DE VENTAS — {group['group_name']}*\n\n"
     msg += f"🆓 *NUEVOS TRIALS (Ingresos)*\n• 📅 Hoy: *{t_today}*\n• 📆 Semana: *{t_week}*\n• 🗓 Mes: *{t_month}*\n\n"
@@ -4245,9 +4313,13 @@ async def trial_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"🎰 *GIROS DE RULETA*\n• 📅 Hoy: *{r_today}*\n• 📆 Semana: *{r_week}*\n• 🗓 Mes: *{r_month}*\n\n"
     msg += f"🔥 *Trial Activos Ahora:* {active}\n"
     msg += f"💰 *Convertidos a pago (Histórico):* {converted}\n"
-    if t_month > 0:
-        conversion = (converted / t_month) * 100
-        msg += f"📈 *Conversión Histórica:* {conversion:.1f}%"
+    
+    msg += f"\n🔻 *EMBUDO DE CONVERSIÓN (Mes)*\n"
+    msg += f"1️⃣ Trials: *{f_trials}*\n"
+    msg += f"2️⃣ Ruleta: *{f_spins}* ({_pct(f_spins, f_trials)} del trial) {_drop(f_trials, f_spins)}\n"
+    msg += f"3️⃣ Vio pago: *{f_leads}* ({_pct(f_leads, f_spins)} de la ruleta) {_drop(f_spins, f_leads)}\n"
+    msg += f"4️⃣ Factura: *{f_invoices}* ({_pct(f_invoices, f_leads)} de los leads) {_drop(f_leads, f_invoices)}\n"
+    msg += f"5️⃣ Pagó: *{f_paid}* ({_pct(f_paid, f_invoices)} de las facturas) {_drop(f_invoices, f_paid)}\n"
 
     keyboard = [_back_button(f"select_group_{group_id}")]
     if query:
@@ -5499,6 +5571,42 @@ async def check_spin_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         msg += f"🚫 *Descuento ya fue aplicado a:* {spin_data.get('applied_to_plan', 'N/A')}\n💰 Precio normal para renovación."
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def spin_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_group = await require_group(update, context)
+    if not current_group:
+        await update.message.reply_text("❌ Usa /start primero o no estás autorizado.")
+        return
+
+    stats = await db.get_spin_revenue_stats(current_group)
+    if not stats:
+        await update.message.reply_text("📭 Aún no hay datos de ruleta para este grupo.")
+        return
+
+    group = get_group_by_id(current_group)
+    msg = f"🎰 *REPORTE DE RENTABILIDAD - RULETA*\n"
+    msg += f"📌 Grupo: {safe_name(group['group_name'])}\n\n"
+    msg += f"{'Tier':<4} | {'Spins':<5} | {'Pagaron':<7} | {'Conv.':<5} | {'Ingresos':<9} | {'$/Spin'}\n"
+    msg += "---------------------------------------------------\n"
+
+    for row in stats:
+        tier = int(row['best_discount'])
+        spins = int(row['users_with_spin'])
+        paid = int(row['users_who_paid'])
+        revenue = float(row['total_revenue'])
+        
+        conv_rate = (paid / spins * 100) if spins > 0 else 0
+        rev_per_spin = (revenue / spins) if spins > 0 else 0
+        
+        msg += f"{tier}%  | {spins:<5} | {paid:<7} | {conv_rate:<5.1f} | ${revenue:<8.2f} | ${rev_per_spin:.2f}\n"
+        
+    msg += "---------------------------------------------------\n"
+    msg += "💡 *Cómo leer esto:*\n"
+    msg += "• `$/Spin` = Ingreso total dividido entre cuántos sacaron este descuento.\n"
+    msg += "• El tier con mayor `$/Spin` es el más rentable.\n"
+    msg += "• Si el 10% tiene un `$/Spin` mayor que el 50%, el 50% solo está regalando margen. Debes bajarle la probabilidad."
+    
+    await update.message.reply_text(f"```\n{msg}\n```", parse_mode="Markdown")
 
 async def respin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_group = await require_group(update, context)
@@ -7337,6 +7445,7 @@ async def main():
     bot_app.add_handler(CommandHandler("dbhealth", db_health_command))
     bot_app.add_handler(CommandHandler("respin", respin_command))
     bot_app.add_handler(CommandHandler("fixusers", fix_affected_users_command))
+    bot_app.add_handler(CommandHandler("spinreport", spin_report_command))
     bot_app.add_error_handler(_global_error_handler)
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
