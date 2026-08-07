@@ -624,10 +624,10 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[
     
     return InlineKeyboardMarkup(keyboard)
     
-def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
+async def get_payment_info_text(group_id: int, user_id: int, discounted_pct: float = 0) -> tuple:
     group = get_group_by_id(group_id)
     if not group:
-        return "Grupo no encontrado"
+        return "Grupo no encontrado", False
     settings = group.get("settings", {})
     binance_address = settings.get("binance_address", "").strip()
     vip_invite_link = settings.get("vip_invite_link", "").strip() 
@@ -651,12 +651,35 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
     else:
         lines += ["⚠️ *Dirección de Binance no configurada aún.*",
                   "Contacta al administrador para más información.", ""]
+                  
+    # --- LÓGICA DE TRANSFERENCIA BANCARIA ---
+    bank_eligible = await db.is_bank_eligible(user_id, group_id)
+    bank_number = settings.get("bank_number", "").strip()
+    has_bank_info = False
+    
+    if bank_eligible and bank_number:
+        has_bank_info = True
+        bank_name = settings.get("bank_name", "Banco Pichincha")
+        bank_holder = settings.get("bank_holder", "No configurado")
+        bank_type = settings.get("bank_type", "Ahorros")
+        
+        lines += [
+            "🏦 *OPCIÓN DE TRANSFERENCIA BANCARIA:*",
+            f"Banco: *{bank_name}*",
+            f"Titular: *{bank_holder}*",
+            f"Tipo de cuenta: *{bank_type}*",
+            f"Número: *{bank_number}*",
+            "⚠️ *Por seguridad, este mensaje se borrará automáticamente en 1 hora.*",
+            ""
+        ]
+        
     if vip_invite_link:
         lines += ["🔥 *¿Quieres probar antes de pagar?*", "Presiona el botón 'Únete al VIP' para tu trial gratuito.", ""]
+        
     if payment_contact:
         lines += [
             f"📤 *Después de pagar:*",
-            f"Envía el TXID (hash) a @{payment_contact}. Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", ""
+            f"Envía el comprobante (foto o TXID) a @{payment_contact}. Presiona el botón *'Enviar Comprobante'* para hacerlo de inmediato.", ""
         ]
     else:
         lines += [
@@ -666,14 +689,10 @@ def get_payment_info_text(group_id: int, discounted_pct: float = 0) -> str:
         
     lines += [
         "⏱ *Tiempo de activación:*",
-        "Tu acceso se activará cuando se valide la transacción en la blockchain.", "",
+        "Tu acceso se activará cuando se valide la transacción.", "",
         "🔄 ¿No recibiste los datos? Presiona el botón de nuevo."
     ]
-    return "\n".join(lines)
-
-# Rate limiting simple en memoria para /pagar y leads
-_PAYMENT_COOLDOWN: Dict[str, datetime] = {}
-_LEAD_ALERT_COOLDOWN: Dict[str, datetime] = {}
+    return "\n".join(lines), has_bank_info
 
 async def _cleanup_payment_cooldown():
     """Limpia entradas viejas del cooldown de pagos y alertas cada hora."""
@@ -708,14 +727,25 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     
         discounted_pct = spin_data.get("best_discount", 0) if status == "active" else 0
         
-        text_to_send = get_payment_info_text(group_id, discounted_pct=discounted_pct)
+        # Obtenemos el texto y el flag de si contiene info bancaria
+        text_to_send, has_bank_info = await get_payment_info_text(group_id, user_id, discounted_pct=discounted_pct)
 
-        await bot.send_message(
+        sent_msg = await bot.send_message(
             user_id, 
             text_to_send, 
             parse_mode="Markdown", 
             reply_markup=await get_payment_keyboard(group_id, user_id, spin_data=spin_data, vip_invite_link=vip_invite_link)
         )
+        
+        # --- PROGRAMAR AUTO-ELIMINACIÓN SILENCIOSA SI HAY DATOS BANCARIOS ---
+        if has_bank_info:
+            async def _delete_bank_msg():
+                await asyncio.sleep(3600) # 1 hora = 3600 segundos
+                try:
+                    await bot.delete_message(chat_id=user_id, message_id=sent_msg.message_id)
+                except Exception:
+                    pass # Si el usuario bloqueó al bot o el mensaje ya no existe, ignoramos silenciosamente
+            asyncio.create_task(_delete_bank_msg())
 
         _PAYMENT_COOLDOWN[cooldown_key] = now
         
@@ -739,7 +769,7 @@ async def send_payment_info(bot, user_id: int, group_id: int, triggered_by: str 
     except Exception as e:
         logger.warning(f"No se pudo enviar info de pago a {user_id}: {e}")
         return False
-
+        
 def extract_user_from_reply(text: str) -> tuple:
     """Extrae user_id, group_id, username y first_name de un mensaje del bot de forma uniforme."""
     if not text:
@@ -1317,6 +1347,13 @@ class Database:
 
     async def get_user_by_id(self, user_id: int, group_id: int):
         return await self.get_user(user_id, group_id, "user_id, status, end_date, plan, trial_used, fuego_notice_sent")
+
+    async def is_bank_eligible(self, user_id: int, group_id: int) -> bool:
+        """Verifica si el usuario ya usó el trial para mostrarle datos bancarios."""
+        user = await self.get_user(user_id, group_id, "trial_used")
+        if not user:
+            return False
+        return user.get('trial_used', False)
 
     async def get_user_by_id_full(self, user_id: int, group_id: int):
         return await self.get_user(user_id, group_id, "*")
@@ -5916,7 +5953,7 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         group = get_group_by_id(group_id)
         current_contact = group.get("settings", {}).get("payment_contact", "") if group else ""
         await update.message.reply_text(
-            f"✅ *Dirección Binance guardada.*\n\nPaso 2/3: *Contacto para comprobantes*\n"
+            f"✅ *Dirección Binance guardada.*\n\nPaso 2/7: *Contacto para comprobantes*\n"
             f"Envía el username de Telegram donde los clientes enviarán su TXID.\n\n"
             f"📋 *Actual:* `{current_contact or 'No configurado'}`\n\n"
             f"*Escribe 'saltar' para dejar el valor actual.*",
@@ -5938,7 +5975,7 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
         group = get_group_by_id(group_id)
         current_link = group.get("settings", {}).get("vip_invite_link", "") if group else ""
         await update.message.reply_text(
-            f"✅ *Contacto guardado.*\n\nPaso 3/3: *Link de Invitación VIP*\n"
+            f"✅ *Contacto guardado.*\n\nPaso 3/7: *Link de Invitación VIP*\n"
             f"Envía el enlace del grupo VIP (debe empezar con https://).\n\n"
             f"📋 *Actual:* `{current_link or 'No configurado'}`\n\n"
             f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
@@ -5965,18 +6002,117 @@ async def handle_payment_config_input(update: Update, context: ContextTypes.DEFA
             context.user_data.pop('config_payment_group_id', None)
             return
             
+        context.user_data['config_payment_step'] = 'bank_name'
+        group = get_group_by_id(group_id)
+        current_bank = group.get("settings", {}).get("bank_name", "") if group else ""
+        await update.message.reply_text(
+            f"✅ *Link VIP guardado.*\n\nPaso 4/7: *Datos Bancarios - Nombre del Banco*\n"
+            f"Envía el nombre del banco (ej: Banco Pichincha).\n\n"
+            f"📋 *Actual:* `{current_bank or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para no usar transferencias. Escribe 'eliminar' para borrar todos los datos bancarios.*",
+            parse_mode="Markdown"
+        )
+        
+    elif step == 'bank_name':
+        changes = {}
+        if text.lower() == 'eliminar':
+            # Limpiamos todo lo relacionado a banco
+            changes['bank_name'] = None
+            changes['bank_holder'] = None
+            changes['bank_type'] = None
+            changes['bank_number'] = None
+            if not await update_group_settings(group_id, changes):
+                await update.message.reply_text("❌ Grupo no encontrado")
+                context.user_data.pop('config_payment_step', None)
+                context.user_data.pop('config_payment_group_id', None)
+                return
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            await update.message.reply_text("✅ *Datos bancarios eliminados.* Configuración completada.", parse_mode="Markdown")
+            return
+            
+        if text.lower() != 'saltar':
+            changes['bank_name'] = text
+            
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
+        context.user_data['config_payment_step'] = 'bank_holder'
+        group = get_group_by_id(group_id)
+        current_holder = group.get("settings", {}).get("bank_holder", "") if group else ""
+        await update.message.reply_text(
+            f"✅ *Banco guardado.*\n\nPaso 5/7: *Titular de la cuenta*\n"
+            f"Envía el nombre del titular.\n\n"
+            f"📋 *Actual:* `{current_holder or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual.*",
+            parse_mode="Markdown"
+        )
+        
+    elif step == 'bank_holder':
+        changes = {}
+        if text.lower() != 'saltar':
+            changes['bank_holder'] = text
+            
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
+        context.user_data['config_payment_step'] = 'bank_type'
+        group = get_group_by_id(group_id)
+        current_type = group.get("settings", {}).get("bank_type", "") if group else ""
+        await update.message.reply_text(
+            f"✅ *Titular guardado.*\n\nPaso 6/7: *Tipo de cuenta*\n"
+            f"Envía el tipo (ej: Ahorros, Corriente).\n\n"
+            f"📋 *Actual:* `{current_type or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual.*",
+            parse_mode="Markdown"
+        )
+        
+    elif step == 'bank_type':
+        changes = {}
+        if text.lower() != 'saltar':
+            changes['bank_type'] = text
+            
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
+        context.user_data['config_payment_step'] = 'bank_number'
+        group = get_group_by_id(group_id)
+        current_number = group.get("settings", {}).get("bank_number", "") if group else ""
+        await update.message.reply_text(
+            f"✅ *Tipo guardado.*\n\nPaso 7/7: *Número de cuenta*\n"
+            f"Envía el número de cuenta.\n\n"
+            f"📋 *Actual:* `{current_number or 'No configurado'}`\n\n"
+            f"*Escribe 'saltar' para dejar el valor actual.*",
+            parse_mode="Markdown"
+        )
+        
+    elif step == 'bank_number':
+        changes = {}
+        if text.lower() != 'saltar':
+            changes['bank_number'] = text
+            
+        if changes and not await update_group_settings(group_id, changes):
+            await update.message.reply_text("❌ Grupo no encontrado")
+            context.user_data.pop('config_payment_step', None)
+            context.user_data.pop('config_payment_group_id', None)
+            return
+            
         context.user_data.pop('config_payment_step', None)
         context.user_data.pop('config_payment_group_id', None)
         
         group = get_group_by_id(group_id)
-        settings = group.get("settings", {}) if group else {}
-        vip_link_status = settings.get('vip_invite_link', 'No configurado')
         await update.message.reply_text(
             f"✅ *Configuración de pago completada*\n\n📌 *Grupo:* {group['group_name'] if group else 'Desconocido'}\n\n"
-            f"🟡 *Binance:*\n`{settings.get('binance_address', 'No configurado')}`\n\n"
-            f"📤 *Contacto:* @{settings.get('payment_contact', 'No configurado')}\n\n"
-            f"🔥 *Link VIP:* `{vip_link_status}`\n\n"
-            f"Los usuarios verán el botón 'Entrar al VIP' en la información de pago.",
+            f"Ahora el bot mostrará los datos del banco *solo a clientes antiguos/trial* y se borrarán en 1 hora.",
             parse_mode="Markdown"
         )
 
