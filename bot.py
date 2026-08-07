@@ -1,6 +1,6 @@
 import os
 import csv
-import asyncio
+import asynciof
 import logging
 import re
 import json
@@ -5843,7 +5843,7 @@ async def config_payment_command(update: Update, context: ContextTypes.DEFAULT_T
     current_binance = settings.get("binance_address", "")
     await update.message.reply_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/3: *Dirección USDT (Binance)*\nEnvía tu dirección TRC20.\n\n"
+        f"Paso 1/7: *Dirección USDT (Binance)*\nEnvía tu dirección TRC20.\n\n"
         f"📋 *Actual:*\n`{current_binance or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
@@ -6133,7 +6133,7 @@ async def config_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     current_binance = settings.get("binance_address", "")
     await query.edit_message_text(
         f"⚙️ *Configuración de Pago — {group['group_name']}*\n\n"
-        f"Paso 1/3: *Dirección USDT (Binance)*\nEnvía tu dirección TRC20.\n\n"
+        f"Paso 1/7: *Dirección USDT (Binance)*\nEnvía tu dirección TRC20.\n\n"
         f"📋 *Actual:*\n`{current_binance or 'No configurado'}`\n\n"
         f"*Escribe 'saltar' para dejar el valor actual, o 'eliminar' para borrarlo.*",
         parse_mode="Markdown"
@@ -7582,6 +7582,7 @@ async def main():
     bot_app.add_handler(CommandHandler("respin", respin_command))
     bot_app.add_handler(CommandHandler("fixusers", fix_affected_users_command))
     bot_app.add_handler(CommandHandler("spinreport", spin_report_command))
+    bot_app.add_handler(CommandHandler("ruleta", ruleta_command))
     bot_app.add_error_handler(_global_error_handler)
     # Callbacks
     bot_app.add_handler(CallbackQueryHandler(handle_callback))
