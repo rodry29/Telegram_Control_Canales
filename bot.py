@@ -2288,7 +2288,7 @@ async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, vip_
     keyboard = [
         [InlineKeyboardButton("🔥 Entrar al VIP", callback_data=f"vip_enter_{vip_group_id}")],
         [spin_btn],
-        [InlineKeyboardButton("🎯 Invitar Amigos (VIP Gratis)", callback_data=f"ref_link_{vip_group_id}")],
+        [InlineKeyboardButton("🎯 Gana VIP gratis", callback_data=f"ref_link_{vip_group_id}")],
         [InlineKeyboardButton("💳 Información de Pago", callback_data=f"vip_pay_{vip_group_id}")]
     ]
     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -2310,8 +2310,8 @@ async def ref_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     msg = (
         f"🎯 *Programa de Referidos - {group['group_name']}*\n\n"
-        f"Invita a tus amigos a unirse al VIP usando tu enlace exclusivo.\n"
-        f"Por cada *{goal}* amigos que se unan, recibirás *{int(ref_hours)} horas de VIP GRATIS*.\n\n"
+        f"Invita a gente a unirse al VIP usando tu enlace exclusivo.\n"
+        f"Por *{goal}* persona que se una, recibirás *{int(ref_hours)} hora de VIP GRATIS (contenido descargable)*.\n\n"
         f"🔗 *Tu enlace de invitación:*\n`{link}`\n\n"
         f"📊 *Tu progreso actual:*\n"
         f"Amigos unidos: *{points}*\n"
