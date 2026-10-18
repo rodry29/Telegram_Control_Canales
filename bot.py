@@ -2187,15 +2187,49 @@ async def show_channel_selector(send_func, user_id: int):
     if not channels:
         await send_func("⚠️ No hay canales disponibles en este momento.")
         return
+
+    # ─── DETECCIÓN AUTOMÁTICA DE CLIENTE (Estrategia B) ───
+    # Si el usuario ya pertenece a un grupo VIP o FREE, derivamos al canal correcto.
+    user_group_ids = await db.get_user_groups(user_id)
+    
+    # Caso 1: ya es VIP en algún grupo → mostrar solo ese canal
+    user_vip_groups = [g for g in user_group_ids
+                       if (get_group_by_id(g) or {}).get("type") == "VIP"]
+    if user_vip_groups:
+        channels = [ch for ch in channels
+                    if ch['vip']['group_id'] in user_vip_groups]
+    
+    # Caso 2: está en un FREE pero no en VIP → derivar al VIP del mismo admin
+    elif any((get_group_by_id(g) or {}).get("type") == "FREE" for g in user_group_ids):
+        free_group_id = next(g for g in user_group_ids
+                             if (get_group_by_id(g) or {}).get("type") == "FREE")
+        free_group = get_group_by_id(free_group_id)
+        vip_group = find_linked_or_admin_group(free_group, "VIP")
+        if vip_group:
+            channels = [ch for ch in channels
+                        if ch['vip']['group_id'] == vip_group['group_id']]
+    # ──────────────────────────────────────────────────────
+
     global_msg = await db.get_global_message('channel_select_message') or DEFAULT_CHANNEL_SELECT_MESSAGE
+    
+    if not channels:
+        await send_func(
+            "👋 *Bienvenido.*\n\n"
+            "Aún no formas parte de ningún canal. "
+            "Pide el enlace de invitación a tu grupo FREE o VIP correspondiente."
+,            parse_mode="Markdown"
+        )
+        return
+    
     if len(channels) == 1:
         await show_channel_menu(send_func, user_id, channels[0])
         return
+    
     keyboard = []
     for ch in channels:
         keyboard.append([InlineKeyboardButton(ch['channel_name'], callback_data=f"channel_SELECT_{ch['vip']['group_id']}")])
     await send_func(global_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
+    
 async def show_channel_menu(send_func, user_id: int, channel: dict):
     vip = channel['vip']
     free = channel.get('free')
