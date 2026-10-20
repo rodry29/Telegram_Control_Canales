@@ -353,7 +353,7 @@ DEFAULT_REJECTION_MESSAGE = (
 
 DEFAULT_CHANNEL_SELECT_MESSAGE = (
     "👋 *¡Bienvenido!*\n\n"
-    "Soy *Aethel*, tu asistente de acceso VIP.\n\n"
+    "Soy *Nexus*, tu asistente de acceso VIP.\n\n"
     "🎭 *Selecciona tu canal para comenzar:*"
 )
 
