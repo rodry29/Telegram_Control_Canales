@@ -434,7 +434,7 @@ async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
 # ==================== HELPERS DE PAGO ====================
-async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[dict] = None, vip_invite_link: str = None) -> InlineKeyboardMarkup:
+async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[dict] = None, vip_invite_link: str = None, free_link: str = None) -> InlineKeyboardMarkup:
     group = get_group_by_id(group_id)
     if not group:
         return InlineKeyboardMarkup([])
@@ -475,8 +475,12 @@ async def get_payment_keyboard(group_id: int, user_id: int, spin_data: Optional[
     # Botón 3: Link al VIP
     if vip_invite_link and vip_invite_link.startswith(("https://", "http://")):
         keyboard.append([InlineKeyboardButton("🔥 Entrada al VIP", url=vip_invite_link)])
+    
+    # Botón 4: Link al Grupo FREE vinculado (mientras recuperas tu acceso VIP)
+    if free_link and free_link.startswith(("https://", "http://")):
+        keyboard.append([InlineKeyboardButton("📢 Ver contenido en el canal FREE", url=free_link)])
         
-    # Botón 4: Volver
+    # Botón 5: Volver
     keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_start")])
     
     return InlineKeyboardMarkup(keyboard)
@@ -4247,14 +4251,15 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
                 + _build_price_list(chat_id, discounted_pct=winback_discount)
                 + f"\n\n⏰ *Esta promo es válida solo 24 horas.*\n"
                 f"Saldrás del VIP pero te activo en cuanto pagues.\n\n"
-                f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
+                + (f"📢 *Mientras tanto, únete al canal FREE* para seguir viendo contenido público con el botón de abajo.\n\n" if free_link else "")
+                + f"📤 Envía comprobante a @{settings.get('payment_contact', 'admin')}"
             )
             
             # 1. Enviar al usuario (siempre)
             await _safe_send(
                 user_id, 
                 promo_msg, 
-                reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
+                reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data, free_link=free_link), 
                 parse_mode="Markdown"
             )
             
@@ -4277,12 +4282,14 @@ async def _process_new_vip_member(chat_id: int, user_id: int, username: str, fir
         if custom_messages and custom_messages.get('expired_message'):
             expired_msg = custom_messages['expired_message']
         expired_msg = format_message(expired_msg, {'group_name': group['group_name']})
+        if free_link:
+            expired_msg += "\n📢 *Mientras decides, únete a nuestro canal FREE* para seguir viendo contenido público. Toca el botón de abajo. 👇"
         
         # 3. Enviar al usuario (siempre)
         await _safe_send(
             user_id, 
             expired_msg, 
-            reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data), 
+            reply_markup=await get_payment_keyboard(chat_id, user_id, spin_data=spin_data, free_link=free_link), 
             parse_mode="Markdown"
         )
         
